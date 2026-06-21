@@ -1,0 +1,4 @@
+interface:
+  display_name: "JaQMC Remote"
+  short_description: "Connect to JaQMC GPU workers and run checks."
+  default_prompt: "Use $jaqmc-remote to locate a GPU worker, sync JaQMC code, and run a JAX GPU validation."
