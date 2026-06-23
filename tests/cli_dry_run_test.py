@@ -256,6 +256,12 @@ run:
         },
     ),
     CliDryRunCase(
+        "molecule_lit_dry_run",
+        "molecule lit system.module=diatomic system.formula=H2 "
+        "system.bond_length=1.4 lit.omega_points=11 "
+        "workflow.save_path=lit_run",
+    ),
+    CliDryRunCase(
         "solid_evaluate_density_yaml",
         "solid evaluate --yml solid_eval.yml",
         {

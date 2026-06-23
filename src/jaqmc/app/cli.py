@@ -79,6 +79,14 @@ def molecule_evaluate(cfg: ConfigManager, dry_run: bool):
     MoleculeEvalWorkflow(cfg)(dry_run)
 
 
+@molecule.add_command
+@make_cli(name="lit", help="Compute a molecular electric-dipole LIT spectrum.")
+def molecule_lit(cfg: ConfigManager, dry_run: bool):
+    from .molecule.lit_workflow import MoleculeLITWorkflow
+
+    MoleculeLITWorkflow(cfg)(dry_run)
+
+
 # --- solid ---
 
 
