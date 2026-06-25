@@ -3,6 +3,7 @@
 
 import numpy as np
 
+from jaqmc.app.molecule.lit_workflow import _parallel_worker_device_ids
 from jaqmc.response.inversion import (
     fit_lit_basis_expansion,
     lit_basis_transform,
@@ -89,3 +90,9 @@ def test_regularized_basis_inversion_refits_synthetic_lit():
     np.testing.assert_allclose(result.fit_lit, lit, rtol=1e-7, atol=1e-7)
     np.testing.assert_allclose(result.response, basis @ coefficients, rtol=1e-5)
     assert result.chi2 < 1e-10
+
+
+def test_parallel_worker_device_ids_oversubscribes_evenly():
+    devices = _parallel_worker_device_ids(("0", "1", "2"), 8, 3)
+
+    assert devices == ("0", "1", "2", "0", "1", "2", "0", "1")

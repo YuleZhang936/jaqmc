@@ -62,6 +62,7 @@ class MolecularLITConfig:
     preview_roots: int = 5
     scan_parallel: str = "auto"
     scan_parallel_workers: int = 0
+    scan_parallel_procs_per_device: int = 1
     scan_parallel_min_points_per_worker: int = 2
     scan_parallel_worker: bool = False
     nqs_checkpoint_path: str = ""
@@ -434,6 +435,9 @@ class MoleculeLITWorkflow(Workflow):
             raise ValueError(msg)
         if self.lit_config.scan_parallel_workers < 0:
             msg = "lit.scan_parallel_workers must be nonnegative."
+            raise ValueError(msg)
+        if self.lit_config.scan_parallel_procs_per_device < 1:
+            msg = "lit.scan_parallel_procs_per_device must be positive."
             raise ValueError(msg)
         if self.lit_config.scan_parallel_min_points_per_worker < 1:
             msg = "lit.scan_parallel_min_points_per_worker must be positive."
@@ -1513,10 +1517,13 @@ class MoleculeLITWorkflow(Workflow):
         return self._parallel_worker_count(device_ids) > 1
 
     def _parallel_worker_count(self, device_ids: tuple[str, ...]) -> int:
+        available_slots = len(device_ids) * int(
+            self.lit_config.scan_parallel_procs_per_device
+        )
         worker_limit = (
             int(self.lit_config.scan_parallel_workers)
             if self.lit_config.scan_parallel_workers > 0
-            else len(device_ids)
+            else available_slots
         )
         points_limit = max(
             1,
@@ -1527,7 +1534,7 @@ class MoleculeLITWorkflow(Workflow):
                 )
             ),
         )
-        return max(1, min(len(device_ids), worker_limit, points_limit))
+        return max(1, min(available_slots, worker_limit, points_limit))
 
     def _run_parallel_scan(self) -> None:
         axes = _axis_indices(self.lit_config.axes)
@@ -1543,6 +1550,11 @@ class MoleculeLITWorkflow(Workflow):
             logger.info("Parallel LIT scan requested but only one block is needed.")
             self._run_serial_scan()
             return
+        worker_devices = _parallel_worker_device_ids(
+            device_ids,
+            len(blocks),
+            int(self.lit_config.scan_parallel_procs_per_device),
+        )
 
         parallel_root = self.save_path / "parallel_scan"
         parallel_root.mkdir(parents=True, exist_ok=True)
@@ -1553,9 +1565,11 @@ class MoleculeLITWorkflow(Workflow):
         )
 
         logger.info(
-            "Starting local-device LIT scan: workers=%d devices=%s blocks=%s",
+            "Starting local-device LIT scan: workers=%d devices=%s "
+            "procs_per_device=%d blocks=%s",
             len(blocks),
-            ",".join(device_ids[: len(blocks)]),
+            ",".join(worker_devices),
+            int(self.lit_config.scan_parallel_procs_per_device),
             ",".join(f"{block[0]}:{block[-1] + 1}" for block in blocks),
         )
         failures: list[_ParallelWorker] = []
@@ -1571,7 +1585,8 @@ class MoleculeLITWorkflow(Workflow):
                     omega[block],
                     run_seed=run_seed,
                 )
-                env = _parallel_worker_env(device_ids[worker_index])
+                device = worker_devices[worker_index]
+                env = _parallel_worker_env(device)
                 log_file = stack.enter_context(log_path.open("w", encoding="utf8"))
                 process = subprocess.Popen(
                     command,
@@ -1587,7 +1602,7 @@ class MoleculeLITWorkflow(Workflow):
                         path=part_dir / self.lit_config.output_filename,
                         log_path=log_path,
                         process=process,
-                        device=device_ids[worker_index],
+                        device=device,
                     )
                 )
             for worker in workers:
@@ -1778,6 +1793,27 @@ def _split_omega_blocks(omega_points: int, worker_count: int) -> list[np.ndarray
         for block in np.array_split(indices, max(1, int(worker_count)))
         if block.size > 0
     ]
+
+
+def _parallel_worker_device_ids(
+    device_ids: tuple[str, ...],
+    worker_count: int,
+    procs_per_device: int,
+) -> tuple[str, ...]:
+    if not device_ids:
+        msg = "At least one CUDA device id is required."
+        raise ValueError(msg)
+    if procs_per_device < 1:
+        msg = "procs_per_device must be positive."
+        raise ValueError(msg)
+    max_workers = len(device_ids) * int(procs_per_device)
+    if worker_count > max_workers:
+        msg = (
+            f"worker_count={worker_count} exceeds available parallel slots "
+            f"{max_workers}."
+        )
+        raise ValueError(msg)
+    return tuple(device_ids[index % len(device_ids)] for index in range(worker_count))
 
 
 def _parallel_worker_env(device_id: str) -> dict[str, str]:
