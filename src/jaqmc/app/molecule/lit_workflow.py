@@ -107,7 +107,7 @@ class MolecularLITConfig:
     nqs_response_envelope: EnvelopeType = EnvelopeType.abs_isotropic
     nqs_response_orbitals_spin_split: bool = True
     nqs_log_interval: int = 50
-    inversion_enabled: bool = True
+    inversion_enabled: bool = False
     inversion_threshold: float = 0.0
     inversion_response_max: float | None = None
     inversion_response_points: int = 1000
