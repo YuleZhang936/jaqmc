@@ -231,6 +231,8 @@ questions:
 
 - **Configuration reference**: <project:train.md> and <project:eval.md> list the resolved
   workflow defaults and every supported key.
+- **Dipole NQS-LIT spectra**: <project:lit.md> shows how to run
+  `jaqmc molecule lit` from a trained ground-state checkpoint.
 - **Training diagnostics**: <project:../../guide/training-stats.md>
   shows how to interpret `train_stats.csv` and check convergence.
 - **Estimator physics**: <project:../../guide/estimators/index.md>
@@ -249,4 +251,5 @@ questions:
 
 train.md
 eval.md
+lit.md
 ```
