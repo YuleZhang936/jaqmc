@@ -34,6 +34,8 @@ from jaqmc.response.nqs_lit import (
     molecular_electronic_dipole,
     nqs_lit_double_sampled_stats,
     nqs_lit_source_sampled_stats,
+    nqs_lit_source_sampled_sums,
+    nqs_lit_stats_from_source_sums,
     restore_params_from_checkpoint,
 )
 from jaqmc.response.spectrum import find_spectrum_peaks
@@ -76,6 +78,8 @@ class MolecularLITConfig:
     nqs_train_pool_batches: int = 32
     nqs_eval_pool_batches: int = 8
     nqs_pool_stride: int = 1
+    nqs_train_update_batch_size: int = 0
+    nqs_eval_batch_size: int = 0
     nqs_source_pool_dir: str = ""
     nqs_reuse_source_pool: bool = True
     nqs_save_source_pool: bool = True
@@ -298,6 +302,7 @@ class MoleculeLITWorkflow(Workflow):
                         jnp.asarray(float(omega_value)),
                         axis_batched_data,
                         rng,
+                        iteration,
                     )
                     if (
                         self.lit_config.nqs_log_interval > 0
@@ -316,7 +321,7 @@ class MoleculeLITWorkflow(Workflow):
                             int(stats.estimator_mode),
                         )
                 if stats is None:
-                    stats = self._nqs_stats(
+                    stats = self._nqs_stats_chunked(
                         response_apply,
                         response_params,
                         ground_logpsi,
@@ -442,6 +447,7 @@ class MoleculeLITWorkflow(Workflow):
         if self.lit_config.scan_parallel_min_points_per_worker < 1:
             msg = "lit.scan_parallel_min_points_per_worker must be positive."
             raise ValueError(msg)
+        self._validate_chunk_config()
         if not 0.0 <= self.lit_config.nqs_reweight_ess_fraction_min <= 1.0:
             msg = (
                 "lit.nqs_reweight_ess_fraction_min must be between 0 and 1, got "
@@ -456,6 +462,14 @@ class MoleculeLITWorkflow(Workflow):
             raise ValueError(msg)
         if self.lit_config.nqs_direct_psi_stride < 1:
             msg = "lit.nqs_direct_psi_stride must be positive."
+            raise ValueError(msg)
+
+    def _validate_chunk_config(self) -> None:
+        if self.lit_config.nqs_train_update_batch_size < 0:
+            msg = "lit.nqs_train_update_batch_size must be nonnegative."
+            raise ValueError(msg)
+        if self.lit_config.nqs_eval_batch_size < 0:
+            msg = "lit.nqs_eval_batch_size must be nonnegative."
             raise ValueError(msg)
 
     def _make_response_ansatz(
@@ -622,13 +636,14 @@ class MoleculeLITWorkflow(Workflow):
         ):
             return response_params, fallback_data, rng
         stats = None
-        for _ in range(self.lit_config.nqs_warm_start_iterations):
+        for iteration in range(self.lit_config.nqs_warm_start_iterations):
             response_params, stats, fallback_data, rng = update_step(
                 response_params,
                 train_pool,
                 jnp.asarray(float(self.lit_config.nqs_warm_start_omega)),
                 fallback_data,
                 rng,
+                iteration,
             )
         if stats is not None:
             logger.info(
@@ -833,20 +848,35 @@ class MoleculeLITWorkflow(Workflow):
             loss = _fidelity_loss(stats.fidelity, self.lit_config.nqs_sr_score_eps)
             return response_params, stats._replace(loss=loss)
 
-        def update(response_params, batched_data, omega, fallback_data, rng):
-            stats = self._nqs_stats(
-                response_apply,
-                response_params,
-                ground_logpsi,
-                ground_params,
+        def update(
+            response_params,
+            batched_data,
+            omega,
+            fallback_data,
+            rng,
+            batch_index: int = 0,
+        ):
+            update_batch = _cyclic_batched_data_chunk(
                 batched_data,
-                axis=axis,
-                source_center=source_center,
-                source_norm=source_norm,
-                ground_energy=ground_energy,
-                omega=omega,
+                self._nqs_train_update_batch_size(),
+                batch_index,
             )
-            if self._should_use_direct_psi(stats):
+            if self._needs_direct_psi_estimator():
+                stats = self._nqs_stats(
+                    response_apply,
+                    response_params,
+                    ground_logpsi,
+                    ground_params,
+                    update_batch,
+                    axis=axis,
+                    source_center=source_center,
+                    source_norm=source_norm,
+                    ground_energy=ground_energy,
+                    omega=omega,
+                )
+            else:
+                stats = None
+            if stats is not None and self._should_use_direct_psi(stats):
                 psi_pool, fallback_data, rng = self._collect_direct_psi_pool(
                     response_apply,
                     response_params,
@@ -862,14 +892,14 @@ class MoleculeLITWorkflow(Workflow):
                 )
                 response_params, stats = direct_update(
                     response_params,
-                    batched_data,
+                    update_batch,
                     psi_pool,
                     omega,
                 )
                 return response_params, stats, fallback_data, rng
             response_params, stats = reweighted_update(
                 response_params,
-                batched_data,
+                update_batch,
                 omega,
             )
             return response_params, stats, fallback_data, rng
@@ -1232,6 +1262,54 @@ class MoleculeLITWorkflow(Workflow):
             source_floor=self.lit_config.nqs_source_floor,
         )
 
+    def _nqs_stats_chunked(
+        self,
+        response_apply,
+        response_params,
+        ground_logpsi,
+        ground_params,
+        batched_data,
+        *,
+        axis: int,
+        source_center: float,
+        source_norm: float,
+        ground_energy: float,
+        omega,
+    ):
+        chunk_size = self._nqs_eval_batch_size()
+
+        @jax.jit
+        def chunk_sums(local_params, chunk, local_omega):
+            return nqs_lit_source_sampled_sums(
+                response_apply,
+                local_params,
+                ground_logpsi,
+                ground_params,
+                chunk,
+                axis=axis,
+                source_center=source_center,
+                ground_energy=ground_energy,
+                omega=local_omega,
+                eta=self.lit_config.eta,
+                source_floor=self.lit_config.nqs_source_floor,
+            )
+
+        total_sums = None
+        for chunk in _batched_data_chunks(batched_data, chunk_size):
+            sums = chunk_sums(response_params, chunk, omega)
+            total_sums = (
+                sums if total_sums is None else _add_source_sums(total_sums, sums)
+            )
+        if total_sums is None:
+            msg = "Cannot evaluate NQS-LIT stats with an empty source pool."
+            raise ValueError(msg)
+        return nqs_lit_stats_from_source_sums(
+            total_sums,
+            source_norm=source_norm,
+            omega=omega,
+            eta=self.lit_config.eta,
+        )
+
     def _nqs_double_stats(
         self,
         response_apply,
@@ -1279,7 +1357,7 @@ class MoleculeLITWorkflow(Workflow):
         ground_energy: float,
         omega,
     ):
-        stats = self._nqs_stats(
+        stats = self._nqs_stats_chunked(
             response_apply,
             response_params,
             ground_logpsi,
@@ -1329,6 +1407,21 @@ class MoleculeLITWorkflow(Workflow):
         if threshold <= 0.0:
             return False
         return float(jax.device_get(stats.reweight_ess_fraction)) < threshold
+
+    def _needs_direct_psi_estimator(self) -> bool:
+        return float(self.lit_config.nqs_reweight_ess_fraction_min) > 0.0
+
+    def _nqs_train_update_batch_size(self) -> int:
+        configured = int(self.lit_config.nqs_train_update_batch_size)
+        if configured > 0:
+            return configured
+        return max(1, int(self.config.batch_size))
+
+    def _nqs_eval_batch_size(self) -> int:
+        configured = int(self.lit_config.nqs_eval_batch_size)
+        if configured > 0:
+            return configured
+        return max(1, int(self.config.batch_size))
 
     def _collect_direct_psi_pool(
         self,
@@ -1889,6 +1982,55 @@ def _concat_batched_data(pool):
         data=first.data.merge(updates),
         fields_with_batch=first.fields_with_batch,
     )
+
+
+def _slice_batched_data(pool: BatchedData, start: int, size: int) -> BatchedData:
+    if size < 1:
+        msg = "BatchedData chunk size must be positive."
+        raise ValueError(msg)
+    if start < 0 or start + size > pool.batch_size:
+        msg = (
+            f"Invalid BatchedData slice start={start} size={size} "
+            f"for batch_size={pool.batch_size}."
+        )
+        raise ValueError(msg)
+    updates = {
+        field_name: jax.tree.map(
+            operator.itemgetter(slice(start, start + size)),
+            getattr(pool.data, field_name),
+        )
+        for field_name in pool.fields_with_batch
+    }
+    return pool.__class__(
+        data=pool.data.merge(updates),
+        fields_with_batch=pool.fields_with_batch,
+    )
+
+
+def _cyclic_batched_data_chunk(
+    pool: BatchedData,
+    requested_size: int,
+    batch_index: int,
+) -> BatchedData:
+    chunk_size = min(max(1, int(requested_size)), max(1, pool.batch_size))
+    if chunk_size >= pool.batch_size:
+        return pool
+    chunk_count = max(1, pool.batch_size // chunk_size)
+    start = (int(batch_index) % chunk_count) * chunk_size
+    return _slice_batched_data(pool, start, chunk_size)
+
+
+def _batched_data_chunks(pool: BatchedData, requested_size: int):
+    chunk_size = min(max(1, int(requested_size)), max(1, pool.batch_size))
+    start = 0
+    while start < pool.batch_size:
+        size = min(chunk_size, pool.batch_size - start)
+        yield _slice_batched_data(pool, start, size)
+        start += size
+
+
+def _add_source_sums(left, right):
+    return jax.tree.map(operator.add, left, right)
 
 
 def _inversion_response_grid(

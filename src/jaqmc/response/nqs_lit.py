@@ -62,6 +62,23 @@ class NQSLITStats(NamedTuple):
     estimator_mode: jnp.ndarray
 
 
+class NQSLITSourceSums(NamedTuple):
+    """Additive source-sampled sums for chunked NQS-LIT evaluation."""
+
+    sample_count: jnp.ndarray
+    weight_sum: jnp.ndarray
+    valid_sample_count: jnp.ndarray
+    ratio_sum: jnp.ndarray
+    ratio_abs2_sum: jnp.ndarray
+    psi_weight_sum: jnp.ndarray
+    psi_weight_sq_sum: jnp.ndarray
+    response_conj_over_source_sum: jnp.ndarray
+    response_over_source_abs2_sum: jnp.ndarray
+    hbar_over_source_sum: jnp.ndarray
+    hbar_over_source_abs2_sum: jnp.ndarray
+    ground_energy_sum: jnp.ndarray
+
+
 class MolecularResponseFermiNet(nn.Module):
     """Complex FermiNet-style response wavefunction ``Psi_L``."""
 
@@ -237,6 +254,45 @@ def nqs_lit_source_sampled_stats(
     eps: float = 1e-12,
 ) -> NQSLITStats:
     """Compute fidelity and LIT observables from ``pi_Phi`` samples."""
+    sums = nqs_lit_source_sampled_sums(
+        response_apply,
+        response_params,
+        ground_logpsi,
+        ground_params,
+        batched_data,
+        axis=axis,
+        source_center=source_center,
+        ground_energy=ground_energy,
+        omega=omega,
+        eta=eta,
+        source_floor=source_floor,
+        eps=eps,
+    )
+    return nqs_lit_stats_from_source_sums(
+        sums,
+        source_norm=source_norm,
+        omega=omega,
+        eta=eta,
+        eps=eps,
+    )
+
+
+def nqs_lit_source_sampled_sums(
+    response_apply: ResponseApply,
+    response_params: Params,
+    ground_logpsi: GroundLogPsi,
+    ground_params: Params,
+    batched_data: BatchedData[MoleculeData],
+    *,
+    axis: int,
+    source_center: float | jnp.ndarray,
+    ground_energy: float | jnp.ndarray,
+    omega: float | jnp.ndarray,
+    eta: float | jnp.ndarray,
+    source_floor: float | jnp.ndarray = 0.0,
+    eps: float = 1e-12,
+) -> NQSLITSourceSums:
+    """Return additive raw sums for source-sampled NQS-LIT observables."""
     data = batched_data.data
     action, response_ratio, eloc_response = jax.vmap(
         lambda one: local_action_ratio(
@@ -277,10 +333,6 @@ def nqs_lit_source_sampled_stats(
         source_weight,
         jnp.asarray(0.0, dtype=source_weight.dtype),
     )
-    weight_norm = jnp.maximum(jnp.mean(source_weight), eps)
-
-    def source_weighted_mean(value):
-        return jnp.mean(source_weight * value) / weight_norm
 
     safe_source = jnp.where(
         jnp.abs(source) > eps,
@@ -288,45 +340,102 @@ def nqs_lit_source_sampled_stats(
         jnp.asarray(eps, dtype=source.dtype) * jnp.where(source < 0, -1.0, 1.0),
     )
     ratio = action / safe_source
-    normalization = source_weighted_mean(ratio)
-    ratio_norm = source_weighted_mean(jnp.abs(ratio) ** 2)
     psi_weight_unnormalized = source_weight * jnp.abs(ratio) ** 2
-    psi_weight_sum = jnp.sum(psi_weight_unnormalized)
-    reweight_ess = psi_weight_sum**2 / jnp.maximum(
-        jnp.sum(psi_weight_unnormalized**2),
-        eps,
+    shift = jnp.asarray(omega, dtype=response_ratio.real.dtype) + 1j * jnp.asarray(
+        eta,
+        dtype=response_ratio.real.dtype,
+    )
+    hbar_response_ratio = action + shift * response_ratio
+    response_over_source = response_ratio / safe_source
+    hbar_over_source = hbar_response_ratio / safe_source
+    eloc_finite = jnp.isfinite(jnp.real(eloc_response))
+    eloc_response = jnp.where(
+        eloc_finite,
+        eloc_response,
+        jnp.asarray(0.0, dtype=eloc_response.dtype),
+    )
+    sample_count = jnp.asarray(action.shape[0], dtype=source_weight.real.dtype)
+    return NQSLITSourceSums(
+        sample_count=sample_count,
+        weight_sum=jnp.sum(source_weight),
+        valid_sample_count=jnp.sum(
+            source_weight > jnp.asarray(0.0, dtype=source_weight.dtype)
+        ),
+        ratio_sum=jnp.sum(source_weight * ratio),
+        ratio_abs2_sum=jnp.sum(source_weight * jnp.abs(ratio) ** 2),
+        psi_weight_sum=jnp.sum(psi_weight_unnormalized),
+        psi_weight_sq_sum=jnp.sum(psi_weight_unnormalized**2),
+        response_conj_over_source_sum=jnp.sum(
+            source_weight * jnp.conj(response_ratio) / safe_source
+        ),
+        response_over_source_abs2_sum=jnp.sum(
+            source_weight * jnp.abs(response_over_source) ** 2
+        ),
+        hbar_over_source_sum=jnp.sum(source_weight * hbar_over_source),
+        hbar_over_source_abs2_sum=jnp.sum(
+            source_weight * jnp.abs(hbar_over_source) ** 2
+        ),
+        ground_energy_sum=jnp.real(jnp.sum(eloc_response)),
+    )
+
+
+def nqs_lit_stats_from_source_sums(
+    sums: NQSLITSourceSums,
+    *,
+    source_norm: float | jnp.ndarray,
+    omega: float | jnp.ndarray,
+    eta: float | jnp.ndarray,
+    eps: float = 1e-12,
+) -> NQSLITStats:
+    """Convert additive source-sampled sums into standard diagnostics."""
+    real_dtype = sums.weight_sum.dtype
+    safe_weight_sum = jnp.maximum(
+        sums.weight_sum,
+        jnp.asarray(eps, dtype=real_dtype),
+    )
+    normalization = sums.ratio_sum / safe_weight_sum
+    ratio_norm = sums.ratio_abs2_sum / safe_weight_sum
+    reweight_ess = sums.psi_weight_sum**2 / jnp.maximum(
+        sums.psi_weight_sq_sum,
+        jnp.asarray(eps, dtype=real_dtype),
     )
     valid_sample_count = jnp.maximum(
-        jnp.sum(source_weight > jnp.asarray(0.0, dtype=source_weight.dtype)),
-        jnp.asarray(1, dtype=reweight_ess.dtype),
+        sums.valid_sample_count,
+        jnp.asarray(1, dtype=real_dtype),
     )
     reweight_ess_fraction = reweight_ess / valid_sample_count
     fidelity = (jnp.abs(normalization) ** 2) / jnp.maximum(ratio_norm, eps)
     fidelity = jnp.clip(jnp.real(fidelity), 0.0, 1.0)
     loss = 1.0 - fidelity
 
-    phi_norm = jnp.asarray(source_norm, dtype=dipole.dtype)
+    phi_norm = jnp.asarray(source_norm, dtype=real_dtype)
     action_norm = phi_norm * ratio_norm
-    correction_overlap = phi_norm * source_weighted_mean(
-        jnp.conj(response_ratio) / safe_source
-    )
+    correction_overlap = phi_norm * sums.response_conj_over_source_sum / safe_weight_sum
     safe_normalization = normalization + jnp.asarray(eps, dtype=normalization.dtype)
     normalized_overlap = correction_overlap / jnp.conj(safe_normalization)
     lit = jnp.maximum(-jnp.imag(normalized_overlap) / jnp.asarray(eta), 0.0)
     broadened = jnp.asarray(eta) * lit / jnp.pi
-    residual = ratio / safe_normalization
-    residual_norm = phi_norm * source_weighted_mean(jnp.abs(residual - 1.0) ** 2)
-    correction_norm, shifted_hamiltonian_norm, error_d = _source_sampled_error_d(
-        action,
-        response_ratio,
-        source_weighted_mean,
-        safe_source,
+    residual_mean = (
+        ratio_norm / jnp.maximum(jnp.abs(safe_normalization) ** 2, eps)
+        - 2.0 * jnp.real(normalization / safe_normalization)
+        + 1.0
+    )
+    residual_norm = phi_norm * jnp.maximum(
+        jnp.real(residual_mean),
+        jnp.asarray(0.0, dtype=real_dtype),
+    )
+    correction_norm, shifted_hamiltonian_norm, error_d = _source_sampled_error_d_sums(
+        sums,
         phi_norm,
         safe_normalization,
         normalized_overlap,
         omega=omega,
         eta=eta,
         eps=eps,
+    )
+    safe_sample_count = jnp.maximum(
+        sums.sample_count,
+        jnp.asarray(1, dtype=real_dtype),
     )
     return NQSLITStats(
         loss=jnp.real(loss),
@@ -338,13 +447,74 @@ def nqs_lit_source_sampled_stats(
         correction_overlap=correction_overlap,
         normalization=normalization,
         residual_norm=jnp.real(residual_norm),
-        ground_energy_mean=jnp.real(jnp.mean(eloc_response)),
+        ground_energy_mean=jnp.real(sums.ground_energy_sum / safe_sample_count),
         correction_norm=jnp.real(correction_norm),
         shifted_hamiltonian_norm=jnp.real(shifted_hamiltonian_norm),
         error_d=jnp.real(error_d),
         reweight_ess=jnp.real(reweight_ess),
         reweight_ess_fraction=jnp.real(reweight_ess_fraction),
         estimator_mode=jnp.asarray(0, dtype=jnp.int32),
+    )
+
+
+def _source_sampled_error_d_sums(
+    sums: NQSLITSourceSums,
+    phi_norm: jnp.ndarray,
+    safe_normalization: jnp.ndarray,
+    normalized_overlap: jnp.ndarray,
+    *,
+    omega: float | jnp.ndarray,
+    eta: float | jnp.ndarray,
+    eps: float,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    safe_weight_sum = jnp.maximum(
+        sums.weight_sum,
+        jnp.asarray(eps, dtype=sums.weight_sum.dtype),
+    )
+    correction_norm = (
+        phi_norm
+        * sums.response_over_source_abs2_sum
+        / safe_weight_sum
+        / jnp.maximum(jnp.abs(safe_normalization) ** 2, eps)
+    )
+    phi_norm_safe = jnp.maximum(phi_norm, jnp.asarray(eps, dtype=phi_norm.dtype))
+    correction_projection = jnp.abs(normalized_overlap) ** 2 / phi_norm_safe
+    correction_perp = jnp.sqrt(
+        jnp.maximum(
+            jnp.real(correction_norm - correction_projection),
+            jnp.asarray(0.0, dtype=phi_norm.dtype),
+        )
+    )
+    shift_norm = jnp.sqrt(
+        jnp.asarray(omega, dtype=phi_norm.dtype) ** 2
+        + jnp.asarray(eta, dtype=phi_norm.dtype) ** 2
+    )
+    shift_norm = jnp.maximum(shift_norm, jnp.asarray(eps, dtype=shift_norm.dtype))
+    shifted_hamiltonian_norm = (
+        phi_norm
+        * sums.hbar_over_source_abs2_sum
+        / safe_weight_sum
+        / jnp.maximum(jnp.abs(safe_normalization) ** 2, eps)
+        / shift_norm**2
+    )
+    shifted_overlap = (
+        phi_norm
+        * sums.hbar_over_source_sum
+        / safe_weight_sum
+        / safe_normalization
+        / shift_norm
+    )
+    shifted_projection = jnp.abs(shifted_overlap) ** 2 / phi_norm_safe
+    shifted_perp = jnp.sqrt(
+        jnp.maximum(
+            jnp.real(shifted_hamiltonian_norm - shifted_projection),
+            jnp.asarray(0.0, dtype=phi_norm.dtype),
+        )
+    )
+    return (
+        correction_norm,
+        shifted_hamiltonian_norm,
+        jnp.minimum(correction_perp, shifted_perp),
     )
 
 

@@ -2,8 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
+from jax import numpy as jnp
 
-from jaqmc.app.molecule.lit_workflow import _parallel_worker_device_ids
+from jaqmc.app.molecule.data import MoleculeData
+from jaqmc.app.molecule.lit_workflow import (
+    _batched_data_chunks,
+    _cyclic_batched_data_chunk,
+    _parallel_worker_device_ids,
+)
+from jaqmc.data import BatchedData
 from jaqmc.response.inversion import (
     fit_lit_basis_expansion,
     lit_basis_transform,
@@ -96,3 +103,27 @@ def test_parallel_worker_device_ids_oversubscribes_evenly():
     devices = _parallel_worker_device_ids(("0", "1", "2"), 8, 3)
 
     assert devices == ("0", "1", "2", "0", "1", "2", "0", "1")
+
+
+def test_batched_data_chunks_cover_pool_and_cycle():
+    pool = BatchedData(
+        data=MoleculeData(
+            electrons=jnp.arange(30, dtype=jnp.float32).reshape(10, 1, 3),
+            atoms=jnp.zeros((1, 3), dtype=jnp.float32),
+            charges=jnp.ones((1,), dtype=jnp.float32),
+        ),
+        fields_with_batch=("electrons",),
+    )
+
+    cycled = _cyclic_batched_data_chunk(pool, 4, 3)
+    chunks = list(_batched_data_chunks(pool, 4))
+
+    np.testing.assert_array_equal(
+        np.asarray(cycled.data.electrons[:, 0, 0]),
+        [12, 15, 18, 21],
+    )
+    assert [chunk.batch_size for chunk in chunks] == [4, 4, 2]
+    np.testing.assert_array_equal(
+        np.concatenate([np.asarray(chunk.data.electrons[:, 0, 0]) for chunk in chunks]),
+        np.arange(0, 30, 3),
+    )
