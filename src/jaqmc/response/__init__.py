@@ -3,12 +3,6 @@
 
 """Response-theory utilities."""
 
-from jaqmc.response.inversion import (
-    BasisLITInversionResult,
-    fit_lit_basis_expansion,
-    lit_basis_transform,
-    lit_response_basis,
-)
 from jaqmc.response.lit import (
     broadened_from_lit,
     lit_error_bound,
@@ -31,18 +25,14 @@ from jaqmc.response.spectrum import (
 )
 
 __all__ = [
-    "BasisLITInversionResult",
     "MolecularResponseFermiNet",
     "NQSLITStats",
     "Peak",
     "broadened_from_lit",
     "find_spectrum_peaks",
-    "fit_lit_basis_expansion",
     "ground_local_energy",
-    "lit_basis_transform",
     "lit_error_bound",
     "lit_from_poles",
-    "lit_response_basis",
     "local_action_ratio",
     "molecular_electronic_dipole",
     "molecular_potential_energy",

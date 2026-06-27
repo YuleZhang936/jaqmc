@@ -25,7 +25,6 @@ from upath import UPath
 from jaqmc.app.molecule.data import data_init
 from jaqmc.app.molecule.workflow import configure_system
 from jaqmc.data import BatchedData
-from jaqmc.response.inversion import fit_lit_basis_expansion
 from jaqmc.response.lit import lit_error_bound
 from jaqmc.response.nqs_lit import (
     MolecularResponseFermiNet,
@@ -107,18 +106,6 @@ class MolecularLITConfig:
     nqs_response_envelope: EnvelopeType = EnvelopeType.abs_isotropic
     nqs_response_orbitals_spin_split: bool = True
     nqs_log_interval: int = 50
-    inversion_enabled: bool = False
-    inversion_threshold: float = 0.0
-    inversion_response_max: float | None = None
-    inversion_response_points: int = 1000
-    inversion_basis_count: int = 8
-    inversion_alpha1_grid: tuple[float, ...] = field(
-        default_factory=lambda: (0.0, 0.5, 1.0, 1.5, 2.0, 3.0)
-    )
-    inversion_alpha2_grid: tuple[float, ...] = field(default_factory=tuple)
-    inversion_l2_grid: tuple[float, ...] = field(
-        default_factory=lambda: (1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2)
-    )
 
 
 @dataclass(frozen=True)
@@ -386,7 +373,6 @@ class MoleculeLITWorkflow(Workflow):
             total_broadened,
             min_height_fraction=self.lit_config.peak_min_height_fraction,
         )
-        inversion_output, inversion_peaks = self._invert_lit_spectrum(omega, lit)
         output_path = self.save_path / self.lit_config.output_filename
         _save_npz(
             output_path,
@@ -427,14 +413,6 @@ class MoleculeLITWorkflow(Workflow):
             peak_energies=np.asarray([peak.energy for peak in peaks]),
             peak_intensities=np.asarray([peak.intensity for peak in peaks]),
             peak_indices=np.asarray([peak.index for peak in peaks]),
-            inversion_peak_energies=np.asarray(
-                [peak.energy for peak in inversion_peaks]
-            ),
-            inversion_peak_intensities=np.asarray(
-                [peak.intensity for peak in inversion_peaks]
-            ),
-            inversion_peak_indices=np.asarray([peak.index for peak in inversion_peaks]),
-            **inversion_output,
         )
         self._log_nqs_summary(str(output_path), peaks, fidelity)
 
@@ -1510,86 +1488,6 @@ class MoleculeLITWorkflow(Workflow):
 
         return log_amplitude
 
-    def _invert_lit_spectrum(self, omega: np.ndarray, lit: np.ndarray):
-        if not self.lit_config.inversion_enabled:
-            return {"inversion_enabled": False}, []
-        if omega.size < 2:
-            logger.warning(
-                "Skipping LIT inversion because at least two omega points are "
-                "required; got %d.",
-                omega.size,
-            )
-            return {
-                "inversion_enabled": False,
-                "inversion_skip_reason": "omega_points_lt_2",
-            }, []
-
-        response_omega = _inversion_response_grid(
-            omega,
-            eta=float(self.lit_config.eta),
-            threshold=float(self.lit_config.inversion_threshold),
-            response_max=self.lit_config.inversion_response_max,
-            response_points=int(self.lit_config.inversion_response_points),
-        )
-        axis_response = []
-        axis_fit_lit = []
-        coefficients = []
-        alpha1 = []
-        alpha2 = []
-        l2_regularization = []
-        chi2 = []
-        objective = []
-        for axis_lit in lit:
-            result = fit_lit_basis_expansion(
-                omega,
-                axis_lit,
-                float(self.lit_config.eta),
-                threshold=float(self.lit_config.inversion_threshold),
-                response_omega=response_omega,
-                basis_count=int(self.lit_config.inversion_basis_count),
-                alpha1_grid=self.lit_config.inversion_alpha1_grid,
-                alpha2_grid=self.lit_config.inversion_alpha2_grid,
-                l2_grid=self.lit_config.inversion_l2_grid,
-            )
-            axis_response.append(result.response)
-            axis_fit_lit.append(result.fit_lit)
-            coefficients.append(result.coefficients)
-            alpha1.append(result.alpha1)
-            alpha2.append(result.alpha2)
-            l2_regularization.append(result.l2_regularization)
-            chi2.append(result.chi2)
-            objective.append(result.objective)
-
-        axis_response_arr = np.asarray(axis_response, dtype=np.float64)
-        total_response = np.sum(axis_response_arr, axis=0)
-        inversion_peaks = find_spectrum_peaks(
-            response_omega,
-            total_response,
-            min_height_fraction=self.lit_config.peak_min_height_fraction,
-        )
-        return (
-            {
-                "inversion_enabled": True,
-                "inversion_method": "regularized_basis_expansion",
-                "inversion_response_omega": response_omega,
-                "inversion_response": axis_response_arr,
-                "total_inversion_response": total_response,
-                "inversion_fit_lit": np.asarray(axis_fit_lit, dtype=np.float64),
-                "inversion_coefficients": np.asarray(coefficients, dtype=np.float64),
-                "inversion_alpha1": np.asarray(alpha1, dtype=np.float64),
-                "inversion_alpha2": np.asarray(alpha2, dtype=np.float64),
-                "inversion_l2_regularization": np.asarray(
-                    l2_regularization,
-                    dtype=np.float64,
-                ),
-                "inversion_chi2": np.asarray(chi2, dtype=np.float64),
-                "inversion_objective": np.asarray(objective, dtype=np.float64),
-                "inversion_threshold": float(self.lit_config.inversion_threshold),
-                "inversion_basis_count": int(self.lit_config.inversion_basis_count),
-            },
-            inversion_peaks,
-        )
-
     def _log_nqs_summary(self, output_path: str, peaks, fidelity: np.ndarray) -> None:
         logger.info("Wrote NQS-LIT spectrum to %s", output_path)
         logger.info(
@@ -1754,7 +1652,6 @@ class MoleculeLITWorkflow(Workflow):
             f"lit.omega_min={float(block_omega[0])}",
             f"lit.omega_max={float(block_omega[-1])}",
             f"lit.omega_points={int(block_omega.size)}",
-            "lit.inversion_enabled=false",
             f"lit.nqs_source_pool_dir={source_pool_dir}",
         ]
 
@@ -1803,10 +1700,6 @@ class MoleculeLITWorkflow(Workflow):
             total_broadened,
             min_height_fraction=self.lit_config.peak_min_height_fraction,
         )
-        inversion_output, inversion_peaks = self._invert_lit_spectrum(
-            omega,
-            combined["lit"],
-        )
         source_centers_blocks = np.asarray(
             [part["source_centers"] for part in loaded],
             dtype=np.float64,
@@ -1849,13 +1742,6 @@ class MoleculeLITWorkflow(Workflow):
             peak_energies=np.asarray([peak.energy for peak in peaks]),
             peak_intensities=np.asarray([peak.intensity for peak in peaks]),
             peak_indices=np.asarray([peak.index for peak in peaks]),
-            inversion_peak_energies=np.asarray(
-                [peak.energy for peak in inversion_peaks]
-            ),
-            inversion_peak_intensities=np.asarray(
-                [peak.intensity for peak in inversion_peaks]
-            ),
-            inversion_peak_indices=np.asarray([peak.index for peak in inversion_peaks]),
             parallel_scan_enabled=True,
             parallel_scan_devices=np.asarray(devices, dtype=str),
             parallel_scan_blocks=np.asarray(
@@ -1864,7 +1750,6 @@ class MoleculeLITWorkflow(Workflow):
             ),
             parallel_scan_part_paths=np.asarray([str(path) for path in paths]),
             **combined,
-            **inversion_output,
         )
         self._log_nqs_summary(str(output_path), peaks, combined["fidelity"])
 
@@ -2039,34 +1924,6 @@ def _batched_data_chunks(pool: BatchedData, requested_size: int):
 
 def _add_source_sums(left, right):
     return jax.tree.map(operator.add, left, right)
-
-
-def _inversion_response_grid(
-    omega: np.ndarray,
-    *,
-    eta: float,
-    threshold: float,
-    response_max: float | None,
-    response_points: int,
-) -> np.ndarray:
-    if response_points < 2:
-        msg = f"lit.inversion_response_points must be at least 2, got {response_points}"
-        raise ValueError(msg)
-    upper = (
-        float(response_max)
-        if response_max is not None
-        else max(
-            float(np.max(omega) + 8.0 * eta),
-            float(threshold + 1.25 * max(np.max(omega) - threshold, eta)),
-        )
-    )
-    if upper <= threshold:
-        msg = (
-            "lit.inversion_response_max must exceed lit.inversion_threshold, got "
-            f"{upper} <= {threshold}"
-        )
-        raise ValueError(msg)
-    return np.linspace(float(threshold), upper, int(response_points))
 
 
 def _save_batched_pool(

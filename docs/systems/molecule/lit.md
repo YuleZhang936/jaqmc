@@ -26,8 +26,7 @@ jaqmc molecule lit --yml molecule_lit.yml \
 
 The command writes `lit_spectrum.npz` under `workflow.save_path`. The file
 contains the scan grid, LIT values, fidelity diagnostics, reweighting effective
-sample-size diagnostics, and peak-picking output. LIT inversion is an optional
-post-processing step and is disabled by default.
+sample-size diagnostics, and peak-picking output.
 
 On a multi-GPU node, the reference LIT configuration below uses
 `lit.scan_parallel=auto`. JaQMC splits the frequency grid into local worker
@@ -211,15 +210,6 @@ lit:
   nqs_response_use_last_layer: false
   nqs_response_envelope: abs_isotropic
   nqs_response_orbitals_spin_split: true
-
-  inversion_enabled: false
-  inversion_threshold: 0.0
-  inversion_response_max: 0.55
-  inversion_response_points: 1600
-  inversion_basis_count: 10
-  inversion_alpha1_grid: [0.0, 0.5, 1.0, 1.5, 2.0, 3.0]
-  inversion_alpha2_grid: []
-  inversion_l2_grid: [1.0e-07, 1.0e-06, 1.0e-05, 0.0001, 0.001, 0.01]
 ```
 
 Run it from the repository root:
@@ -277,20 +267,3 @@ jaqmc molecule lit --yml h_atom_lit.yml \
 
 This only checks that checkpoint restoration, source-pool construction, and the
 response update path run successfully. It is not a physics calculation.
-
-## Optional LIT Inversion
-
-Raw LIT values are the primary output of the workflow. To attempt a basis
-expansion inversion of the transform, enable it explicitly:
-
-```bash
-jaqmc molecule lit --yml h_atom_lit.yml \
-  workflow.save_path=./runs/h_atom-lit-inversion \
-  workflow.restore_path=./runs/h_atom-ground \
-  lit.inversion_enabled=true
-```
-
-Inversion is an ill-conditioned post-processing problem. Treat
-`inversion_peak_energies` as reliable only after checking the fitted LIT,
-regularization choice, and stability against the frequency window, broadening
-width, and inversion basis.

@@ -11,11 +11,6 @@ from jaqmc.app.molecule.lit_workflow import (
     _parallel_worker_device_ids,
 )
 from jaqmc.data import BatchedData
-from jaqmc.response.inversion import (
-    fit_lit_basis_expansion,
-    lit_basis_transform,
-    lit_response_basis,
-)
 from jaqmc.response.lit import (
     broadened_from_lit,
     lit_from_poles,
@@ -67,36 +62,6 @@ def test_hydrogen_bound_lit_matches_hardcoded_lorentzian_sum():
     actual = broadened_from_lit(lit_from_poles(omega, energies, strengths, eta), eta)
 
     np.testing.assert_allclose(actual, expected, rtol=1e-14)
-
-
-def test_regularized_basis_inversion_refits_synthetic_lit():
-    response_omega = np.linspace(0.0, 5.0, 1200)
-    omega0 = np.linspace(0.2, 3.5, 24)
-    eta = 0.2
-    basis = lit_response_basis(
-        response_omega,
-        threshold=0.0,
-        basis_count=3,
-        alpha1=1.0,
-        alpha2=2.0,
-    )
-    coefficients = np.array([0.8, 0.25, 0.05])
-    lit = lit_basis_transform(omega0, response_omega, basis, eta) @ coefficients
-
-    result = fit_lit_basis_expansion(
-        omega0,
-        lit,
-        eta,
-        response_omega=response_omega,
-        basis_count=3,
-        alpha1_grid=(1.0,),
-        alpha2_grid=(2.0,),
-        l2_grid=(1e-10,),
-    )
-
-    np.testing.assert_allclose(result.fit_lit, lit, rtol=1e-7, atol=1e-7)
-    np.testing.assert_allclose(result.response, basis @ coefficients, rtol=1e-5)
-    assert result.chi2 < 1e-10
 
 
 def test_parallel_worker_device_ids_oversubscribes_evenly():
