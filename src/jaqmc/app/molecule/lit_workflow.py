@@ -293,14 +293,22 @@ class MoleculeLITWorkflow(Workflow):
                 rng,
                 axis=axis,
             )
+            axis_start_response_params = response_params
+            axis_start_batched_data = axis_batched_data
+            logger.info(
+                "axis=%s omega_points independent_response_start=true",
+                _AXIS_NAMES[axis],
+            )
             for omega_pos, omega_value in enumerate(omega):
+                point_response_params = axis_start_response_params
+                point_batched_data = axis_start_batched_data
                 stats = None
                 for iteration in range(self.lit_config.nqs_iterations):
-                    response_params, stats, axis_batched_data, rng = update_step(
-                        response_params,
+                    point_response_params, stats, point_batched_data, rng = update_step(
+                        point_response_params,
                         train_pool,
                         jnp.asarray(float(omega_value)),
-                        axis_batched_data,
+                        point_batched_data,
                         rng,
                         iteration,
                     )
@@ -323,7 +331,7 @@ class MoleculeLITWorkflow(Workflow):
                 if stats is None:
                     stats = self._nqs_stats_chunked(
                         response_apply,
-                        response_params,
+                        point_response_params,
                         ground_logpsi,
                         ground_params,
                         train_pool,
@@ -333,13 +341,13 @@ class MoleculeLITWorkflow(Workflow):
                         ground_energy=ground_energy,
                         omega=float(omega_value),
                     )
-                stats, axis_batched_data, rng = self._nqs_eval_stats_with_fallback(
+                stats, point_batched_data, rng = self._nqs_eval_stats_with_fallback(
                     response_apply,
-                    response_params,
+                    point_response_params,
                     ground_logpsi,
                     ground_params,
                     eval_pool,
-                    axis_batched_data,
+                    point_batched_data,
                     rng,
                     axis=axis,
                     source_center=source_center,

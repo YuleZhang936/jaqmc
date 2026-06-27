@@ -31,7 +31,10 @@ post-processing step and is disabled by default.
 
 On a multi-GPU node, the reference LIT configuration below uses
 `lit.scan_parallel=auto`. JaQMC splits the frequency grid into local worker
-processes, using one process per visible GPU by default for this setting.
+processes, using one process per visible GPU by default for this setting. Each
+frequency point starts from the same axis warm-started response parameters, so
+peak positions are not path-dependent on neighboring frequencies or worker block
+boundaries.
 
 ## End-To-End H Atom Reference
 
