@@ -39,6 +39,7 @@ from jaqmc.wavefunction.output.orbital import SplitChannelDense
 
 type ResponseApply = Callable[[Params, MoleculeData], jnp.ndarray]
 type GroundLogPsi = Callable[[Params, MoleculeData], jnp.ndarray]
+type SourceRatioApply = Callable[[MoleculeData], jnp.ndarray]
 
 
 class NQSLITStats(NamedTuple):
@@ -244,14 +245,14 @@ def nqs_lit_source_sampled_stats(
     ground_params: Params,
     batched_data: BatchedData[MoleculeData],
     *,
-    axis: int,
-    source_center: float | jnp.ndarray,
+    source_ratio_apply: SourceRatioApply,
     source_norm: float | jnp.ndarray,
     ground_energy: float | jnp.ndarray,
     omega: float | jnp.ndarray,
     eta: float | jnp.ndarray,
     source_floor: float | jnp.ndarray = 0.0,
     eps: float = 1e-12,
+    local_action_fn: Callable | None = None,
 ) -> NQSLITStats:
     """Compute fidelity and LIT observables from ``pi_Phi`` samples."""
     sums = nqs_lit_source_sampled_sums(
@@ -260,13 +261,13 @@ def nqs_lit_source_sampled_stats(
         ground_logpsi,
         ground_params,
         batched_data,
-        axis=axis,
-        source_center=source_center,
+        source_ratio_apply=source_ratio_apply,
         ground_energy=ground_energy,
         omega=omega,
         eta=eta,
         source_floor=source_floor,
         eps=eps,
+        local_action_fn=local_action_fn,
     )
     return nqs_lit_stats_from_source_sums(
         sums,
@@ -284,35 +285,37 @@ def nqs_lit_source_sampled_sums(
     ground_params: Params,
     batched_data: BatchedData[MoleculeData],
     *,
-    axis: int,
-    source_center: float | jnp.ndarray,
+    source_ratio_apply: SourceRatioApply,
     ground_energy: float | jnp.ndarray,
     omega: float | jnp.ndarray,
     eta: float | jnp.ndarray,
     source_floor: float | jnp.ndarray = 0.0,
     eps: float = 1e-12,
+    local_action_fn: Callable | None = None,
 ) -> NQSLITSourceSums:
     """Return additive raw sums for source-sampled NQS-LIT observables."""
     data = batched_data.data
+
+    def one_action(one):
+        if local_action_fn is None:
+            return local_action_ratio(
+                response_apply,
+                response_params,
+                ground_logpsi,
+                ground_params,
+                one,
+                ground_energy=ground_energy,
+                omega=omega,
+                eta=eta,
+            )
+        return local_action_fn(response_params, one, omega)
+
     action, response_ratio, eloc_response = jax.vmap(
-        lambda one: local_action_ratio(
-            response_apply,
-            response_params,
-            ground_logpsi,
-            ground_params,
-            one,
-            ground_energy=ground_energy,
-            omega=omega,
-            eta=eta,
-        ),
+        one_action,
         in_axes=(batched_data.vmap_axis,),
     )(data)
-    dipole = jax.vmap(
-        lambda one: molecular_electronic_dipole(one, axis),
-        in_axes=(batched_data.vmap_axis,),
-    )(data)
-    source = dipole - jnp.asarray(source_center, dtype=dipole.dtype)
-    floor = jnp.asarray(source_floor, dtype=dipole.dtype)
+    source = jax.vmap(source_ratio_apply, in_axes=(batched_data.vmap_axis,))(data)
+    floor = jnp.asarray(source_floor, dtype=jnp.real(source).dtype)
     sampled_source_abs = jnp.maximum(jnp.abs(source), floor)
     source_weight = (jnp.abs(source) / jnp.maximum(sampled_source_abs, eps)) ** 2
     finite = (
@@ -320,7 +323,8 @@ def nqs_lit_source_sampled_sums(
         & jnp.isfinite(jnp.imag(action))
         & jnp.isfinite(jnp.real(response_ratio))
         & jnp.isfinite(jnp.imag(response_ratio))
-        & jnp.isfinite(source)
+        & jnp.isfinite(jnp.real(source))
+        & jnp.isfinite(jnp.imag(source))
     )
     action = jnp.where(finite, action, jnp.asarray(0.0, dtype=action.dtype))
     response_ratio = jnp.where(
@@ -337,7 +341,7 @@ def nqs_lit_source_sampled_sums(
     safe_source = jnp.where(
         jnp.abs(source) > eps,
         source,
-        jnp.asarray(eps, dtype=source.dtype) * jnp.where(source < 0, -1.0, 1.0),
+        jnp.asarray(eps, dtype=jnp.real(source).dtype) + 0j,
     )
     ratio = action / safe_source
     psi_weight_unnormalized = source_weight * jnp.abs(ratio) ** 2
@@ -515,152 +519,6 @@ def _source_sampled_error_d_sums(
         correction_norm,
         shifted_hamiltonian_norm,
         jnp.minimum(correction_perp, shifted_perp),
-    )
-
-
-def nqs_lit_double_sampled_stats(
-    response_apply: ResponseApply,
-    response_params: Params,
-    ground_logpsi: GroundLogPsi,
-    ground_params: Params,
-    source_batched_data: BatchedData[MoleculeData],
-    psi_batched_data: BatchedData[MoleculeData],
-    *,
-    axis: int,
-    source_center: float | jnp.ndarray,
-    source_norm: float | jnp.ndarray,
-    ground_energy: float | jnp.ndarray,
-    omega: float | jnp.ndarray,
-    eta: float | jnp.ndarray,
-    source_floor: float | jnp.ndarray = 0.0,
-    eps: float = 1e-12,
-) -> NQSLITStats:
-    """Compute NQS-LIT diagnostics with direct ``pi_Psi`` samples.
-
-    The source pool supplies the complex normalization
-    ``N=<Phi|Psi>/<Phi|Phi>`` and stable overlap estimator.  The direct
-    ``pi_Psi`` pool supplies the double-Monte-Carlo fidelity estimator,
-    avoiding source-pool reweighting when its effective sample size collapses.
-    """
-    source_stats = nqs_lit_source_sampled_stats(
-        response_apply,
-        response_params,
-        ground_logpsi,
-        ground_params,
-        source_batched_data,
-        axis=axis,
-        source_center=source_center,
-        source_norm=source_norm,
-        ground_energy=ground_energy,
-        omega=omega,
-        eta=eta,
-        source_floor=source_floor,
-        eps=eps,
-    )
-    data = psi_batched_data.data
-    action = jax.vmap(
-        lambda one: local_action_ratio(
-            response_apply,
-            response_params,
-            ground_logpsi,
-            ground_params,
-            one,
-            ground_energy=ground_energy,
-            omega=omega,
-            eta=eta,
-        )[0],
-        in_axes=(psi_batched_data.vmap_axis,),
-    )(data)
-    dipole = jax.vmap(
-        lambda one: molecular_electronic_dipole(one, axis),
-        in_axes=(psi_batched_data.vmap_axis,),
-    )(data)
-    source = dipole - jnp.asarray(source_center, dtype=dipole.dtype)
-    safe_source = jnp.where(
-        jnp.abs(source) > eps,
-        source,
-        jnp.asarray(eps, dtype=source.dtype) * jnp.where(source < 0, -1.0, 1.0),
-    )
-    ratio = action / safe_source
-    safe_ratio = jnp.where(
-        jnp.abs(ratio) > eps,
-        ratio,
-        jnp.asarray(eps, dtype=ratio.real.dtype) + 0j,
-    )
-    hloc = source_stats.normalization / safe_ratio
-    finite = jnp.isfinite(jnp.real(hloc)) & jnp.isfinite(jnp.imag(hloc))
-    hloc = jnp.where(finite, hloc, jnp.asarray(0.0, dtype=hloc.dtype))
-    fidelity = jnp.clip(jnp.real(jnp.mean(hloc)), 0.0, 1.0)
-    action_norm = (
-        jnp.asarray(source_norm, dtype=fidelity.dtype)
-        * jnp.abs(source_stats.normalization) ** 2
-        / jnp.maximum(fidelity, jnp.asarray(eps, dtype=fidelity.dtype))
-    )
-    return source_stats._replace(
-        loss=1.0 - fidelity,
-        fidelity=fidelity,
-        action_norm=jnp.real(action_norm),
-        estimator_mode=jnp.asarray(1, dtype=jnp.int32),
-    )
-
-
-def _source_sampled_error_d(
-    action: jnp.ndarray,
-    response_ratio: jnp.ndarray,
-    source_weighted_mean,
-    safe_source: jnp.ndarray,
-    phi_norm: jnp.ndarray,
-    safe_normalization: jnp.ndarray,
-    normalized_overlap: jnp.ndarray,
-    *,
-    omega: float | jnp.ndarray,
-    eta: float | jnp.ndarray,
-    eps: float,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    normalized_response_over_source = response_ratio / safe_normalization / safe_source
-    correction_norm = phi_norm * source_weighted_mean(
-        jnp.abs(normalized_response_over_source) ** 2
-    )
-    phi_norm_safe = jnp.maximum(phi_norm, jnp.asarray(eps, dtype=phi_norm.dtype))
-    correction_projection = jnp.abs(normalized_overlap) ** 2 / phi_norm_safe
-    correction_perp = jnp.sqrt(
-        jnp.maximum(
-            jnp.real(correction_norm - correction_projection),
-            jnp.asarray(0.0, dtype=phi_norm.dtype),
-        )
-    )
-
-    shift = jnp.asarray(omega, dtype=response_ratio.real.dtype) + 1j * jnp.asarray(
-        eta,
-        dtype=response_ratio.real.dtype,
-    )
-    hbar_response_ratio = action + shift * response_ratio
-    shift_norm = jnp.sqrt(
-        jnp.asarray(omega, dtype=response_ratio.real.dtype) ** 2
-        + jnp.asarray(eta, dtype=response_ratio.real.dtype) ** 2
-    )
-    shift_norm = jnp.maximum(shift_norm, jnp.asarray(eps, dtype=shift_norm.dtype))
-    shifted_over_source = (
-        hbar_response_ratio / safe_normalization / safe_source / shift_norm
-    )
-    shifted_hamiltonian_norm = phi_norm * source_weighted_mean(
-        jnp.abs(shifted_over_source) ** 2
-    )
-    shifted_overlap = phi_norm * source_weighted_mean(shifted_over_source)
-    shifted_projection = jnp.abs(shifted_overlap) ** 2 / phi_norm_safe
-    shifted_perp = jnp.sqrt(
-        jnp.maximum(
-            jnp.real(shifted_hamiltonian_norm - shifted_projection),
-            jnp.asarray(0.0, dtype=phi_norm.dtype),
-        )
-    )
-    return (
-        correction_norm,
-        shifted_hamiltonian_norm,
-        jnp.minimum(
-            correction_perp,
-            shifted_perp,
-        ),
     )
 
 

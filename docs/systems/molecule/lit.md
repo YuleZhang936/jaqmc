@@ -1,10 +1,16 @@
 # Dipole NQS-LIT Spectra
 
 The `jaqmc molecule lit` command computes electric-dipole response spectra from
-a trained molecular ground-state wavefunction. The current implementation uses
-the NQS-LIT workflow: it restores the ground-state neural wavefunction, samples a
-large source-state pool, optimizes a response NQS for each complex-frequency
-point, and writes the Lorentz integral transform spectrum.
+a trained molecular ground-state wavefunction. The implementation follows the
+source-projected, symmetry-resolved NQS-LIT workflow: it restores and projects
+the ground-state neural wavefunction, constructs the projected dipole source
+`Phi = Q P_lambda (mu_a - <mu_a>) Psi_0`, samples a large source-state pool,
+optimizes a hard-projected response NQS for each complex-frequency point, and
+writes the Lorentz integral transform spectrum from the source-overlap
+estimator. The SR update uses the reweighted double-Monte-Carlo estimator from
+the NQS-LIT formulation: `pi_Psi` fidelity-gradient and QFI expectations are
+evaluated with centered Jacobians by importance reweighting the reusable
+`pi_Phi` source pool.
 
 Use this workflow after a normal `jaqmc molecule train` run has produced a
 ground-state checkpoint. The LIT command restores that checkpoint from
@@ -26,7 +32,12 @@ jaqmc molecule lit --yml molecule_lit.yml \
 
 The command writes `lit_spectrum.npz` under `workflow.save_path`. The file
 contains the scan grid, LIT values, fidelity diagnostics, reweighting effective
-sample-size diagnostics, and peak-picking output.
+sample-size diagnostics, symmetry-sector labels, sector-resolved arrays such as
+`sector_lit`, `sector_broadened`, and `sector_source_elastic_overlap`, and
+peak-picking output. The axis-level
+`lit` and `broadened` arrays are sums over the nonzero source sectors for each
+dipole component. `estimator_mode` marks SR updates that used the reusable
+source-pool estimator (`0`) or the direct `pi_Psi` low-ESS fallback (`1`).
 
 On a multi-GPU node, the reference LIT configuration below uses
 `lit.scan_parallel=auto`. JaQMC splits the frequency grid into local worker
@@ -163,7 +174,7 @@ lit:
   axes: x
   output_filename: lit_spectrum.npz
   peak_min_height_fraction: 0.02
-  preview_roots: 8
+  preview_peaks: 8
 
   scan_parallel: auto
   scan_parallel_workers: 0
@@ -178,6 +189,7 @@ lit:
   nqs_source_center_steps: 64
   nqs_source_center_override: null
   nqs_source_norm_override: null
+  nqs_source_norm_min: 1.0e-10
   nqs_source_burn_in: 150
   nqs_source_floor: 0.0001
   nqs_train_pool_batches: 64
@@ -187,11 +199,8 @@ lit:
   nqs_eval_batch_size: 4096
   nqs_reuse_source_pool: true
   nqs_save_source_pool: true
-
-  # Disable fallback double-sampling updates for this high-throughput scan.
-  # The large source pool is evaluated in chunks to keep device memory bounded.
-  nqs_reweight_ess_fraction_min: 0.0
-  nqs_direct_psi_burn_in: 0
+  nqs_reweight_ess_fraction_min: 0.05
+  nqs_direct_psi_burn_in: 5
   nqs_direct_psi_batches: 1
   nqs_direct_psi_stride: 1
 
@@ -199,8 +208,8 @@ lit:
   nqs_sr_damping: 0.01
   nqs_sr_max_norm: 0.05
   nqs_sr_score_eps: 1.0e-10
-  nqs_warm_start_omega: -3.674932217565499
-  nqs_warm_start_iterations: 800
+  nqs_warm_start_omega: null
+  nqs_warm_start_iterations: 0
   nqs_iterations: 2000
   nqs_log_interval: 100
 
@@ -210,7 +219,39 @@ lit:
   nqs_response_use_last_layer: false
   nqs_response_envelope: abs_isotropic
   nqs_response_orbitals_spin_split: true
+
+  # Source-projected symmetry resolution. In auto mode, JaQMC uses numerical
+  # Haar projectors for continuous atom and linear-molecule symmetries
+  # (L=0/L=1 for atoms; Sigma/Pi for linear molecules), and finite point-group
+  # irreps for nonlinear molecules. C1 geometries reduce to the identity
+  # spatial projector. The spin projector defaults to the lowest total S
+  # compatible with n_up - n_down and is reused for electric-dipole response.
+  nqs_symmetry_projectors: true
+  nqs_ground_spatial_projector: auto
+  nqs_ground_spatial_irrep: null
+  nqs_spatial_projector: auto
+  nqs_response_spatial_irreps: ""
+  nqs_spin_projector: auto
+  nqs_ground_spin: null
+  nqs_response_spin: null
+  nqs_symmetry_tolerance: 1.0e-5
+  nqs_projection_eps: 1.0e-12
+  nqs_so3_quadrature_order: 4
+  nqs_so2_quadrature_order: 24
+  nqs_leakage_diagnostic_samples: 8
+  isotropic_average: true
 ```
+
+Set `nqs_ground_spatial_irrep` to a discovered projector label when the ground
+state is not the totally symmetric sector. Set
+`nqs_response_spatial_irreps` to a comma-separated label list to restrict the
+response calculation to explicit final spatial sectors; otherwise the workflow
+keeps every sector with nonzero projected source norm. The leakage diagnostics
+reapply the selected projector to the optimized response and carrier on a small
+sample and should be close to zero for a correctly hard-projected calculation.
+For atomic dipole spectra, `auto` projects the ground state to `L0_even` and the
+response to `L1_odd`. Increase `nqs_so3_quadrature_order` for stricter angular
+quadrature at higher cost.
 
 Run it from the repository root:
 
@@ -262,7 +303,7 @@ jaqmc molecule lit --yml h_atom_lit.yml \
   workflow.restore_path=./runs/h_atom-ground \
   lit.omega_min=0.444 lit.omega_max=0.444 lit.omega_points=1 \
   lit.nqs_train_pool_batches=2 lit.nqs_eval_pool_batches=1 \
-  lit.nqs_warm_start_iterations=1 lit.nqs_iterations=1
+  lit.nqs_iterations=1
 ```
 
 This only checks that checkpoint restoration, source-pool construction, and the
