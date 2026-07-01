@@ -1725,6 +1725,14 @@ class MoleculeLITWorkflow(Workflow):
             return None
 
         axis = axes[0]
+        fast_source = self._parallel_shared_source_from_overrides(
+            axis,
+            run_seed=run_seed,
+            source_pool_dir=source_pool_dir,
+        )
+        if fast_source is not None:
+            return fast_source
+
         logger.info(
             "Preparing shared source pool for parallel LIT workers on axis=%s.",
             _AXIS_NAMES[axis],
@@ -1829,6 +1837,54 @@ class MoleculeLITWorkflow(Workflow):
             ground_energy=float(ground_energy),
             source_center=float(source_center),
             source_norm=float(source_norm),
+            source_pool_dir=source_pool_dir,
+        )
+
+    def _parallel_shared_source_from_overrides(
+        self,
+        axis: int,
+        *,
+        run_seed: int,
+        source_pool_dir: UPath,
+    ) -> _ParallelSharedSource | None:
+        if (
+            self.lit_config.nqs_ground_energy is None
+            or self.lit_config.nqs_source_center_override is None
+            or self.lit_config.nqs_source_norm_override is None
+        ):
+            return None
+
+        rng = jax.random.PRNGKey(run_seed)
+        _, data_rng, _, _, _ = jax.random.split(rng, 5)
+        batched_data = data_init(self.system_config, self.config.batch_size, data_rng)
+        source_center = float(self.lit_config.nqs_source_center_override)
+        source_norm = float(self.lit_config.nqs_source_norm_override)
+        loaded_pools = self._try_load_source_pools(
+            batched_data,
+            axis=axis,
+            source_center=source_center,
+            pool_root=source_pool_dir,
+        )
+        if loaded_pools is None:
+            return None
+
+        train_pool, eval_pool = loaded_pools
+        ground_energy = float(self.lit_config.nqs_ground_energy)
+        logger.info(
+            "Using configured shared source axis=%s energy=%.10f "
+            "source_center=%.8e source_norm=%.8e train=%d eval=%d dir=%s",
+            _AXIS_NAMES[axis],
+            ground_energy,
+            source_center,
+            source_norm,
+            train_pool.batch_size,
+            eval_pool.batch_size,
+            source_pool_dir,
+        )
+        return _ParallelSharedSource(
+            ground_energy=ground_energy,
+            source_center=source_center,
+            source_norm=source_norm,
             source_pool_dir=source_pool_dir,
         )
 
