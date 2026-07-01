@@ -30,10 +30,13 @@ sample-size diagnostics, and peak-picking output.
 
 On a multi-GPU node, the reference LIT configuration below uses
 `lit.scan_parallel=auto`. JaQMC splits the frequency grid into local worker
-processes, using one process per visible GPU by default for this setting. Each
-frequency point starts from the same axis warm-started response parameters, so
-peak positions are not path-dependent on neighboring frequencies or worker block
-boundaries.
+processes, using one process per visible GPU by default for this setting. For
+single-axis scans, JaQMC prepares the ground energy, source normalization, and
+source-state pools once in the parent process, then passes those shared values
+to the workers so the expensive source sampling is not repeated per frequency
+block. Each frequency point starts from the same axis warm-started response
+parameters, so peak positions are not path-dependent on neighboring frequencies
+or worker block boundaries.
 
 ## End-To-End H Atom Reference
 
@@ -191,6 +194,7 @@ lit:
   # Fall back to direct pi_Psi sampling when source-pool reweighting ESS collapses.
   # The large source pool is evaluated in chunks to keep device memory bounded.
   nqs_reweight_ess_fraction_min: 0.05
+  nqs_direct_psi_train: false
   nqs_direct_psi_burn_in: 5
   nqs_direct_psi_batches: 1
   nqs_direct_psi_stride: 1

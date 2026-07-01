@@ -83,6 +83,7 @@ class MolecularLITConfig:
     nqs_reuse_source_pool: bool = True
     nqs_save_source_pool: bool = True
     nqs_reweight_ess_fraction_min: float = 0.05
+    nqs_direct_psi_train: bool = False
     nqs_direct_psi_burn_in: int = 5
     nqs_direct_psi_batches: int = 1
     nqs_direct_psi_stride: int = 1
@@ -116,6 +117,14 @@ class _ParallelWorker:
     log_path: UPath
     process: subprocess.Popen[bytes]
     device: str
+
+
+@dataclass(frozen=True)
+class _ParallelSharedSource:
+    ground_energy: float
+    source_center: float
+    source_norm: float
+    source_pool_dir: UPath
 
 
 class MoleculeLITWorkflow(Workflow):
@@ -219,43 +228,52 @@ class MoleculeLITWorkflow(Workflow):
                 axis=axis,
                 source_center=source_center,
             )
-            source_sample_plan, source_state, axis_batched_data, rng = (
-                self._prepare_source_sampler(
-                    self.sampler,
-                    batched_data,
-                    ground_params,
-                    ground_logpsi,
-                    rng,
-                    axis=axis,
-                    source_center=source_center,
-                )
+            loaded_pools = self._try_load_source_pools(
+                batched_data,
+                axis=axis,
+                source_center=source_center,
             )
-            train_pool, axis_batched_data, source_state, rng = (
-                self._load_or_collect_source_pool(
-                    source_sample_plan,
-                    ground_params,
-                    axis_batched_data,
-                    source_state,
-                    rng,
-                    axis=axis,
-                    source_center=source_center,
-                    split="train",
-                    batches=self.lit_config.nqs_train_pool_batches,
+            if loaded_pools is None:
+                source_sample_plan, source_state, axis_batched_data, rng = (
+                    self._prepare_source_sampler(
+                        self.sampler,
+                        batched_data,
+                        ground_params,
+                        ground_logpsi,
+                        rng,
+                        axis=axis,
+                        source_center=source_center,
+                    )
                 )
-            )
-            eval_pool, axis_batched_data, source_state, rng = (
-                self._load_or_collect_source_pool(
-                    source_sample_plan,
-                    ground_params,
-                    axis_batched_data,
-                    source_state,
-                    rng,
-                    axis=axis,
-                    source_center=source_center,
-                    split="eval",
-                    batches=self.lit_config.nqs_eval_pool_batches,
+                train_pool, axis_batched_data, source_state, rng = (
+                    self._load_or_collect_source_pool(
+                        source_sample_plan,
+                        ground_params,
+                        axis_batched_data,
+                        source_state,
+                        rng,
+                        axis=axis,
+                        source_center=source_center,
+                        split="train",
+                        batches=self.lit_config.nqs_train_pool_batches,
+                    )
                 )
-            )
+                eval_pool, axis_batched_data, source_state, rng = (
+                    self._load_or_collect_source_pool(
+                        source_sample_plan,
+                        ground_params,
+                        axis_batched_data,
+                        source_state,
+                        rng,
+                        axis=axis,
+                        source_center=source_center,
+                        split="eval",
+                        batches=self.lit_config.nqs_eval_pool_batches,
+                    )
+                )
+            else:
+                train_pool, eval_pool = loaded_pools
+                axis_batched_data = batched_data
             logger.info(
                 "axis=%s source_pool train=%d eval=%d",
                 _AXIS_NAMES[axis],
@@ -403,6 +421,7 @@ class MoleculeLITWorkflow(Workflow):
             nqs_reweight_ess_fraction_min=(
                 self.lit_config.nqs_reweight_ess_fraction_min
             ),
+            nqs_direct_psi_train=bool(self.lit_config.nqs_direct_psi_train),
             nqs_direct_psi_burn_in=self.lit_config.nqs_direct_psi_burn_in,
             nqs_direct_psi_batches=self.lit_config.nqs_direct_psi_batches,
             nqs_direct_psi_stride=self.lit_config.nqs_direct_psi_stride,
@@ -548,8 +567,9 @@ class MoleculeLITWorkflow(Workflow):
         source_center: float,
         split: str,
         batches: int,
+        pool_root: UPath | None = None,
     ):
-        pool_path = self._source_pool_path(axis, split)
+        pool_path = self._source_pool_path(axis, split, root=pool_root)
         metadata = self._source_pool_metadata(axis, source_center)
         if self.lit_config.nqs_reuse_source_pool and pool_path.exists():
             try:
@@ -587,12 +607,50 @@ class MoleculeLITWorkflow(Workflow):
             )
         return pool, batched_data, sampler_state, rng
 
-    def _source_pool_path(self, axis: int, split: str) -> UPath:
-        root = (
-            UPath(self.lit_config.nqs_source_pool_dir)
-            if self.lit_config.nqs_source_pool_dir
-            else self.save_path / "source_pools"
-        )
+    def _try_load_source_pools(
+        self,
+        batched_data,
+        *,
+        axis: int,
+        source_center: float,
+        pool_root: UPath | None = None,
+    ):
+        if not self.lit_config.nqs_reuse_source_pool:
+            return None
+        metadata = self._source_pool_metadata(axis, source_center)
+        loaded = []
+        for split in ("train", "eval"):
+            pool_path = self._source_pool_path(axis, split, root=pool_root)
+            if not pool_path.exists():
+                return None
+            try:
+                pool = _load_batched_pool(pool_path, batched_data, metadata=metadata)
+            except (KeyError, ValueError, OSError) as exc:
+                logger.warning(
+                    "Ignoring incompatible %s source pool %s: %s",
+                    split,
+                    pool_path,
+                    exc,
+                )
+                return None
+            logger.info(
+                "Loaded %s source pool for axis=%s from %s",
+                split,
+                _AXIS_NAMES[axis],
+                pool_path,
+            )
+            loaded.append(pool)
+        return tuple(loaded)
+
+    def _source_pool_path(
+        self, axis: int, split: str, *, root: UPath | None = None
+    ) -> UPath:
+        if root is None:
+            root = (
+                UPath(self.lit_config.nqs_source_pool_dir)
+                if self.lit_config.nqs_source_pool_dir
+                else self.save_path / "source_pools"
+            )
         return root / f"axis_{_AXIS_NAMES[axis]}_{split}.npz"
 
     def _source_pool_metadata(
@@ -716,6 +774,17 @@ class MoleculeLITWorkflow(Workflow):
         *,
         axis: int,
     ):
+        if (
+            self.lit_config.nqs_source_center_override is not None
+            and self.lit_config.nqs_source_norm_override is not None
+        ):
+            return (
+                float(self.lit_config.nqs_source_center_override),
+                float(self.lit_config.nqs_source_norm_override),
+                batched_data,
+                sampler_state,
+                rng,
+            )
         mean_values = []
         mean_square_values = []
         for _ in range(max(1, self.lit_config.nqs_source_center_steps)):
@@ -847,7 +916,10 @@ class MoleculeLITWorkflow(Workflow):
                 self._nqs_train_update_batch_size(),
                 batch_index,
             )
-            if self._needs_direct_psi_estimator():
+            if (
+                self.lit_config.nqs_direct_psi_train
+                and self._needs_direct_psi_estimator()
+            ):
                 stats = self._nqs_stats(
                     response_apply,
                     response_params,
@@ -1562,6 +1634,16 @@ class MoleculeLITWorkflow(Workflow):
         run_seed = (
             int(self.config.seed) if self.config.seed is not None else int(time.time())
         )
+        shared_pool_root = (
+            UPath(self.lit_config.nqs_source_pool_dir)
+            if self.lit_config.nqs_source_pool_dir
+            else parallel_root / "source_pools"
+        )
+        shared_source = self._prepare_parallel_shared_source(
+            axes,
+            run_seed=run_seed,
+            source_pool_dir=shared_pool_root,
+        )
 
         logger.info(
             "Starting local-device LIT scan: workers=%d devices=%s "
@@ -1583,6 +1665,7 @@ class MoleculeLITWorkflow(Workflow):
                     part_dir,
                     omega[block],
                     run_seed=run_seed,
+                    shared_source=shared_source,
                 )
                 device = worker_devices[worker_index]
                 env = _parallel_worker_env(device)
@@ -1627,6 +1710,128 @@ class MoleculeLITWorkflow(Workflow):
             axes=axes,
         )
 
+    def _prepare_parallel_shared_source(
+        self,
+        axes: tuple[int, ...],
+        *,
+        run_seed: int,
+        source_pool_dir: UPath,
+    ) -> _ParallelSharedSource | None:
+        if len(axes) != 1:
+            logger.info(
+                "Parallel shared source pools are only used for single-axis "
+                "scans; falling back to per-worker source preparation."
+            )
+            return None
+
+        axis = axes[0]
+        logger.info(
+            "Preparing shared source pool for parallel LIT workers on axis=%s.",
+            _AXIS_NAMES[axis],
+        )
+        rng = jax.random.PRNGKey(run_seed)
+        rng, data_rng, ground_rng, sample_rng = jax.random.split(rng, 4)
+        batched_data = data_init(self.system_config, self.config.batch_size, data_rng)
+        example = batched_data.unbatched_example()
+        checkpoint_step, ground_params, ground_logpsi = self._resolve_nqs_ground_state(
+            example, ground_rng
+        )
+        ground_sample_plan = SamplePlan(ground_logpsi, {"electrons": self.sampler})
+        sampler_state = ground_sample_plan.init(batched_data, sample_rng)
+        for _ in range(self.lit_config.nqs_burn_in):
+            rng, sample_rng = jax.random.split(rng)
+            batched_data, _, sampler_state = ground_sample_plan.step(
+                ground_params,
+                batched_data,
+                sampler_state,
+                sample_rng,
+            )
+
+        ground_energy, batched_data, sampler_state, rng = self._resolve_ground_energy(
+            ground_logpsi,
+            ground_params,
+            batched_data,
+            sampler_state,
+            ground_sample_plan,
+            rng,
+        )
+        source_center, source_norm, batched_data, sampler_state, rng = (
+            self._estimate_source_stats(
+                ground_params,
+                batched_data,
+                sampler_state,
+                ground_sample_plan,
+                rng,
+                axis=axis,
+            )
+        )
+
+        loaded_pools = self._try_load_source_pools(
+            batched_data,
+            axis=axis,
+            source_center=source_center,
+            pool_root=source_pool_dir,
+        )
+        if loaded_pools is None:
+            source_sample_plan, source_state, axis_batched_data, rng = (
+                self._prepare_source_sampler(
+                    self.sampler,
+                    batched_data,
+                    ground_params,
+                    ground_logpsi,
+                    rng,
+                    axis=axis,
+                    source_center=source_center,
+                )
+            )
+            train_pool, axis_batched_data, source_state, rng = (
+                self._load_or_collect_source_pool(
+                    source_sample_plan,
+                    ground_params,
+                    axis_batched_data,
+                    source_state,
+                    rng,
+                    axis=axis,
+                    source_center=source_center,
+                    split="train",
+                    batches=self.lit_config.nqs_train_pool_batches,
+                    pool_root=source_pool_dir,
+                )
+            )
+            eval_pool, _, _, _ = self._load_or_collect_source_pool(
+                source_sample_plan,
+                ground_params,
+                axis_batched_data,
+                source_state,
+                rng,
+                axis=axis,
+                source_center=source_center,
+                split="eval",
+                batches=self.lit_config.nqs_eval_pool_batches,
+                pool_root=source_pool_dir,
+            )
+        else:
+            train_pool, eval_pool = loaded_pools
+
+        logger.info(
+            "Prepared shared source axis=%s checkpoint=%d energy=%.10f "
+            "source_center=%.8e source_norm=%.8e train=%d eval=%d dir=%s",
+            _AXIS_NAMES[axis],
+            checkpoint_step,
+            ground_energy,
+            source_center,
+            source_norm,
+            train_pool.batch_size,
+            eval_pool.batch_size,
+            source_pool_dir,
+        )
+        return _ParallelSharedSource(
+            ground_energy=float(ground_energy),
+            source_center=float(source_center),
+            source_norm=float(source_norm),
+            source_pool_dir=source_pool_dir,
+        )
+
     def _parallel_worker_command(
         self,
         base_config_path: UPath,
@@ -1634,9 +1839,14 @@ class MoleculeLITWorkflow(Workflow):
         block_omega: np.ndarray,
         *,
         run_seed: int,
+        shared_source: _ParallelSharedSource | None = None,
     ) -> list[str]:
-        source_pool_dir = part_dir / "source_pools"
-        return [
+        source_pool_dir = (
+            shared_source.source_pool_dir
+            if shared_source is not None
+            else part_dir / "source_pools"
+        )
+        command = [
             sys.executable,
             "-c",
             "from jaqmc.app.cli import cli; cli()",
@@ -1654,6 +1864,18 @@ class MoleculeLITWorkflow(Workflow):
             f"lit.omega_points={int(block_omega.size)}",
             f"lit.nqs_source_pool_dir={source_pool_dir}",
         ]
+        if shared_source is not None:
+            command.extend(
+                [
+                    f"lit.nqs_ground_energy={float(shared_source.ground_energy)!r}",
+                    "lit.nqs_source_center_steps=0",
+                    "lit.nqs_source_center_override="
+                    f"{float(shared_source.source_center)!r}",
+                    "lit.nqs_source_norm_override="
+                    f"{float(shared_source.source_norm)!r}",
+                ]
+            )
+        return command
 
     def _merge_parallel_outputs(
         self,
@@ -1730,6 +1952,7 @@ class MoleculeLITWorkflow(Workflow):
             nqs_reweight_ess_fraction_min=(
                 self.lit_config.nqs_reweight_ess_fraction_min
             ),
+            nqs_direct_psi_train=bool(self.lit_config.nqs_direct_psi_train),
             nqs_direct_psi_burn_in=self.lit_config.nqs_direct_psi_burn_in,
             nqs_direct_psi_batches=self.lit_config.nqs_direct_psi_batches,
             nqs_direct_psi_stride=self.lit_config.nqs_direct_psi_stride,
