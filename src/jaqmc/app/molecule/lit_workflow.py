@@ -1730,7 +1730,7 @@ class MoleculeLITWorkflow(Workflow):
             _AXIS_NAMES[axis],
         )
         rng = jax.random.PRNGKey(run_seed)
-        rng, data_rng, ground_rng, sample_rng = jax.random.split(rng, 4)
+        rng, data_rng, ground_rng, _, sample_rng = jax.random.split(rng, 5)
         batched_data = data_init(self.system_config, self.config.batch_size, data_rng)
         example = batched_data.unbatched_example()
         checkpoint_step, ground_params, ground_logpsi = self._resolve_nqs_ground_state(
