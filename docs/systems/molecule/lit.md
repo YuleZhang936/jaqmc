@@ -188,10 +188,10 @@ lit:
   nqs_reuse_source_pool: true
   nqs_save_source_pool: true
 
-  # Disable fallback double-sampling updates for this high-throughput scan.
+  # Fall back to direct pi_Psi sampling when source-pool reweighting ESS collapses.
   # The large source pool is evaluated in chunks to keep device memory bounded.
-  nqs_reweight_ess_fraction_min: 0.0
-  nqs_direct_psi_burn_in: 0
+  nqs_reweight_ess_fraction_min: 0.05
+  nqs_direct_psi_burn_in: 5
   nqs_direct_psi_batches: 1
   nqs_direct_psi_stride: 1
 
