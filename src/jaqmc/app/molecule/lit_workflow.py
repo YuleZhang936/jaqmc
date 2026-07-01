@@ -1440,7 +1440,7 @@ class MoleculeLITWorkflow(Workflow):
             source_center=source_center,
             ground_energy=ground_energy,
             omega=omega,
-            batches=max(1, min(self.lit_config.nqs_direct_psi_batches, 2)),
+            batches=self.lit_config.nqs_direct_psi_batches,
         )
         return (
             self._nqs_double_stats(
