@@ -2129,7 +2129,13 @@ class MoleculeLITWorkflow(Workflow):
                     compile_gate_dir=compile_gate_dir,
                 )
                 device = worker_devices[worker_index]
-                env = _parallel_worker_env(device, cache_dir=compile_cache_dir)
+                env = _parallel_worker_env(
+                    device,
+                    cache_dir=compile_cache_dir,
+                    autotune_cache_dir=parallel_root
+                    / "xla_autotune_cache"
+                    / f"worker_{worker_index:03d}",
+                )
                 log_file = stack.enter_context(log_path.open("w", encoding="utf8"))
                 process = subprocess.Popen(
                     command,
@@ -2557,6 +2563,7 @@ def _parallel_worker_env(
     device_id: str,
     *,
     cache_dir: UPath | None = None,
+    autotune_cache_dir: UPath | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(device_id)
@@ -2566,6 +2573,13 @@ def _parallel_worker_env(
         env.setdefault("JAX_ENABLE_COMPILATION_CACHE", "true")
         env.setdefault("JAX_COMPILATION_CACHE_DIR", str(cache_dir))
         env.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
+    if autotune_cache_dir is not None:
+        autotune_cache_dir.mkdir(parents=True, exist_ok=True)
+        (autotune_cache_dir / "tmp").mkdir(parents=True, exist_ok=True)
+        flag = f"--xla_gpu_per_fusion_autotune_cache_dir={autotune_cache_dir}"
+        xla_flags = env.get("XLA_FLAGS", "")
+        if "xla_gpu_per_fusion_autotune_cache_dir" not in xla_flags:
+            env["XLA_FLAGS"] = f"{xla_flags} {flag}".strip()
     return env
 
 

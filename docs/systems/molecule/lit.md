@@ -202,6 +202,7 @@ lit:
   nqs_direct_psi_eval_batches: null
   nqs_direct_psi_stride: 1
   # Engineering controls only: the source-first ESS fallback decision is unchanged.
+  # Parallel workers share source data but isolate XLA autotune caches per worker.
   nqs_direct_psi_precompile: true
   nqs_direct_psi_persistent_sampler: true
 
