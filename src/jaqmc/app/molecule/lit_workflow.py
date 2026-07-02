@@ -40,7 +40,7 @@ from jaqmc.response.nqs_lit import (
 )
 from jaqmc.response.spectrum import find_spectrum_peaks
 from jaqmc.sampler.base import SamplePlan
-from jaqmc.sampler.mcmc import MCMCSampler
+from jaqmc.sampler.mcmc import MCMCSampler, MCMCState
 from jaqmc.utils.config import ConfigManager, configurable_dataclass
 from jaqmc.wavefunction.output.envelope import EnvelopeType
 from jaqmc.workflow.base import Workflow
@@ -1821,6 +1821,45 @@ class MoleculeLITWorkflow(Workflow):
             rng=rng,
         )
 
+    def _single_device_mcmc_step(self, batch_log_prob, data, state, rng):
+        logprob = batch_log_prob(data).real
+        if logprob.ndim != 1:
+            raise ValueError(
+                f"log_amplitude should return a scalar, got shape {logprob.shape[1:]}."
+            )
+        num_accepts = jnp.array(0.0)
+        data, _, _, num_accepts = jax.lax.fori_loop(
+            0,
+            int(self.sampler.steps),
+            lambda _, x: self.sampler._mh_update(
+                batch_log_prob,
+                *x,
+                stddev=state.stddev,
+            ),
+            (data, rng, logprob, num_accepts),
+        )
+        pmove = jnp.sum(num_accepts) / (int(self.sampler.steps) * logprob.shape[0])
+
+        stddev, pmoves, counter = state
+        counter += 1
+        t_since_mcmc_update = counter % int(self.sampler.adapt_frequency)
+        pmoves = pmoves.at[t_since_mcmc_update].set(pmove)
+        stddev = jnp.where(
+            t_since_mcmc_update == 0,
+            jnp.where(
+                jnp.mean(pmoves) > self.sampler.pmove_range[1],
+                stddev * 1.1,
+                jnp.where(
+                    jnp.mean(pmoves) < self.sampler.pmove_range[0],
+                    stddev / 1.1,
+                    stddev,
+                ),
+            ),
+            stddev,
+        )
+        new_state = MCMCState(counter=counter, pmoves=pmoves, stddev=stddev)
+        return data, {"pmove": pmove}, new_state
+
     def _make_direct_psi_pool_collector(
         self,
         response_apply,
@@ -1868,7 +1907,7 @@ class MoleculeLITWorkflow(Workflow):
                 local_batched_data, local_sampler_state, local_rng = carry
                 local_rng, sample_rng = jax.random.split(local_rng)
                 base_data = local_batched_data.data
-                data_part, _, electron_state = self.sampler.step(
+                data_part, _, electron_state = self._single_device_mcmc_step(
                     lambda x: batch_log_prob(x, base_data),
                     base_data.subset(("electrons",)),
                     local_sampler_state["electrons"],
