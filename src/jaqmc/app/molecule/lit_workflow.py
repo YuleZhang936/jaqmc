@@ -1860,7 +1860,7 @@ class MoleculeLITWorkflow(Workflow):
                 merged = base_data.merge(data_part)
                 values = jax.vmap(
                     lambda one: action_log_amplitude(response_params, one, omega),
-                    in_axes=batched_data.vmap_axis,
+                    in_axes=(batched_data.vmap_axis,),
                 )(merged)
                 return 2.0 * values
 
