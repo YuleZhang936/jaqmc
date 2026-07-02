@@ -172,6 +172,7 @@ lit:
   scan_parallel_workers: 0
   scan_parallel_procs_per_device: 1
   scan_parallel_min_points_per_worker: 2
+  scan_parallel_compile_gate_timeout: 1800.0
 
   nqs_allow_untrained_ground: false
   nqs_ground_energy: null
@@ -200,6 +201,9 @@ lit:
   nqs_direct_psi_train_batches: null
   nqs_direct_psi_eval_batches: null
   nqs_direct_psi_stride: 1
+  # Engineering controls only: the source-first ESS fallback decision is unchanged.
+  nqs_direct_psi_precompile: true
+  nqs_direct_psi_persistent_sampler: true
 
   nqs_learning_rate: 0.005
   nqs_sr_damping: 0.01

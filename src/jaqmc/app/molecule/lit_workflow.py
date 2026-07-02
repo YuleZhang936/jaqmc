@@ -12,8 +12,9 @@ import subprocess
 import sys
 import time
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 import jax
 import numpy as np
@@ -66,6 +67,9 @@ class MolecularLITConfig:
     scan_parallel_procs_per_device: int = 1
     scan_parallel_min_points_per_worker: int = 2
     scan_parallel_worker: bool = False
+    scan_parallel_worker_index: int = 0
+    scan_parallel_compile_gate_dir: str = ""
+    scan_parallel_compile_gate_timeout: float = 1800.0
     nqs_checkpoint_path: str = ""
     nqs_allow_untrained_ground: bool = False
     nqs_ground_energy: float | None = None
@@ -89,6 +93,8 @@ class MolecularLITConfig:
     nqs_direct_psi_train_batches: int | None = None
     nqs_direct_psi_eval_batches: int | None = None
     nqs_direct_psi_stride: int = 1
+    nqs_direct_psi_precompile: bool = True
+    nqs_direct_psi_persistent_sampler: bool = True
     nqs_energy_steps: int = 2
     nqs_burn_in: int = 20
     nqs_iterations: int = 200
@@ -127,6 +133,13 @@ class _ParallelSharedSource:
     source_center: float
     source_norm: float
     source_pool_dir: UPath
+
+
+@dataclass
+class _DirectPsiState:
+    batched_data: BatchedData
+    sampler_state: dict[str, Any]
+    rng: jax.Array
 
 
 class MoleculeLITWorkflow(Workflow):
@@ -292,6 +305,20 @@ class MoleculeLITWorkflow(Workflow):
                 source_center=source_center,
                 source_norm=axis_phi_norm,
             )
+            precompile_omega = (
+                float(self.lit_config.nqs_warm_start_omega)
+                if self.lit_config.nqs_warm_start_omega is not None
+                else float(omega[0])
+            )
+            rng = self._coordinate_parallel_direct_precompile(
+                update_step,
+                response_params,
+                train_pool,
+                axis_batched_data,
+                rng,
+                axis=axis,
+                omega=jnp.asarray(precompile_omega),
+            )
             response_params, axis_batched_data, rng = self._warm_start_axis(
                 update_step,
                 response_params,
@@ -429,6 +456,10 @@ class MoleculeLITWorkflow(Workflow):
             nqs_direct_psi_train_batches=self._nqs_direct_psi_train_batches(),
             nqs_direct_psi_eval_batches=self._nqs_direct_psi_eval_batches(),
             nqs_direct_psi_stride=self.lit_config.nqs_direct_psi_stride,
+            nqs_direct_psi_precompile=bool(self.lit_config.nqs_direct_psi_precompile),
+            nqs_direct_psi_persistent_sampler=bool(
+                self.lit_config.nqs_direct_psi_persistent_sampler
+            ),
             nqs_warm_start_omega=_optional_float(self.lit_config.nqs_warm_start_omega),
             nqs_warm_start_iterations=self.lit_config.nqs_warm_start_iterations,
             source_centers=source_centers,
@@ -455,6 +486,12 @@ class MoleculeLITWorkflow(Workflow):
             raise ValueError(msg)
         if self.lit_config.scan_parallel_min_points_per_worker < 1:
             msg = "lit.scan_parallel_min_points_per_worker must be positive."
+            raise ValueError(msg)
+        if self.lit_config.scan_parallel_worker_index < 0:
+            msg = "lit.scan_parallel_worker_index must be nonnegative."
+            raise ValueError(msg)
+        if self.lit_config.scan_parallel_compile_gate_timeout <= 0:
+            msg = "lit.scan_parallel_compile_gate_timeout must be positive."
             raise ValueError(msg)
         self._validate_chunk_config()
         if not 0.0 <= self.lit_config.nqs_reweight_ess_fraction_min <= 1.0:
@@ -683,6 +720,60 @@ class MoleculeLITWorkflow(Workflow):
             "source_floor": float(self.lit_config.nqs_source_floor),
         }
 
+    def _coordinate_parallel_direct_precompile(
+        self,
+        update_step,
+        response_params,
+        train_pool,
+        fallback_data,
+        rng,
+        *,
+        axis: int,
+        omega,
+    ):
+        if not (
+            self.lit_config.nqs_direct_psi_train
+            and self._needs_direct_psi_estimator()
+            and self.lit_config.nqs_direct_psi_precompile
+        ):
+            return rng
+        precompile = getattr(update_step, "precompile_direct", None)
+        if precompile is None:
+            return rng
+        if (
+            not self.lit_config.scan_parallel_worker
+            or not self.lit_config.scan_parallel_compile_gate_dir
+        ):
+            return precompile(response_params, train_pool, fallback_data, rng, omega)
+
+        gate_dir = UPath(self.lit_config.scan_parallel_compile_gate_dir)
+        gate_path = gate_dir / f"axis_{_AXIS_NAMES[axis]}_direct_precompiled"
+        if int(self.lit_config.scan_parallel_worker_index) == 0:
+            gate_dir.mkdir(parents=True, exist_ok=True)
+            rng = precompile(response_params, train_pool, fallback_data, rng, omega)
+            gate_path.write_text(
+                f"ready pid={os.getpid()} axis={_AXIS_NAMES[axis]} time={time.time()}\n"
+            )
+            logger.info(
+                "Wrote direct pi_Psi compile gate for axis=%s to %s",
+                _AXIS_NAMES[axis],
+                gate_path,
+            )
+            return rng
+
+        timeout = float(self.lit_config.scan_parallel_compile_gate_timeout)
+        logger.info(
+            "Waiting for direct pi_Psi compile gate axis=%s at %s",
+            _AXIS_NAMES[axis],
+            gate_path,
+        )
+        _wait_for_path(gate_path, timeout=timeout)
+        logger.info(
+            "Direct pi_Psi compile gate ready for axis=%s",
+            _AXIS_NAMES[axis],
+        )
+        return rng
+
     def _warm_start_axis(
         self,
         update_step,
@@ -886,6 +977,27 @@ class MoleculeLITWorkflow(Workflow):
             loss = _fidelity_loss(stats.fidelity, self.lit_config.nqs_sr_score_eps)
             return response_params, stats._replace(loss=loss)
 
+        direct_train_collect_initial = self._make_direct_psi_pool_collector(
+            response_apply,
+            ground_logpsi,
+            ground_params,
+            axis=axis,
+            source_center=source_center,
+            ground_energy=ground_energy,
+            batches=self._nqs_direct_psi_train_batches(),
+            burn_in=max(0, int(self.lit_config.nqs_direct_psi_burn_in)),
+        )
+        direct_train_collect_continue = self._make_direct_psi_pool_collector(
+            response_apply,
+            ground_logpsi,
+            ground_params,
+            axis=axis,
+            source_center=source_center,
+            ground_energy=ground_energy,
+            batches=self._nqs_direct_psi_train_batches(),
+            burn_in=0,
+        )
+
         @jax.jit
         def direct_update(
             response_params,
@@ -893,7 +1005,7 @@ class MoleculeLITWorkflow(Workflow):
             psi_batched_data,
             omega,
         ):
-            stats = self._nqs_double_stats(
+            stats, updates = self._direct_sr_stats_and_updates(
                 response_apply,
                 response_params,
                 ground_logpsi,
@@ -906,21 +1018,11 @@ class MoleculeLITWorkflow(Workflow):
                 ground_energy=ground_energy,
                 omega=omega,
             )
-            updates = self._direct_sr_updates(
-                response_apply,
-                response_params,
-                ground_logpsi,
-                ground_params,
-                source_batched_data,
-                psi_batched_data,
-                axis=axis,
-                source_center=source_center,
-                ground_energy=ground_energy,
-                omega=omega,
-            )
             response_params = _apply_updates(response_params, updates)
             loss = _fidelity_loss(stats.fidelity, self.lit_config.nqs_sr_score_eps)
             return response_params, stats._replace(loss=loss)
+
+        direct_state: _DirectPsiState | None = None
 
         def update(
             response_params,
@@ -930,6 +1032,9 @@ class MoleculeLITWorkflow(Workflow):
             rng,
             batch_index: int = 0,
         ):
+            nonlocal direct_state
+            if int(batch_index) == 0:
+                direct_state = None
             update_batch = _cyclic_batched_data_chunk(
                 batched_data,
                 self._nqs_train_update_batch_size(),
@@ -954,19 +1059,21 @@ class MoleculeLITWorkflow(Workflow):
             else:
                 stats = None
             if stats is not None and self._should_use_direct_psi(stats):
-                psi_pool, fallback_data, rng = self._collect_direct_psi_pool(
-                    response_apply,
+                if direct_state is None:
+                    direct_state = self._init_direct_psi_state(fallback_data, rng)
+                    collector = direct_train_collect_initial
+                else:
+                    collector = direct_train_collect_continue
+                psi_pool, direct_state = self._collect_direct_psi_pool_from_state(
+                    collector,
                     response_params,
-                    ground_logpsi,
-                    ground_params,
-                    fallback_data,
-                    rng,
-                    axis=axis,
-                    source_center=source_center,
-                    ground_energy=ground_energy,
+                    direct_state,
                     omega=omega,
-                    batches=self._nqs_direct_psi_train_batches(),
                 )
+                fallback_data = direct_state.batched_data
+                rng = direct_state.rng
+                if not self.lit_config.nqs_direct_psi_persistent_sampler:
+                    direct_state = None
                 response_params, stats = direct_update(
                     response_params,
                     update_batch,
@@ -974,6 +1081,7 @@ class MoleculeLITWorkflow(Workflow):
                     omega,
                 )
                 return response_params, stats, fallback_data, rng
+            direct_state = None
             response_params, stats = reweighted_update(
                 response_params,
                 update_batch,
@@ -981,7 +1089,76 @@ class MoleculeLITWorkflow(Workflow):
             )
             return response_params, stats, fallback_data, rng
 
+        def precompile_direct(response_params, batched_data, fallback_data, rng, omega):
+            return self._precompile_direct_fallback_kernels(
+                response_params,
+                batched_data,
+                fallback_data,
+                rng,
+                omega,
+                axis=axis,
+                collect_initial=direct_train_collect_initial,
+                collect_continue=direct_train_collect_continue,
+                direct_update=direct_update,
+            )
+
+        update.precompile_direct = precompile_direct  # type: ignore[attr-defined]
         return update
+
+    def _precompile_direct_fallback_kernels(
+        self,
+        response_params,
+        batched_data,
+        fallback_data,
+        rng,
+        omega,
+        *,
+        axis: int,
+        collect_initial,
+        collect_continue,
+        direct_update,
+    ):
+        if not (
+            self.lit_config.nqs_direct_psi_train
+            and self._needs_direct_psi_estimator()
+            and self.lit_config.nqs_direct_psi_precompile
+        ):
+            return rng
+        update_batch = _cyclic_batched_data_chunk(
+            batched_data,
+            self._nqs_train_update_batch_size(),
+            0,
+        )
+        direct_state_for_compile = self._init_direct_psi_state(fallback_data, rng)
+        collect_initial.lower(
+            response_params,
+            direct_state_for_compile.batched_data,
+            direct_state_for_compile.sampler_state,
+            direct_state_for_compile.rng,
+            omega,
+        ).compile()
+        collect_continue.lower(
+            response_params,
+            direct_state_for_compile.batched_data,
+            direct_state_for_compile.sampler_state,
+            direct_state_for_compile.rng,
+            omega,
+        ).compile()
+        psi_pool = _tile_batched_data(
+            fallback_data,
+            self._nqs_direct_psi_train_batches(),
+        )
+        direct_update.lower(
+            response_params,
+            update_batch,
+            psi_pool,
+            omega,
+        ).compile()
+        logger.info(
+            "Precompiled direct pi_Psi fallback kernels for axis=%s",
+            _AXIS_NAMES[axis],
+        )
+        return rng
 
     def _weighted_sr_updates(
         self,
@@ -1119,6 +1296,103 @@ class MoleculeLITWorkflow(Workflow):
                 max_norm / (update_norm + jnp.asarray(1e-12, dtype=grad_flat.dtype)),
             )
         return unravel_fn(scale * preconditioned)
+
+    def _direct_sr_stats_and_updates(
+        self,
+        response_apply,
+        response_params,
+        ground_logpsi,
+        ground_params,
+        source_batched_data,
+        psi_batched_data,
+        *,
+        axis: int,
+        source_center: float,
+        source_norm: float,
+        ground_energy: float,
+        omega,
+    ):
+        source_sums = nqs_lit_source_sampled_sums(
+            response_apply,
+            response_params,
+            ground_logpsi,
+            ground_params,
+            source_batched_data,
+            axis=axis,
+            source_center=source_center,
+            ground_energy=ground_energy,
+            omega=omega,
+            eta=self.lit_config.eta,
+            source_floor=self.lit_config.nqs_source_floor,
+        )
+        source_stats = nqs_lit_stats_from_source_sums(
+            source_sums,
+            source_norm=source_norm,
+            omega=omega,
+            eta=self.lit_config.eta,
+        )
+        score, ratio, _ = self._source_sampled_action_scores(
+            response_apply,
+            response_params,
+            ground_logpsi,
+            ground_params,
+            psi_batched_data,
+            axis=axis,
+            source_center=source_center,
+            ground_energy=ground_energy,
+            omega=omega,
+        )
+        eps = jnp.asarray(self.lit_config.nqs_sr_score_eps, dtype=ratio.real.dtype)
+        safe_ratio = jnp.where(
+            jnp.abs(ratio) > eps,
+            ratio,
+            jnp.asarray(eps, dtype=ratio.real.dtype) + 0j,
+        )
+        normalization = source_stats.normalization
+        hloc = normalization / safe_ratio
+        finite = jnp.isfinite(jnp.real(hloc)) & jnp.isfinite(jnp.imag(hloc))
+        hloc = jnp.where(finite, hloc, jnp.asarray(0.0, dtype=hloc.dtype))
+        fidelity = jnp.clip(jnp.real(jnp.mean(hloc)), 0.0, 1.0)
+        action_norm = (
+            jnp.asarray(source_norm, dtype=fidelity.dtype)
+            * jnp.abs(normalization) ** 2
+            / jnp.maximum(fidelity, eps)
+        )
+
+        hloc_conj = jnp.conj(hloc)
+        score = jnp.where(finite[:, None], score, jnp.asarray(0.0, dtype=score.dtype))
+        sample_count = jnp.maximum(score.shape[0], 1)
+        score_mean = jnp.mean(score, axis=0, keepdims=True)
+        centered_score = score - score_mean
+        grad_flat = 2.0 * jnp.real(
+            jnp.mean(centered_score * hloc_conj[:, None], axis=0)
+        )
+        score_scale = jnp.sqrt(jnp.asarray(sample_count, dtype=grad_flat.dtype))
+        weighted_score = centered_score / score_scale
+        score_aug = jnp.concatenate([weighted_score.real, weighted_score.imag], axis=0)
+
+        _, unravel_fn = ravel_pytree(response_params)
+        damping = jnp.asarray(self.lit_config.nqs_sr_damping, dtype=grad_flat.dtype)
+        damping = jnp.maximum(damping, jnp.asarray(1e-12, dtype=grad_flat.dtype))
+        preconditioned = self._solve_sr_direction(score_aug, grad_flat, damping)
+        scale = jnp.asarray(self.lit_config.nqs_learning_rate, dtype=grad_flat.dtype)
+        if self.lit_config.nqs_sr_max_norm is not None:
+            update_norm = jnp.linalg.norm(preconditioned)
+            max_norm = jnp.asarray(
+                self.lit_config.nqs_sr_max_norm,
+                dtype=grad_flat.dtype,
+            )
+            scale = jnp.minimum(
+                scale,
+                max_norm / (update_norm + jnp.asarray(1e-12, dtype=grad_flat.dtype)),
+            )
+        stats = source_stats._replace(
+            loss=1.0 - fidelity,
+            fidelity=fidelity,
+            action_norm=jnp.real(action_norm),
+            estimator_mode=jnp.asarray(1, dtype=jnp.int32),
+        )
+        return stats, unravel_fn(scale * preconditioned)
 
     def _solve_sr_direction(self, score_aug, grad_flat, damping):
         parameter_count = grad_flat.shape[0]
@@ -1512,6 +1786,133 @@ class MoleculeLITWorkflow(Workflow):
             return configured
         return max(1, int(self.config.batch_size))
 
+    def _init_direct_psi_state(self, batched_data, rng) -> _DirectPsiState:
+        rng, sample_rng = jax.random.split(rng)
+        sampler_state = {
+            "electrons": self.sampler.init(
+                batched_data.data.subset(("electrons",)),
+                sample_rng,
+            )
+        }
+        return _DirectPsiState(
+            batched_data=batched_data,
+            sampler_state=sampler_state,
+            rng=rng,
+        )
+
+    def _collect_direct_psi_pool_from_state(
+        self,
+        collector,
+        response_params,
+        direct_state: _DirectPsiState,
+        *,
+        omega,
+    ) -> tuple[BatchedData, _DirectPsiState]:
+        pool, batched_data, sampler_state, rng = collector(
+            response_params,
+            direct_state.batched_data,
+            direct_state.sampler_state,
+            direct_state.rng,
+            omega,
+        )
+        return pool, _DirectPsiState(
+            batched_data=batched_data,
+            sampler_state=sampler_state,
+            rng=rng,
+        )
+
+    def _make_direct_psi_pool_collector(
+        self,
+        response_apply,
+        ground_logpsi,
+        ground_params,
+        *,
+        axis: int,
+        source_center: float,
+        ground_energy: float,
+        batches: int,
+        burn_in: int,
+    ):
+        del axis, source_center
+        batches = max(1, int(batches))
+        burn_in = max(0, int(burn_in))
+        stride = max(1, int(self.lit_config.nqs_direct_psi_stride))
+        eps = float(self.lit_config.nqs_sr_score_eps)
+
+        def action_log_amplitude(response_params, data, omega):
+            action, _, _ = local_action_ratio(
+                response_apply,
+                response_params,
+                ground_logpsi,
+                ground_params,
+                data,
+                ground_energy=ground_energy,
+                omega=omega,
+                eta=self.lit_config.eta,
+            )
+            return ground_logpsi(ground_params, data) + jnp.log(
+                jnp.maximum(jnp.abs(action), eps)
+            )
+
+        @jax.jit
+        def collect(response_params, batched_data, sampler_state, rng, omega):
+            def batch_log_prob(data_part, base_data):
+                merged = base_data.merge(data_part)
+                values = jax.vmap(
+                    lambda one: action_log_amplitude(response_params, one, omega),
+                    in_axes=batched_data.vmap_axis,
+                )(merged)
+                return 2.0 * values
+
+            def one_sampler_step(carry, _):
+                local_batched_data, local_sampler_state, local_rng = carry
+                local_rng, sample_rng = jax.random.split(local_rng)
+                base_data = local_batched_data.data
+                data_part, _, electron_state = self.sampler.step(
+                    lambda x: batch_log_prob(x, base_data),
+                    base_data.subset(("electrons",)),
+                    local_sampler_state["electrons"],
+                    sample_rng,
+                )
+                next_batched_data = replace(
+                    local_batched_data,
+                    data=base_data.merge(data_part),
+                )
+                next_sampler_state = {"electrons": electron_state}
+                return (next_batched_data, next_sampler_state, local_rng), None
+
+            carry = (batched_data, sampler_state, rng)
+            if burn_in > 0:
+                carry, _ = jax.lax.scan(
+                    one_sampler_step,
+                    carry,
+                    None,
+                    length=burn_in,
+                )
+
+            def collect_one_batch(carry, _):
+                carry, _ = jax.lax.scan(
+                    one_sampler_step,
+                    carry,
+                    None,
+                    length=stride,
+                )
+                return carry, carry[0]
+
+            carry, scanned_pool = jax.lax.scan(
+                collect_one_batch,
+                carry,
+                None,
+                length=batches,
+            )
+            batched_data, sampler_state, rng = carry
+            pool = _flatten_scanned_batched_pool(scanned_pool, batched_data)
+            pool = jax.tree.map(jax.lax.stop_gradient, pool)
+            batched_data = jax.tree.map(jax.lax.stop_gradient, batched_data)
+            return pool, batched_data, sampler_state, rng
+
+        return collect
+
     def _collect_direct_psi_pool(
         self,
         response_apply,
@@ -1527,38 +1928,24 @@ class MoleculeLITWorkflow(Workflow):
         omega,
         batches: int,
     ):
-        sample_plan = SamplePlan(
-            self._make_action_log_amplitude(
-                response_apply,
-                ground_logpsi,
-                ground_params,
-                axis=axis,
-                source_center=source_center,
-                ground_energy=ground_energy,
-                omega=omega,
-            ),
-            {"electrons": self.sampler},
+        collector = self._make_direct_psi_pool_collector(
+            response_apply,
+            ground_logpsi,
+            ground_params,
+            axis=axis,
+            source_center=source_center,
+            ground_energy=ground_energy,
+            batches=batches,
+            burn_in=max(0, int(self.lit_config.nqs_direct_psi_burn_in)),
         )
-        rng, sample_rng = jax.random.split(rng)
-        sampler_state = sample_plan.init(batched_data, sample_rng)
-        for _ in range(max(0, int(self.lit_config.nqs_direct_psi_burn_in))):
-            rng, sample_rng = jax.random.split(rng)
-            batched_data, _, sampler_state = sample_plan.step(
-                response_params,
-                batched_data,
-                sampler_state,
-                sample_rng,
-            )
-        pool, batched_data, _, rng = self._collect_sample_pool(
-            sample_plan,
+        direct_state = self._init_direct_psi_state(batched_data, rng)
+        pool, direct_state = self._collect_direct_psi_pool_from_state(
+            collector,
             response_params,
-            batched_data,
-            sampler_state,
-            rng,
-            batches=max(1, int(batches)),
-            stride=max(1, int(self.lit_config.nqs_direct_psi_stride)),
+            direct_state,
+            omega=omega,
         )
-        return pool, batched_data, rng
+        return pool, direct_state.batched_data, direct_state.rng
 
     def _make_action_log_amplitude(
         self,
@@ -1662,6 +2049,8 @@ class MoleculeLITWorkflow(Workflow):
         parallel_root.mkdir(parents=True, exist_ok=True)
         base_config_path = parallel_root / "base_config.yaml"
         base_config_path.write_text(self.cfg.to_yaml())
+        compile_cache_dir = parallel_root / "jax_compile_cache"
+        compile_gate_dir = parallel_root / "compile_gate"
         run_seed = (
             int(self.config.seed) if self.config.seed is not None else int(time.time())
         )
@@ -1697,9 +2086,11 @@ class MoleculeLITWorkflow(Workflow):
                     omega[block],
                     run_seed=run_seed,
                     shared_source=shared_source,
+                    worker_index=worker_index,
+                    compile_gate_dir=compile_gate_dir,
                 )
                 device = worker_devices[worker_index]
-                env = _parallel_worker_env(device)
+                env = _parallel_worker_env(device, cache_dir=compile_cache_dir)
                 log_file = stack.enter_context(log_path.open("w", encoding="utf8"))
                 process = subprocess.Popen(
                     command,
@@ -1927,6 +2318,8 @@ class MoleculeLITWorkflow(Workflow):
         *,
         run_seed: int,
         shared_source: _ParallelSharedSource | None = None,
+        worker_index: int = 0,
+        compile_gate_dir: UPath | None = None,
     ) -> list[str]:
         source_pool_dir = (
             shared_source.source_pool_dir
@@ -1950,7 +2343,10 @@ class MoleculeLITWorkflow(Workflow):
             f"lit.omega_max={float(block_omega[-1])}",
             f"lit.omega_points={int(block_omega.size)}",
             f"lit.nqs_source_pool_dir={source_pool_dir}",
+            f"lit.scan_parallel_worker_index={int(worker_index)}",
         ]
+        if compile_gate_dir is not None:
+            command.append(f"lit.scan_parallel_compile_gate_dir={compile_gate_dir}")
         if shared_source is not None:
             command.extend(
                 [
@@ -2045,6 +2441,10 @@ class MoleculeLITWorkflow(Workflow):
             nqs_direct_psi_train_batches=self._nqs_direct_psi_train_batches(),
             nqs_direct_psi_eval_batches=self._nqs_direct_psi_eval_batches(),
             nqs_direct_psi_stride=self.lit_config.nqs_direct_psi_stride,
+            nqs_direct_psi_precompile=bool(self.lit_config.nqs_direct_psi_precompile),
+            nqs_direct_psi_persistent_sampler=bool(
+                self.lit_config.nqs_direct_psi_persistent_sampler
+            ),
             nqs_warm_start_omega=_optional_float(self.lit_config.nqs_warm_start_omega),
             nqs_warm_start_iterations=self.lit_config.nqs_warm_start_iterations,
             source_centers=np.mean(source_centers_blocks, axis=0),
@@ -2114,10 +2514,19 @@ def _parallel_worker_device_ids(
     return tuple(device_ids[index % len(device_ids)] for index in range(worker_count))
 
 
-def _parallel_worker_env(device_id: str) -> dict[str, str]:
+def _parallel_worker_env(
+    device_id: str,
+    *,
+    cache_dir: UPath | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(device_id)
     env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        env.setdefault("JAX_ENABLE_COMPILATION_CACHE", "true")
+        env.setdefault("JAX_COMPILATION_CACHE_DIR", str(cache_dir))
+        env.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
     return env
 
 
@@ -2145,6 +2554,16 @@ def _tail_text(path: UPath, lines: int = 80) -> str:
     except OSError as exc:
         return f"<failed to read {path}: {exc}>"
     return "\n".join(text.splitlines()[-lines:])
+
+
+def _wait_for_path(path: UPath, *, timeout: float, poll_seconds: float = 2.0) -> None:
+    deadline = time.time() + float(timeout)
+    while time.time() < deadline:
+        if path.exists():
+            return
+        time.sleep(float(poll_seconds))
+    msg = f"Timed out waiting for {path}"
+    raise TimeoutError(msg)
 
 
 def _axis_indices(axes: str) -> tuple[int, ...]:
@@ -2186,6 +2605,38 @@ def _concat_batched_data(pool):
     return first.__class__(
         data=first.data.merge(updates),
         fields_with_batch=first.fields_with_batch,
+    )
+
+
+def _flatten_scanned_batched_pool(scanned_pool: BatchedData, reference: BatchedData):
+    updates = {}
+    for field_name in reference.fields_with_batch:
+        updates[field_name] = jax.tree.map(
+            lambda value: jnp.reshape(
+                value,
+                (value.shape[0] * value.shape[1], *value.shape[2:]),
+            ),
+            getattr(scanned_pool.data, field_name),
+        )
+    return reference.__class__(
+        data=reference.data.merge(updates),
+        fields_with_batch=reference.fields_with_batch,
+    )
+
+
+def _tile_batched_data(pool: BatchedData, repeats: int) -> BatchedData:
+    repeats = max(1, int(repeats))
+    if repeats == 1:
+        return pool
+    updates = {}
+    for field_name in pool.fields_with_batch:
+        updates[field_name] = jax.tree.map(
+            lambda value: jnp.concatenate([value] * repeats, axis=0),
+            getattr(pool.data, field_name),
+        )
+    return pool.__class__(
+        data=pool.data.merge(updates),
+        fields_with_batch=pool.fields_with_batch,
     )
 
 
