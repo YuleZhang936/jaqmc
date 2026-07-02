@@ -86,6 +86,8 @@ class MolecularLITConfig:
     nqs_direct_psi_train: bool = False
     nqs_direct_psi_burn_in: int = 5
     nqs_direct_psi_batches: int = 1
+    nqs_direct_psi_train_batches: int | None = None
+    nqs_direct_psi_eval_batches: int | None = None
     nqs_direct_psi_stride: int = 1
     nqs_energy_steps: int = 2
     nqs_burn_in: int = 20
@@ -424,6 +426,8 @@ class MoleculeLITWorkflow(Workflow):
             nqs_direct_psi_train=bool(self.lit_config.nqs_direct_psi_train),
             nqs_direct_psi_burn_in=self.lit_config.nqs_direct_psi_burn_in,
             nqs_direct_psi_batches=self.lit_config.nqs_direct_psi_batches,
+            nqs_direct_psi_train_batches=self._nqs_direct_psi_train_batches(),
+            nqs_direct_psi_eval_batches=self._nqs_direct_psi_eval_batches(),
             nqs_direct_psi_stride=self.lit_config.nqs_direct_psi_stride,
             nqs_warm_start_omega=_optional_float(self.lit_config.nqs_warm_start_omega),
             nqs_warm_start_iterations=self.lit_config.nqs_warm_start_iterations,
@@ -459,11 +463,26 @@ class MoleculeLITWorkflow(Workflow):
                 f"{self.lit_config.nqs_reweight_ess_fraction_min}."
             )
             raise ValueError(msg)
+        self._validate_direct_psi_config()
+
+    def _validate_direct_psi_config(self) -> None:
         if self.lit_config.nqs_direct_psi_burn_in < 0:
             msg = "lit.nqs_direct_psi_burn_in must be nonnegative."
             raise ValueError(msg)
         if self.lit_config.nqs_direct_psi_batches < 1:
             msg = "lit.nqs_direct_psi_batches must be positive."
+            raise ValueError(msg)
+        if (
+            self.lit_config.nqs_direct_psi_train_batches is not None
+            and self.lit_config.nqs_direct_psi_train_batches < 1
+        ):
+            msg = "lit.nqs_direct_psi_train_batches must be positive."
+            raise ValueError(msg)
+        if (
+            self.lit_config.nqs_direct_psi_eval_batches is not None
+            and self.lit_config.nqs_direct_psi_eval_batches < 1
+        ):
+            msg = "lit.nqs_direct_psi_eval_batches must be positive."
             raise ValueError(msg)
         if self.lit_config.nqs_direct_psi_stride < 1:
             msg = "lit.nqs_direct_psi_stride must be positive."
@@ -946,7 +965,7 @@ class MoleculeLITWorkflow(Workflow):
                     source_center=source_center,
                     ground_energy=ground_energy,
                     omega=omega,
-                    batches=self.lit_config.nqs_direct_psi_batches,
+                    batches=self._nqs_direct_psi_train_batches(),
                 )
                 response_params, stats = direct_update(
                     response_params,
@@ -1440,7 +1459,7 @@ class MoleculeLITWorkflow(Workflow):
             source_center=source_center,
             ground_energy=ground_energy,
             omega=omega,
-            batches=self.lit_config.nqs_direct_psi_batches,
+            batches=self._nqs_direct_psi_eval_batches(),
         )
         return (
             self._nqs_double_stats(
@@ -1468,6 +1487,18 @@ class MoleculeLITWorkflow(Workflow):
 
     def _needs_direct_psi_estimator(self) -> bool:
         return float(self.lit_config.nqs_reweight_ess_fraction_min) > 0.0
+
+    def _nqs_direct_psi_train_batches(self) -> int:
+        configured = self.lit_config.nqs_direct_psi_train_batches
+        if configured is not None:
+            return int(configured)
+        return int(self.lit_config.nqs_direct_psi_batches)
+
+    def _nqs_direct_psi_eval_batches(self) -> int:
+        configured = self.lit_config.nqs_direct_psi_eval_batches
+        if configured is not None:
+            return int(configured)
+        return int(self.lit_config.nqs_direct_psi_batches)
 
     def _nqs_train_update_batch_size(self) -> int:
         configured = int(self.lit_config.nqs_train_update_batch_size)
@@ -2011,6 +2042,8 @@ class MoleculeLITWorkflow(Workflow):
             nqs_direct_psi_train=bool(self.lit_config.nqs_direct_psi_train),
             nqs_direct_psi_burn_in=self.lit_config.nqs_direct_psi_burn_in,
             nqs_direct_psi_batches=self.lit_config.nqs_direct_psi_batches,
+            nqs_direct_psi_train_batches=self._nqs_direct_psi_train_batches(),
+            nqs_direct_psi_eval_batches=self._nqs_direct_psi_eval_batches(),
             nqs_direct_psi_stride=self.lit_config.nqs_direct_psi_stride,
             nqs_warm_start_omega=_optional_float(self.lit_config.nqs_warm_start_omega),
             nqs_warm_start_iterations=self.lit_config.nqs_warm_start_iterations,
