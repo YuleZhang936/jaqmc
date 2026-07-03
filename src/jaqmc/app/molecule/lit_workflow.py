@@ -29,6 +29,7 @@ from jaqmc.data import BatchedData
 from jaqmc.response.lit import lit_error_bound
 from jaqmc.response.nqs_lit import (
     MolecularResponseFermiNet,
+    NQSLITSourceSums,
     ground_local_energy,
     local_action_ratio,
     molecular_electronic_dipole,
@@ -937,7 +938,7 @@ class MoleculeLITWorkflow(Workflow):
 
         return log_amplitude
 
-    def _make_nqs_update_step(
+    def _make_nqs_update_step(  # noqa: C901
         self,
         response_apply,
         ground_params,
@@ -949,8 +950,8 @@ class MoleculeLITWorkflow(Workflow):
         source_norm: float,
     ):
         @jax.jit
-        def reweighted_update(response_params, batched_data, omega):
-            _, stats = self._nqs_loss(
+        def source_stats_and_updates(response_params, batched_data, omega):
+            stats, updates = self._source_sr_stats_and_updates(
                 response_apply,
                 response_params,
                 ground_logpsi,
@@ -962,20 +963,8 @@ class MoleculeLITWorkflow(Workflow):
                 ground_energy=ground_energy,
                 omega=omega,
             )
-            updates = self._weighted_sr_updates(
-                response_apply,
-                response_params,
-                ground_logpsi,
-                ground_params,
-                batched_data,
-                axis=axis,
-                source_center=source_center,
-                ground_energy=ground_energy,
-                omega=omega,
-            )
-            response_params = _apply_updates(response_params, updates)
             loss = _fidelity_loss(stats.fidelity, self.lit_config.nqs_sr_score_eps)
-            return response_params, stats._replace(loss=loss)
+            return stats._replace(loss=loss), updates
 
         direct_train_collect_initial = self._make_direct_psi_pool_collector(
             response_apply,
@@ -1040,22 +1029,30 @@ class MoleculeLITWorkflow(Workflow):
                 self._nqs_train_update_batch_size(),
                 batch_index,
             )
+            source_updates = None
             if (
                 self.lit_config.nqs_direct_psi_train
                 and self._needs_direct_psi_estimator()
             ):
-                stats = self._nqs_stats(
-                    response_apply,
-                    response_params,
-                    ground_logpsi,
-                    ground_params,
-                    update_batch,
-                    axis=axis,
-                    source_center=source_center,
-                    source_norm=source_norm,
-                    ground_energy=ground_energy,
-                    omega=omega,
-                )
+                if direct_state is None:
+                    stats, source_updates = source_stats_and_updates(
+                        response_params,
+                        update_batch,
+                        omega,
+                    )
+                else:
+                    stats = self._nqs_stats(
+                        response_apply,
+                        response_params,
+                        ground_logpsi,
+                        ground_params,
+                        update_batch,
+                        axis=axis,
+                        source_center=source_center,
+                        source_norm=source_norm,
+                        ground_energy=ground_energy,
+                        omega=omega,
+                    )
             else:
                 stats = None
             if stats is not None and self._should_use_direct_psi(stats):
@@ -1082,11 +1079,13 @@ class MoleculeLITWorkflow(Workflow):
                 )
                 return response_params, stats, fallback_data, rng
             direct_state = None
-            response_params, stats = reweighted_update(
-                response_params,
-                update_batch,
-                omega,
-            )
+            if source_updates is None:
+                stats, source_updates = source_stats_and_updates(
+                    response_params,
+                    update_batch,
+                    omega,
+                )
+            response_params = _apply_updates(response_params, source_updates)
             return response_params, stats, fallback_data, rng
 
         def precompile_direct(response_params, batched_data, fallback_data, rng, omega):
@@ -1160,7 +1159,7 @@ class MoleculeLITWorkflow(Workflow):
         )
         return rng
 
-    def _weighted_sr_updates(
+    def _source_sr_stats_and_updates(
         self,
         response_apply,
         response_params,
@@ -1170,20 +1169,44 @@ class MoleculeLITWorkflow(Workflow):
         *,
         axis: int,
         source_center: float,
+        source_norm: float,
         ground_energy: float,
         omega,
     ):
-        score, ratio, source_weight = self._source_sampled_action_scores(
-            response_apply,
-            response_params,
-            ground_logpsi,
-            ground_params,
-            batched_data,
-            axis=axis,
-            source_center=source_center,
-            ground_energy=ground_energy,
-            omega=omega,
+        score, ratio, source_weight, source_sums = (
+            self._source_sampled_action_scores_and_sums(
+                response_apply,
+                response_params,
+                ground_logpsi,
+                ground_params,
+                batched_data,
+                axis=axis,
+                source_center=source_center,
+                ground_energy=ground_energy,
+                omega=omega,
+            )
         )
+        stats = nqs_lit_stats_from_source_sums(
+            source_sums,
+            source_norm=source_norm,
+            omega=omega,
+            eta=self.lit_config.eta,
+        )
+        updates = self._weighted_sr_updates_from_scores(
+            response_params,
+            score,
+            ratio,
+            source_weight,
+        )
+        return stats, updates
+
+    def _weighted_sr_updates_from_scores(
+        self,
+        response_params,
+        score,
+        ratio,
+        source_weight,
+    ):
         eps = jnp.asarray(self.lit_config.nqs_sr_score_eps, dtype=ratio.real.dtype)
         phi_weight = source_weight / jnp.maximum(jnp.sum(source_weight), eps)
         amplitude = jnp.sum(phi_weight * ratio)
@@ -1217,6 +1240,37 @@ class MoleculeLITWorkflow(Workflow):
                 max_norm / (update_norm + jnp.asarray(1e-12, dtype=grad_flat.dtype)),
             )
         return unravel_fn(scale * preconditioned)
+
+    def _weighted_sr_updates(
+        self,
+        response_apply,
+        response_params,
+        ground_logpsi,
+        ground_params,
+        batched_data,
+        *,
+        axis: int,
+        source_center: float,
+        ground_energy: float,
+        omega,
+    ):
+        score, ratio, source_weight = self._source_sampled_action_scores(
+            response_apply,
+            response_params,
+            ground_logpsi,
+            ground_params,
+            batched_data,
+            axis=axis,
+            source_center=source_center,
+            ground_energy=ground_energy,
+            omega=omega,
+        )
+        return self._weighted_sr_updates_from_scores(
+            response_params,
+            score,
+            ratio,
+            source_weight,
+        )
 
     def _direct_sr_updates(
         self,
@@ -1406,6 +1460,163 @@ class MoleculeLITWorkflow(Workflow):
         rhs = score_aug @ grad_flat
         projected = score_aug.T @ jnp.linalg.solve(kernel, rhs)
         return (grad_flat - projected) / damping
+
+    def _source_sampled_action_scores_and_sums(
+        self,
+        response_apply,
+        response_params,
+        ground_logpsi,
+        ground_params,
+        batched_data,
+        *,
+        axis: int,
+        source_center: float,
+        ground_energy: float,
+        omega,
+    ):
+        data = batched_data.data
+        score_eps = float(self.lit_config.nqs_sr_score_eps)
+
+        def action_score_and_aux(params, one):
+            def split_log_action(local_params):
+                local_action, local_response_ratio, local_eloc_response = (
+                    local_action_ratio(
+                        response_apply,
+                        local_params,
+                        ground_logpsi,
+                        ground_params,
+                        one,
+                        ground_energy=ground_energy,
+                        omega=omega,
+                        eta=self.lit_config.eta,
+                    )
+                )
+                safe_action = jnp.where(
+                    jnp.abs(local_action) > score_eps,
+                    local_action,
+                    jnp.asarray(score_eps, dtype=local_action.real.dtype) + 0j,
+                )
+                value = jnp.log(safe_action)
+                return jnp.stack([jnp.real(value), jnp.imag(value)]), (
+                    local_action,
+                    local_response_ratio,
+                    local_eloc_response,
+                )
+
+            jac, aux = jax.jacrev(split_log_action, has_aux=True)(params)
+            score_tree = jax.tree.map(lambda leaf: leaf[0] + 1j * leaf[1], jac)
+            action, response_ratio, eloc_response = aux
+            return action, response_ratio, eloc_response, score_tree
+
+        action, response_ratio, eloc_response, score_tree = jax.vmap(
+            lambda one: action_score_and_aux(response_params, one),
+            in_axes=(batched_data.vmap_axis,),
+        )(data)
+        score = _flatten_batched_tree(score_tree, action.shape[0])
+        dipole = jax.vmap(
+            lambda one: molecular_electronic_dipole(one, axis),
+            in_axes=(batched_data.vmap_axis,),
+        )(data)
+        source = dipole - jnp.asarray(source_center, dtype=dipole.dtype)
+        floor = jnp.asarray(self.lit_config.nqs_source_floor, dtype=dipole.dtype)
+
+        stats_eps = jnp.asarray(1e-12, dtype=dipole.dtype)
+        stats_sampled_source = jnp.maximum(jnp.abs(source), floor)
+        stats_source_weight = (
+            jnp.abs(source) / jnp.maximum(stats_sampled_source, stats_eps)
+        ) ** 2
+        finite_sums = (
+            jnp.isfinite(jnp.real(action))
+            & jnp.isfinite(jnp.imag(action))
+            & jnp.isfinite(jnp.real(response_ratio))
+            & jnp.isfinite(jnp.imag(response_ratio))
+            & jnp.isfinite(source)
+            & jnp.isfinite(stats_source_weight)
+        )
+        stats_action = jnp.where(
+            finite_sums,
+            action,
+            jnp.asarray(0.0, dtype=action.dtype),
+        )
+        stats_response_ratio = jnp.where(
+            finite_sums,
+            response_ratio,
+            jnp.asarray(0.0, dtype=response_ratio.dtype),
+        )
+        stats_source_weight = jnp.where(
+            finite_sums,
+            stats_source_weight,
+            jnp.asarray(0.0, dtype=stats_source_weight.dtype),
+        )
+        safe_source_stats = jnp.where(
+            jnp.abs(source) > stats_eps,
+            source,
+            stats_eps * jnp.where(source < 0, -1.0, 1.0),
+        )
+        stats_ratio = stats_action / safe_source_stats
+        psi_weight_unnormalized = stats_source_weight * jnp.abs(stats_ratio) ** 2
+        shift = jnp.asarray(omega, dtype=stats_response_ratio.real.dtype) + 1j * (
+            jnp.asarray(self.lit_config.eta, dtype=stats_response_ratio.real.dtype)
+        )
+        hbar_response_ratio = stats_action + shift * stats_response_ratio
+        response_over_source = stats_response_ratio / safe_source_stats
+        hbar_over_source = hbar_response_ratio / safe_source_stats
+        eloc_finite = jnp.isfinite(jnp.real(eloc_response))
+        eloc_response = jnp.where(
+            eloc_finite,
+            eloc_response,
+            jnp.asarray(0.0, dtype=eloc_response.dtype),
+        )
+        sample_count = jnp.asarray(action.shape[0], dtype=stats_source_weight.dtype)
+        source_sums = NQSLITSourceSums(
+            sample_count=sample_count,
+            weight_sum=jnp.sum(stats_source_weight),
+            valid_sample_count=jnp.sum(
+                stats_source_weight > jnp.asarray(0.0, dtype=stats_source_weight.dtype)
+            ),
+            ratio_sum=jnp.sum(stats_source_weight * stats_ratio),
+            ratio_abs2_sum=jnp.sum(stats_source_weight * jnp.abs(stats_ratio) ** 2),
+            psi_weight_sum=jnp.sum(psi_weight_unnormalized),
+            psi_weight_sq_sum=jnp.sum(psi_weight_unnormalized**2),
+            response_conj_over_source_sum=jnp.sum(
+                stats_source_weight * jnp.conj(stats_response_ratio) / safe_source_stats
+            ),
+            response_over_source_abs2_sum=jnp.sum(
+                stats_source_weight * jnp.abs(response_over_source) ** 2
+            ),
+            hbar_over_source_sum=jnp.sum(stats_source_weight * hbar_over_source),
+            hbar_over_source_abs2_sum=jnp.sum(
+                stats_source_weight * jnp.abs(hbar_over_source) ** 2
+            ),
+            ground_energy_sum=jnp.real(jnp.sum(eloc_response)),
+        )
+
+        safe_source_score = jnp.where(
+            jnp.abs(source) > score_eps,
+            source,
+            jnp.asarray(score_eps, dtype=source.dtype)
+            * jnp.where(source < 0, -1.0, 1.0),
+        )
+        score_sampled_source = jnp.maximum(jnp.abs(source), floor)
+        source_weight = (
+            jnp.abs(source) / jnp.maximum(score_sampled_source, score_eps)
+        ) ** 2
+        ratio = action / safe_source_score
+        finite_score = jnp.all(
+            jnp.isfinite(jnp.real(score)) & jnp.isfinite(jnp.imag(score)),
+            axis=1,
+        )
+        finite_ratio = jnp.isfinite(jnp.real(ratio)) & jnp.isfinite(jnp.imag(ratio))
+        finite_weight = jnp.isfinite(source_weight)
+        finite = finite_score & finite_ratio & finite_weight
+        score = jnp.where(finite[:, None], score, jnp.asarray(0.0, dtype=score.dtype))
+        ratio = jnp.where(finite, ratio, jnp.asarray(0.0, dtype=ratio.dtype))
+        source_weight = jnp.where(
+            finite,
+            source_weight,
+            jnp.asarray(0.0, dtype=source_weight.dtype),
+        )
+        return score, ratio, source_weight, source_sums
 
     def _source_sampled_action_scores(
         self,

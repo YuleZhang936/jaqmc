@@ -6,12 +6,15 @@ import numpy as np
 from jax import numpy as jnp
 
 from jaqmc.app.molecule.data import MoleculeData
+from jaqmc.app.molecule.lit_workflow import MolecularLITConfig, MoleculeLITWorkflow
 from jaqmc.data import BatchedData
 from jaqmc.response.nqs_lit import (
     MolecularResponseFermiNet,
     local_action_ratio,
     nqs_lit_double_sampled_stats,
     nqs_lit_source_sampled_stats,
+    nqs_lit_source_sampled_sums,
+    nqs_lit_stats_from_source_sums,
     restore_params_from_checkpoint,
 )
 from jaqmc.utils.checkpoint import NumPyCheckpointManager
@@ -27,6 +30,10 @@ def _hydrogen_2pz_logpsi(params, data: MoleculeData):
     rel = data.electrons[0] - data.atoms[0]
     sign_phase = jnp.where(rel[2] < 0.0, jnp.pi, 0.0)
     return jnp.log(jnp.abs(rel[2])) - 0.5 * jnp.linalg.norm(rel) + 1j * sign_phase
+
+
+def _scaled_hydrogen_2pz_logpsi(params, data: MoleculeData):
+    return params["scale"] * _hydrogen_2pz_logpsi({}, data)
 
 
 def _h_batch() -> BatchedData[MoleculeData]:
@@ -97,6 +104,62 @@ def test_full_response_source_sampled_hydrogen_stats_are_finite():
     assert 0.0 < float(stats.reweight_ess_fraction) <= 1.0
     assert np.isfinite(float(stats.error_d))
     np.testing.assert_allclose(float(stats.source_norm), 1.0)
+
+
+def test_fused_source_scores_preserve_source_sampled_sums():
+    batch = _h_batch()
+    response_params = {"scale": jnp.asarray(1.0, dtype=jnp.float32)}
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(
+        eta=0.02,
+        nqs_source_floor=1e-4,
+        nqs_sr_score_eps=1e-8,
+    )
+
+    _, _, _, fused_sums = workflow._source_sampled_action_scores_and_sums(
+        _scaled_hydrogen_2pz_logpsi,
+        response_params,
+        _hydrogen_1s_logpsi,
+        {},
+        batch,
+        axis=2,
+        source_center=0.0,
+        ground_energy=-0.5,
+        omega=0.375,
+    )
+    reference_sums = nqs_lit_source_sampled_sums(
+        _scaled_hydrogen_2pz_logpsi,
+        response_params,
+        _hydrogen_1s_logpsi,
+        {},
+        batch,
+        axis=2,
+        source_center=0.0,
+        ground_energy=-0.5,
+        omega=0.375,
+        eta=0.02,
+        source_floor=1e-4,
+    )
+
+    for actual, expected in zip(fused_sums, reference_sums, strict=True):
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=2e-5)
+
+    fused_stats = nqs_lit_stats_from_source_sums(
+        fused_sums,
+        source_norm=1.0,
+        omega=0.375,
+        eta=0.02,
+    )
+    reference_stats = nqs_lit_stats_from_source_sums(
+        reference_sums,
+        source_norm=1.0,
+        omega=0.375,
+        eta=0.02,
+    )
+    np.testing.assert_allclose(
+        float(fused_stats.fidelity),
+        float(reference_stats.fidelity),
+    )
 
 
 def test_double_sampled_hydrogen_stats_reports_direct_estimator():
