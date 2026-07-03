@@ -14,7 +14,7 @@ import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import numpy as np
@@ -141,6 +141,13 @@ class _DirectPsiState:
     batched_data: BatchedData
     sampler_state: dict[str, Any]
     rng: jax.Array
+
+
+class _DirectPsiCarry(NamedTuple):
+    batched_data: BatchedData
+    sampler_state: dict[str, Any]
+    rng: jax.Array
+    initialized: jax.Array
 
 
 class MoleculeLITWorkflow(Workflow):
@@ -320,31 +327,34 @@ class MoleculeLITWorkflow(Workflow):
                 axis=axis,
                 omega=jnp.asarray(precompile_omega),
             )
-            response_params, axis_batched_data, rng = self._warm_start_axis(
+            axis_direct_carry = update_step.init_direct_carry(axis_batched_data, rng)
+            response_params, axis_direct_carry = self._warm_start_axis(
                 update_step,
                 response_params,
                 train_pool,
-                axis_batched_data,
-                rng,
+                axis_direct_carry,
                 axis=axis,
             )
             axis_start_response_params = response_params
-            axis_start_batched_data = axis_batched_data
+            axis_start_batched_data = axis_direct_carry.batched_data
+            rng = axis_direct_carry.rng
             logger.info(
                 "axis=%s omega_points independent_response_start=true",
                 _AXIS_NAMES[axis],
             )
             for omega_pos, omega_value in enumerate(omega):
                 point_response_params = axis_start_response_params
-                point_batched_data = axis_start_batched_data
+                point_direct_carry = update_step.init_direct_carry(
+                    axis_start_batched_data,
+                    rng,
+                )
                 stats = None
                 for iteration in range(self.lit_config.nqs_iterations):
-                    point_response_params, stats, point_batched_data, rng = update_step(
+                    point_response_params, stats, point_direct_carry = update_step(
                         point_response_params,
                         train_pool,
                         jnp.asarray(float(omega_value)),
-                        point_batched_data,
-                        rng,
+                        point_direct_carry,
                         iteration,
                     )
                     if (
@@ -376,14 +386,14 @@ class MoleculeLITWorkflow(Workflow):
                         ground_energy=ground_energy,
                         omega=float(omega_value),
                     )
-                stats, point_batched_data, rng = self._nqs_eval_stats_with_fallback(
+                stats, _, rng = self._nqs_eval_stats_with_fallback(
                     response_apply,
                     point_response_params,
                     ground_logpsi,
                     ground_params,
                     eval_pool,
-                    point_batched_data,
-                    rng,
+                    point_direct_carry.batched_data,
+                    point_direct_carry.rng,
                     axis=axis,
                     source_center=source_center,
                     source_norm=axis_phi_norm,
@@ -780,8 +790,7 @@ class MoleculeLITWorkflow(Workflow):
         update_step,
         response_params,
         train_pool,
-        fallback_data,
-        rng,
+        direct_carry,
         *,
         axis: int,
     ):
@@ -789,15 +798,14 @@ class MoleculeLITWorkflow(Workflow):
             self.lit_config.nqs_warm_start_omega is None
             or self.lit_config.nqs_warm_start_iterations <= 0
         ):
-            return response_params, fallback_data, rng
+            return response_params, direct_carry
         stats = None
         for iteration in range(self.lit_config.nqs_warm_start_iterations):
-            response_params, stats, fallback_data, rng = update_step(
+            response_params, stats, direct_carry = update_step(
                 response_params,
                 train_pool,
                 jnp.asarray(float(self.lit_config.nqs_warm_start_omega)),
-                fallback_data,
-                rng,
+                direct_carry,
                 iteration,
             )
         if stats is not None:
@@ -812,7 +820,7 @@ class MoleculeLITWorkflow(Workflow):
                 float(stats.reweight_ess_fraction),
                 int(stats.estimator_mode),
             )
-        return response_params, fallback_data, rng
+        return response_params, direct_carry
 
     def _resolve_nqs_ground_state(self, example, ground_rng):
         fallback_ground_params = self.wf.init_params(example, ground_rng)
@@ -950,7 +958,7 @@ class MoleculeLITWorkflow(Workflow):
         source_norm: float,
     ):
         @jax.jit
-        def source_stats_and_updates(response_params, batched_data, omega):
+        def source_update(response_params, batched_data, omega):
             stats, updates = self._source_sr_stats_and_updates(
                 response_apply,
                 response_params,
@@ -963,8 +971,9 @@ class MoleculeLITWorkflow(Workflow):
                 ground_energy=ground_energy,
                 omega=omega,
             )
+            response_params = _apply_updates(response_params, updates)
             loss = _fidelity_loss(stats.fidelity, self.lit_config.nqs_sr_score_eps)
-            return stats._replace(loss=loss), updates
+            return response_params, stats._replace(loss=loss)
 
         direct_train_collect_initial = self._make_direct_psi_pool_collector(
             response_apply,
@@ -988,105 +997,168 @@ class MoleculeLITWorkflow(Workflow):
         )
 
         @jax.jit
-        def direct_update(
+        def fallback_update(
             response_params,
             source_batched_data,
-            psi_batched_data,
+            direct_batched_data,
+            direct_sampler_state,
+            direct_rng,
+            direct_initialized,
             omega,
         ):
-            stats, updates = self._direct_sr_stats_and_updates(
-                response_apply,
-                response_params,
-                ground_logpsi,
-                ground_params,
-                source_batched_data,
-                psi_batched_data,
-                axis=axis,
-                source_center=source_center,
-                source_norm=source_norm,
-                ground_energy=ground_energy,
-                omega=omega,
+            source_stats, source_updates, source_sums = (
+                self._source_sr_stats_updates_and_sums(
+                    response_apply,
+                    response_params,
+                    ground_logpsi,
+                    ground_params,
+                    source_batched_data,
+                    axis=axis,
+                    source_center=source_center,
+                    source_norm=source_norm,
+                    ground_energy=ground_energy,
+                    omega=omega,
+                )
             )
-            response_params = _apply_updates(response_params, updates)
-            loss = _fidelity_loss(stats.fidelity, self.lit_config.nqs_sr_score_eps)
-            return response_params, stats._replace(loss=loss)
-
-        direct_state: _DirectPsiState | None = None
-
-        def update(
-            response_params,
-            batched_data,
-            omega,
-            fallback_data,
-            rng,
-            batch_index: int = 0,
-        ):
-            nonlocal direct_state
-            if int(batch_index) == 0:
-                direct_state = None
-            update_batch = _cyclic_batched_data_chunk(
-                batched_data,
-                self._nqs_train_update_batch_size(),
-                batch_index,
+            source_loss = _fidelity_loss(
+                source_stats.fidelity,
+                self.lit_config.nqs_sr_score_eps,
             )
-            source_updates = None
-            if (
-                self.lit_config.nqs_direct_psi_train
-                and self._needs_direct_psi_estimator()
-            ):
-                if direct_state is None:
-                    stats, source_updates = source_stats_and_updates(
+            source_stats = source_stats._replace(loss=source_loss)
+            threshold = jnp.asarray(
+                self.lit_config.nqs_reweight_ess_fraction_min,
+                dtype=source_stats.reweight_ess_fraction.dtype,
+            )
+            use_direct = source_stats.reweight_ess_fraction < threshold
+
+            def source_branch(_):
+                source_response_params = _apply_updates(response_params, source_updates)
+                return (
+                    source_response_params,
+                    source_stats,
+                    direct_batched_data,
+                    direct_sampler_state,
+                    direct_rng,
+                    jnp.asarray(False),
+                )
+
+            def direct_branch(_):
+                def collect_initial(_):
+                    return direct_train_collect_initial(
                         response_params,
-                        update_batch,
+                        direct_batched_data,
+                        direct_sampler_state,
+                        direct_rng,
                         omega,
                     )
-                else:
-                    stats = self._nqs_stats(
+
+                def collect_continue(_):
+                    return direct_train_collect_continue(
+                        response_params,
+                        direct_batched_data,
+                        direct_sampler_state,
+                        direct_rng,
+                        omega,
+                    )
+
+                psi_pool, next_batched_data, next_sampler_state, next_rng = (
+                    jax.lax.cond(
+                        direct_initialized,
+                        collect_continue,
+                        collect_initial,
+                        operand=None,
+                    )
+                )
+                direct_stats, direct_updates = (
+                    self._direct_sr_stats_and_updates_from_source_sums(
                         response_apply,
                         response_params,
                         ground_logpsi,
                         ground_params,
-                        update_batch,
+                        source_sums,
+                        psi_pool,
                         axis=axis,
                         source_center=source_center,
                         source_norm=source_norm,
                         ground_energy=ground_energy,
                         omega=omega,
                     )
-            else:
-                stats = None
-            if stats is not None and self._should_use_direct_psi(stats):
-                if direct_state is None:
-                    direct_state = self._init_direct_psi_state(fallback_data, rng)
-                    collector = direct_train_collect_initial
-                else:
-                    collector = direct_train_collect_continue
-                psi_pool, direct_state = self._collect_direct_psi_pool_from_state(
-                    collector,
-                    response_params,
-                    direct_state,
-                    omega=omega,
                 )
-                fallback_data = direct_state.batched_data
-                rng = direct_state.rng
-                if not self.lit_config.nqs_direct_psi_persistent_sampler:
-                    direct_state = None
-                response_params, stats = direct_update(
+                direct_response_params = _apply_updates(
+                    response_params,
+                    direct_updates,
+                )
+                direct_loss = _fidelity_loss(
+                    direct_stats.fidelity,
+                    self.lit_config.nqs_sr_score_eps,
+                )
+                return (
+                    direct_response_params,
+                    direct_stats._replace(loss=direct_loss),
+                    next_batched_data,
+                    next_sampler_state,
+                    next_rng,
+                    jnp.asarray(True),
+                )
+
+            return jax.lax.cond(
+                use_direct,
+                direct_branch,
+                source_branch,
+                operand=None,
+            )
+
+        direct_enabled = (
+            self.lit_config.nqs_direct_psi_train and self._needs_direct_psi_estimator()
+        )
+
+        def update(
+            response_params,
+            batched_data,
+            omega,
+            direct_carry,
+            batch_index: int = 0,
+        ):
+            if int(batch_index) == 0:
+                direct_carry = direct_carry._replace(initialized=jnp.asarray(False))
+            update_batch = _cyclic_batched_data_chunk(
+                batched_data,
+                self._nqs_train_update_batch_size(),
+                batch_index,
+            )
+            if not direct_enabled:
+                response_params, stats = source_update(
                     response_params,
                     update_batch,
-                    psi_pool,
                     omega,
                 )
-                return response_params, stats, fallback_data, rng
-            direct_state = None
-            if source_updates is None:
-                stats, source_updates = source_stats_and_updates(
-                    response_params,
-                    update_batch,
-                    omega,
-                )
-            response_params = _apply_updates(response_params, source_updates)
-            return response_params, stats, fallback_data, rng
+                return response_params, stats, direct_carry
+            (
+                response_params,
+                stats,
+                direct_batched_data,
+                direct_sampler_state,
+                direct_rng,
+                direct_initialized,
+            ) = fallback_update(
+                response_params,
+                update_batch,
+                direct_carry.batched_data,
+                direct_carry.sampler_state,
+                direct_carry.rng,
+                direct_carry.initialized,
+                omega,
+            )
+            return (
+                response_params,
+                stats,
+                _DirectPsiCarry(
+                    batched_data=direct_batched_data,
+                    sampler_state=direct_sampler_state,
+                    rng=direct_rng,
+                    initialized=direct_initialized,
+                ),
+            )
 
         def precompile_direct(response_params, batched_data, fallback_data, rng, omega):
             return self._precompile_direct_fallback_kernels(
@@ -1096,11 +1168,10 @@ class MoleculeLITWorkflow(Workflow):
                 rng,
                 omega,
                 axis=axis,
-                collect_initial=direct_train_collect_initial,
-                collect_continue=direct_train_collect_continue,
-                direct_update=direct_update,
+                fallback_update=fallback_update,
             )
 
+        update.init_direct_carry = self._init_direct_psi_carry  # type: ignore[attr-defined]
         update.precompile_direct = precompile_direct  # type: ignore[attr-defined]
         return update
 
@@ -1113,9 +1184,7 @@ class MoleculeLITWorkflow(Workflow):
         omega,
         *,
         axis: int,
-        collect_initial,
-        collect_continue,
-        direct_update,
+        fallback_update,
     ):
         if not (
             self.lit_config.nqs_direct_psi_train
@@ -1128,36 +1197,62 @@ class MoleculeLITWorkflow(Workflow):
             self._nqs_train_update_batch_size(),
             0,
         )
-        direct_state_for_compile = self._init_direct_psi_state(fallback_data, rng)
-        collect_initial.lower(
-            response_params,
-            direct_state_for_compile.batched_data,
-            direct_state_for_compile.sampler_state,
-            direct_state_for_compile.rng,
-            omega,
-        ).compile()
-        collect_continue.lower(
-            response_params,
-            direct_state_for_compile.batched_data,
-            direct_state_for_compile.sampler_state,
-            direct_state_for_compile.rng,
-            omega,
-        ).compile()
-        psi_pool = _tile_batched_data(
-            fallback_data,
-            self._nqs_direct_psi_train_batches(),
-        )
-        direct_update.lower(
+        direct_carry = self._init_direct_psi_carry(fallback_data, rng)
+        fallback_update.lower(
             response_params,
             update_batch,
-            psi_pool,
+            direct_carry.batched_data,
+            direct_carry.sampler_state,
+            direct_carry.rng,
+            direct_carry.initialized,
             omega,
         ).compile()
         logger.info(
-            "Precompiled direct pi_Psi fallback kernels for axis=%s",
+            "Precompiled fused direct pi_Psi fallback step for axis=%s",
             _AXIS_NAMES[axis],
         )
         return rng
+
+    def _source_sr_stats_updates_and_sums(
+        self,
+        response_apply,
+        response_params,
+        ground_logpsi,
+        ground_params,
+        batched_data,
+        *,
+        axis: int,
+        source_center: float,
+        source_norm: float,
+        ground_energy: float,
+        omega,
+    ):
+        score, ratio, source_weight, source_sums = (
+            self._source_sampled_action_scores_and_sums(
+                response_apply,
+                response_params,
+                ground_logpsi,
+                ground_params,
+                batched_data,
+                axis=axis,
+                source_center=source_center,
+                ground_energy=ground_energy,
+                omega=omega,
+            )
+        )
+        stats = nqs_lit_stats_from_source_sums(
+            source_sums,
+            source_norm=source_norm,
+            omega=omega,
+            eta=self.lit_config.eta,
+        )
+        updates = self._weighted_sr_updates_from_scores(
+            response_params,
+            score,
+            ratio,
+            source_weight,
+        )
+        return stats, updates, source_sums
 
     def _source_sr_stats_and_updates(
         self,
@@ -1379,6 +1474,35 @@ class MoleculeLITWorkflow(Workflow):
             eta=self.lit_config.eta,
             source_floor=self.lit_config.nqs_source_floor,
         )
+        return self._direct_sr_stats_and_updates_from_source_sums(
+            response_apply,
+            response_params,
+            ground_logpsi,
+            ground_params,
+            source_sums,
+            psi_batched_data,
+            axis=axis,
+            source_center=source_center,
+            source_norm=source_norm,
+            ground_energy=ground_energy,
+            omega=omega,
+        )
+
+    def _direct_sr_stats_and_updates_from_source_sums(
+        self,
+        response_apply,
+        response_params,
+        ground_logpsi,
+        ground_params,
+        source_sums,
+        psi_batched_data,
+        *,
+        axis: int,
+        source_center: float,
+        source_norm: float,
+        ground_energy: float,
+        omega,
+    ):
         source_stats = nqs_lit_stats_from_source_sums(
             source_sums,
             source_norm=source_norm,
@@ -2009,6 +2133,15 @@ class MoleculeLITWorkflow(Workflow):
             batched_data=batched_data,
             sampler_state=sampler_state,
             rng=rng,
+        )
+
+    def _init_direct_psi_carry(self, batched_data, rng) -> _DirectPsiCarry:
+        state = self._init_direct_psi_state(batched_data, rng)
+        return _DirectPsiCarry(
+            batched_data=state.batched_data,
+            sampler_state=state.sampler_state,
+            rng=state.rng,
+            initialized=jnp.asarray(False),
         )
 
     def _collect_direct_psi_pool_from_state(
