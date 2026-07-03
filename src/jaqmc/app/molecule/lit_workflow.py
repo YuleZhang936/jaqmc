@@ -69,8 +69,6 @@ class MolecularLITConfig:
     scan_parallel_min_points_per_worker: int = 2
     scan_parallel_worker: bool = False
     scan_parallel_worker_index: int = 0
-    scan_parallel_compile_gate_dir: str = ""
-    scan_parallel_compile_gate_timeout: float = 1800.0
     nqs_checkpoint_path: str = ""
     nqs_allow_untrained_ground: bool = False
     nqs_ground_energy: float | None = None
@@ -501,9 +499,6 @@ class MoleculeLITWorkflow(Workflow):
         if self.lit_config.scan_parallel_worker_index < 0:
             msg = "lit.scan_parallel_worker_index must be nonnegative."
             raise ValueError(msg)
-        if self.lit_config.scan_parallel_compile_gate_timeout <= 0:
-            msg = "lit.scan_parallel_compile_gate_timeout must be positive."
-            raise ValueError(msg)
         self._validate_chunk_config()
         if not 0.0 <= self.lit_config.nqs_reweight_ess_fraction_min <= 1.0:
             msg = (
@@ -751,39 +746,7 @@ class MoleculeLITWorkflow(Workflow):
         precompile = getattr(update_step, "precompile_direct", None)
         if precompile is None:
             return rng
-        if (
-            not self.lit_config.scan_parallel_worker
-            or not self.lit_config.scan_parallel_compile_gate_dir
-        ):
-            return precompile(response_params, train_pool, fallback_data, rng, omega)
-
-        gate_dir = UPath(self.lit_config.scan_parallel_compile_gate_dir)
-        gate_path = gate_dir / f"axis_{_AXIS_NAMES[axis]}_direct_precompiled"
-        if int(self.lit_config.scan_parallel_worker_index) == 0:
-            gate_dir.mkdir(parents=True, exist_ok=True)
-            rng = precompile(response_params, train_pool, fallback_data, rng, omega)
-            gate_path.write_text(
-                f"ready pid={os.getpid()} axis={_AXIS_NAMES[axis]} time={time.time()}\n"
-            )
-            logger.info(
-                "Wrote direct pi_Psi compile gate for axis=%s to %s",
-                _AXIS_NAMES[axis],
-                gate_path,
-            )
-            return rng
-
-        timeout = float(self.lit_config.scan_parallel_compile_gate_timeout)
-        logger.info(
-            "Waiting for direct pi_Psi compile gate axis=%s at %s",
-            _AXIS_NAMES[axis],
-            gate_path,
-        )
-        _wait_for_path(gate_path, timeout=timeout)
-        logger.info(
-            "Direct pi_Psi compile gate ready for axis=%s",
-            _AXIS_NAMES[axis],
-        )
-        return rng
+        return precompile(response_params, train_pool, fallback_data, rng, omega)
 
     def _warm_start_axis(
         self,
@@ -2433,7 +2396,6 @@ class MoleculeLITWorkflow(Workflow):
         base_config_path = parallel_root / "base_config.yaml"
         base_config_path.write_text(self.cfg.to_yaml())
         compile_cache_dir = parallel_root / "jax_compile_cache"
-        compile_gate_dir = parallel_root / "compile_gate"
         run_seed = (
             int(self.config.seed) if self.config.seed is not None else int(time.time())
         )
@@ -2470,12 +2432,11 @@ class MoleculeLITWorkflow(Workflow):
                     run_seed=run_seed,
                     shared_source=shared_source,
                     worker_index=worker_index,
-                    compile_gate_dir=compile_gate_dir,
                 )
                 device = worker_devices[worker_index]
                 env = _parallel_worker_env(
                     device,
-                    cache_dir=compile_cache_dir,
+                    cache_dir=compile_cache_dir / f"worker_{worker_index:03d}",
                     autotune_cache_dir=parallel_root
                     / "xla_autotune_cache"
                     / f"worker_{worker_index:03d}",
@@ -2708,7 +2669,6 @@ class MoleculeLITWorkflow(Workflow):
         run_seed: int,
         shared_source: _ParallelSharedSource | None = None,
         worker_index: int = 0,
-        compile_gate_dir: UPath | None = None,
     ) -> list[str]:
         source_pool_dir = (
             shared_source.source_pool_dir
@@ -2734,8 +2694,6 @@ class MoleculeLITWorkflow(Workflow):
             f"lit.nqs_source_pool_dir={source_pool_dir}",
             f"lit.scan_parallel_worker_index={int(worker_index)}",
         ]
-        if compile_gate_dir is not None:
-            command.append(f"lit.scan_parallel_compile_gate_dir={compile_gate_dir}")
         if shared_source is not None:
             command.extend(
                 [
@@ -2951,16 +2909,6 @@ def _tail_text(path: UPath, lines: int = 80) -> str:
     except OSError as exc:
         return f"<failed to read {path}: {exc}>"
     return "\n".join(text.splitlines()[-lines:])
-
-
-def _wait_for_path(path: UPath, *, timeout: float, poll_seconds: float = 2.0) -> None:
-    deadline = time.time() + float(timeout)
-    while time.time() < deadline:
-        if path.exists():
-            return
-        time.sleep(float(poll_seconds))
-    msg = f"Timed out waiting for {path}"
-    raise TimeoutError(msg)
 
 
 def _axis_indices(axes: str) -> tuple[int, ...]:
