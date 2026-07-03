@@ -1,0 +1,86 @@
+logging:
+  level: info
+
+workflow:
+  seed: 1234
+  batch_size: 4096
+  config:
+    ignore_extra: false
+    verbose: false
+
+system:
+  module: atom
+  symbol: He
+  electron_init_width: 0.7
+  basis: aug-cc-pVTZ
+
+wf:
+  module: jaqmc.app.molecule.wavefunction.ferminet
+  ndets: 16
+  hidden_dims_single: [64, 64, 64, 64]
+  hidden_dims_double: [16, 16, 16, 16]
+  use_last_layer: false
+  envelope: abs_isotropic
+  orbitals_spin_split: true
+  full_det: true
+
+sampler:
+  steps: 20
+  initial_width: 0.25
+  adapt_frequency: 100
+
+lit:
+  eta: 0.003
+  omega_min: 0.772
+  omega_max: 0.787
+  omega_points: 61
+  axes: x
+  output_filename: lit_spectrum.npz
+  peak_min_height_fraction: 0.02
+  preview_roots: 12
+  scan_parallel: auto
+  scan_parallel_workers: 0
+  scan_parallel_procs_per_device: 1
+  scan_parallel_min_points_per_worker: 2
+
+  nqs_allow_untrained_ground: false
+  nqs_ground_energy: null
+  nqs_energy_steps: 32
+  nqs_burn_in: 150
+
+  nqs_source_center_steps: 64
+  nqs_source_center_override: null
+  nqs_source_norm_override: null
+  nqs_source_burn_in: 150
+  nqs_source_floor: 0.0001
+  nqs_train_pool_batches: 64
+  nqs_eval_pool_batches: 16
+  nqs_pool_stride: 4
+  nqs_train_update_batch_size: 4096
+  nqs_eval_batch_size: 4096
+  nqs_source_pool_dir: ''
+  nqs_reuse_source_pool: true
+  nqs_save_source_pool: true
+  nqs_reweight_ess_fraction_min: 0.10
+  nqs_direct_psi_train: true
+  nqs_direct_psi_burn_in: 10
+  nqs_direct_psi_batches: 1
+  nqs_direct_psi_train_batches: 1
+  nqs_direct_psi_eval_batches: 4
+  nqs_direct_psi_stride: 2
+
+  nqs_learning_rate: 0.002
+  nqs_sr_damping: 0.03
+  nqs_sr_max_norm: 0.02
+  nqs_sr_score_eps: 1.0e-10
+  nqs_warm_start_omega: -3.674932217565499
+  nqs_warm_start_iterations: 1500
+  nqs_iterations: 6000
+  nqs_log_interval: 100
+
+  nqs_response_ndets: 16
+  nqs_response_hidden_dims_single: [64, 64, 64, 64]
+  nqs_response_hidden_dims_double: [16, 16, 16, 16]
+  nqs_response_use_last_layer: false
+  nqs_response_envelope: abs_isotropic
+  nqs_response_orbitals_spin_split: true
