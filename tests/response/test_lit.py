@@ -8,7 +8,9 @@ from jaqmc.app.molecule.data import MoleculeData
 from jaqmc.app.molecule.lit_workflow import (
     _batched_data_chunks,
     _cyclic_batched_data_chunk,
-    _parallel_worker_device_ids,
+    _local_parallel_slots,
+    _parallel_worker_slots,
+    _parse_parallel_remote_hosts,
 )
 from jaqmc.data import BatchedData
 from jaqmc.response.lit import (
@@ -64,10 +66,37 @@ def test_hydrogen_bound_lit_matches_hardcoded_lorentzian_sum():
     np.testing.assert_allclose(actual, expected, rtol=1e-14)
 
 
-def test_parallel_worker_device_ids_oversubscribes_evenly():
-    devices = _parallel_worker_device_ids(("0", "1", "2"), 8, 3)
+def test_parallel_worker_slots_oversubscribe_evenly():
+    slots = _local_parallel_slots(("0", "1", "2"), procs_per_device=3)
+    selected = _parallel_worker_slots(slots, 8)
 
-    assert devices == ("0", "1", "2", "0", "1", "2", "0", "1")
+    assert tuple(slot.device for slot in selected) == (
+        "0",
+        "1",
+        "2",
+        "0",
+        "1",
+        "2",
+        "0",
+        "1",
+    )
+
+
+def test_parallel_remote_hosts_parse_ipv6_ranges():
+    slots = _parse_parallel_remote_hosts(
+        ("10234@fdbd:dc03:16:340::210:0-2,7",),
+        remote_root="/opt/tiger/jaqmc",
+        remote_python=".venv-gpu/bin/python",
+        ssh_options=("-o", "BatchMode=yes"),
+        procs_per_device=1,
+    )
+
+    assert tuple(slot.device for slot in slots) == ("0", "1", "2", "7")
+    assert slots[0].host == "fdbd:dc03:16:340::210"
+    assert slots[0].port == 10234
+    assert slots[0].root == "/opt/tiger/jaqmc"
+    assert slots[0].python == ".venv-gpu/bin/python"
+    assert slots[0].ssh_options == ("-o", "BatchMode=yes")
 
 
 def test_batched_data_chunks_cover_pool_and_cycle():

@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import operator
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -67,6 +68,17 @@ class MolecularLITConfig:
     scan_parallel_workers: int = 0
     scan_parallel_procs_per_device: int = 1
     scan_parallel_min_points_per_worker: int = 2
+    scan_parallel_remote_hosts: tuple[str, ...] = field(default_factory=tuple)
+    scan_parallel_remote_root: str = ""
+    scan_parallel_remote_python: str = ""
+    scan_parallel_ssh_options: tuple[str, ...] = field(
+        default_factory=lambda: (
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+        )
+    )
     scan_parallel_worker: bool = False
     scan_parallel_worker_index: int = 0
     nqs_checkpoint_path: str = ""
@@ -124,6 +136,21 @@ class _ParallelWorker:
     log_path: UPath
     process: subprocess.Popen[bytes]
     device: str
+
+
+@dataclass(frozen=True)
+class _ParallelSlot:
+    device: str
+    label: str
+    host: str = ""
+    port: int | None = None
+    root: str = ""
+    python: str = ""
+    ssh_options: tuple[str, ...] = ()
+
+    @property
+    def is_remote(self) -> bool:
+        return bool(self.host)
 
 
 @dataclass(frozen=True)
@@ -483,12 +510,38 @@ class MoleculeLITWorkflow(Workflow):
 
     def _validate_config(self) -> None:
         scan_parallel = self.lit_config.scan_parallel.lower()
-        if scan_parallel not in ("auto", "off", "false", "none", "0", "local_devices"):
+        allowed_scan_parallel = (
+            "auto",
+            "off",
+            "false",
+            "none",
+            "0",
+            "local_devices",
+            "distributed",
+            "remote",
+            "remote_devices",
+        )
+        if scan_parallel not in allowed_scan_parallel:
             msg = (
-                "lit.scan_parallel must be one of 'auto', 'off', or "
-                f"'local_devices', got {self.lit_config.scan_parallel!r}."
+                "lit.scan_parallel must be one of 'auto', 'off', "
+                "'local_devices', or 'distributed', got "
+                f"{self.lit_config.scan_parallel!r}."
             )
             raise ValueError(msg)
+        if scan_parallel in _REMOTE_PARALLEL_MODES:
+            if not self.lit_config.scan_parallel_remote_hosts:
+                msg = (
+                    "lit.scan_parallel=distributed requires at least one "
+                    "lit.scan_parallel_remote_hosts entry."
+                )
+                raise ValueError(msg)
+            _parse_parallel_remote_hosts(
+                self.lit_config.scan_parallel_remote_hosts,
+                remote_root=self.lit_config.scan_parallel_remote_root,
+                remote_python=self.lit_config.scan_parallel_remote_python,
+                ssh_options=tuple(self.lit_config.scan_parallel_ssh_options),
+                procs_per_device=int(self.lit_config.scan_parallel_procs_per_device),
+            )
         if self.lit_config.scan_parallel_workers < 0:
             msg = "lit.scan_parallel_workers must be nonnegative."
             raise ValueError(msg)
@@ -2362,15 +2415,28 @@ class MoleculeLITWorkflow(Workflow):
             return False
         if self.lit_config.omega_points < 2:
             return False
-        device_ids = _visible_cuda_devices()
-        if len(device_ids) < 2:
+        slots = self._parallel_slots()
+        if len(slots) < 2:
             return False
-        return self._parallel_worker_count(device_ids) > 1
+        return self._parallel_worker_count(len(slots)) > 1
 
-    def _parallel_worker_count(self, device_ids: tuple[str, ...]) -> int:
-        available_slots = len(device_ids) * int(
-            self.lit_config.scan_parallel_procs_per_device
+    def _parallel_slots(self) -> tuple[_ParallelSlot, ...]:
+        mode = self.lit_config.scan_parallel.lower()
+        if mode in _REMOTE_PARALLEL_MODES:
+            return _parse_parallel_remote_hosts(
+                self.lit_config.scan_parallel_remote_hosts,
+                remote_root=self.lit_config.scan_parallel_remote_root,
+                remote_python=self.lit_config.scan_parallel_remote_python,
+                ssh_options=tuple(self.lit_config.scan_parallel_ssh_options),
+                procs_per_device=int(self.lit_config.scan_parallel_procs_per_device),
+            )
+        device_ids = _visible_cuda_devices()
+        return _local_parallel_slots(
+            device_ids,
+            procs_per_device=int(self.lit_config.scan_parallel_procs_per_device),
         )
+
+    def _parallel_worker_count(self, available_slots: int) -> int:
         worker_limit = (
             int(self.lit_config.scan_parallel_workers)
             if self.lit_config.scan_parallel_workers > 0
@@ -2394,18 +2460,14 @@ class MoleculeLITWorkflow(Workflow):
             self.lit_config.omega_max,
             self.lit_config.omega_points,
         )
-        device_ids = _visible_cuda_devices()
-        worker_count = self._parallel_worker_count(device_ids)
+        slots = self._parallel_slots()
+        worker_count = self._parallel_worker_count(len(slots))
         blocks = _split_omega_blocks(self.lit_config.omega_points, worker_count)
         if len(blocks) <= 1:
             logger.info("Parallel LIT scan requested but only one block is needed.")
             self._run_serial_scan()
             return
-        worker_devices = _parallel_worker_device_ids(
-            device_ids,
-            len(blocks),
-            int(self.lit_config.scan_parallel_procs_per_device),
-        )
+        worker_slots = _parallel_worker_slots(slots, len(blocks))
 
         parallel_root = self.save_path / "parallel_scan"
         parallel_root.mkdir(parents=True, exist_ok=True)
@@ -2426,12 +2488,16 @@ class MoleculeLITWorkflow(Workflow):
             source_pool_dir=shared_pool_root,
         )
 
+        parallel_mode = (
+            "distributed"
+            if self.lit_config.scan_parallel.lower() in _REMOTE_PARALLEL_MODES
+            else "local-device"
+        )
         logger.info(
-            "Starting local-device LIT scan: workers=%d devices=%s "
-            "procs_per_device=%d blocks=%s",
+            "Starting %s LIT scan: workers=%d slots=%s blocks=%s",
+            parallel_mode,
             len(blocks),
-            ",".join(worker_devices),
-            int(self.lit_config.scan_parallel_procs_per_device),
+            ",".join(slot.label for slot in worker_slots),
             ",".join(f"{block[0]}:{block[-1] + 1}" for block in blocks),
         )
         failures: list[_ParallelWorker] = []
@@ -2448,22 +2514,20 @@ class MoleculeLITWorkflow(Workflow):
                     run_seed=run_seed,
                     shared_source=shared_source,
                     worker_index=worker_index,
+                    python_executable=worker_slots[worker_index].python or None,
                 )
-                device = worker_devices[worker_index]
-                env = _parallel_worker_env(
-                    device,
-                    cache_dir=compile_cache_dir / f"worker_{worker_index:03d}",
-                    autotune_cache_dir=parallel_root
-                    / "xla_autotune_cache"
-                    / f"worker_{worker_index:03d}",
+                slot = worker_slots[worker_index]
+                cache_dir = compile_cache_dir / f"worker_{worker_index:03d}"
+                autotune_cache_dir = (
+                    parallel_root / "xla_autotune_cache" / f"worker_{worker_index:03d}"
                 )
                 log_file = stack.enter_context(log_path.open("w", encoding="utf8"))
-                process = subprocess.Popen(
+                process = self._start_parallel_worker(
+                    slot,
                     command,
-                    cwd=Path.cwd(),
-                    env=env,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
+                    log_file,
+                    cache_dir=cache_dir,
+                    autotune_cache_dir=autotune_cache_dir,
                 )
                 workers.append(
                     _ParallelWorker(
@@ -2472,7 +2536,7 @@ class MoleculeLITWorkflow(Workflow):
                         path=part_dir / self.lit_config.output_filename,
                         log_path=log_path,
                         process=process,
-                        device=device,
+                        device=slot.label,
                     )
                 )
             for worker in workers:
@@ -2496,6 +2560,53 @@ class MoleculeLITWorkflow(Workflow):
             devices=[worker.device for worker in workers],
             blocks=[worker.block for worker in workers],
             axes=axes,
+        )
+
+    def _start_parallel_worker(
+        self,
+        slot: _ParallelSlot,
+        command: list[str],
+        log_file,
+        *,
+        cache_dir: UPath,
+        autotune_cache_dir: UPath,
+    ) -> subprocess.Popen[bytes]:
+        if not slot.is_remote:
+            env = _parallel_worker_env(
+                slot.device,
+                cache_dir=cache_dir,
+                autotune_cache_dir=autotune_cache_dir,
+            )
+            return subprocess.Popen(
+                command,
+                cwd=Path.cwd(),
+                env=env,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+            )
+
+        env = _parallel_worker_env(
+            slot.device,
+            cache_dir=cache_dir,
+            autotune_cache_dir=autotune_cache_dir,
+            base_env={},
+            create_dirs=False,
+        )
+        remote_command = _remote_parallel_shell_command(
+            root=slot.root or str(Path.cwd()),
+            command=command,
+            env=env,
+            mkdirs=(cache_dir, autotune_cache_dir, autotune_cache_dir / "tmp"),
+        )
+        ssh_command = ["ssh", *slot.ssh_options]
+        if slot.port is not None:
+            ssh_command.extend(["-p", str(slot.port)])
+        ssh_command.extend([slot.host, remote_command])
+        return subprocess.Popen(
+            ssh_command,
+            cwd=Path.cwd(),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
         )
 
     def _prepare_parallel_shared_source(
@@ -2685,6 +2796,7 @@ class MoleculeLITWorkflow(Workflow):
         run_seed: int,
         shared_source: _ParallelSharedSource | None = None,
         worker_index: int = 0,
+        python_executable: str | None = None,
     ) -> list[str]:
         source_pool_dir = (
             shared_source.source_pool_dir
@@ -2692,7 +2804,7 @@ class MoleculeLITWorkflow(Workflow):
             else part_dir / "source_pools"
         )
         command = [
-            sys.executable,
+            python_executable or sys.executable,
             "-c",
             "from jaqmc.app.cli import cli; cli()",
             "molecule",
@@ -2830,6 +2942,7 @@ class MoleculeLITWorkflow(Workflow):
 
 
 _AXIS_NAMES = ("x", "y", "z")
+_REMOTE_PARALLEL_MODES = frozenset({"distributed", "remote", "remote_devices"})
 
 
 def _visible_cuda_devices() -> tuple[str, ...]:
@@ -2856,25 +2969,145 @@ def _split_omega_blocks(omega_points: int, worker_count: int) -> list[np.ndarray
     ]
 
 
-def _parallel_worker_device_ids(
+def _local_parallel_slots(
     device_ids: tuple[str, ...],
-    worker_count: int,
+    *,
     procs_per_device: int,
-) -> tuple[str, ...]:
-    if not device_ids:
-        msg = "At least one CUDA device id is required."
-        raise ValueError(msg)
+) -> tuple[_ParallelSlot, ...]:
     if procs_per_device < 1:
         msg = "procs_per_device must be positive."
         raise ValueError(msg)
-    max_workers = len(device_ids) * int(procs_per_device)
-    if worker_count > max_workers:
+    slots: list[_ParallelSlot] = []
+    for replica in range(int(procs_per_device)):
+        for device in device_ids:
+            label = str(device)
+            if procs_per_device > 1:
+                label = f"{label}/p{replica}"
+            slots.append(_ParallelSlot(device=str(device), label=label))
+    return tuple(slots)
+
+
+def _parallel_worker_slots(
+    slots: tuple[_ParallelSlot, ...],
+    worker_count: int,
+) -> tuple[_ParallelSlot, ...]:
+    if not slots:
+        msg = "At least one parallel worker slot is required."
+        raise ValueError(msg)
+    if worker_count > len(slots):
         msg = (
             f"worker_count={worker_count} exceeds available parallel slots "
-            f"{max_workers}."
+            f"{len(slots)}."
         )
         raise ValueError(msg)
-    return tuple(device_ids[index % len(device_ids)] for index in range(worker_count))
+    return tuple(slots[:worker_count])
+
+
+def _parse_parallel_remote_hosts(
+    specs: tuple[str, ...],
+    *,
+    remote_root: str,
+    remote_python: str,
+    ssh_options: tuple[str, ...],
+    procs_per_device: int,
+) -> tuple[_ParallelSlot, ...]:
+    if procs_per_device < 1:
+        msg = "procs_per_device must be positive."
+        raise ValueError(msg)
+    slots: list[_ParallelSlot] = []
+    for spec in specs:
+        host, port, devices = _parse_parallel_remote_host(spec)
+        for replica in range(int(procs_per_device)):
+            for device in devices:
+                label = f"{host}:{device}"
+                if port is not None:
+                    label = f"{host}:{port}:{device}"
+                if procs_per_device > 1:
+                    label = f"{label}/p{replica}"
+                slots.append(
+                    _ParallelSlot(
+                        device=device,
+                        label=label,
+                        host=host,
+                        port=port,
+                        root=remote_root,
+                        python=remote_python,
+                        ssh_options=ssh_options,
+                    )
+                )
+    return tuple(slots)
+
+
+def _parse_parallel_remote_host(spec: str) -> tuple[str, int | None, tuple[str, ...]]:
+    raw_spec = str(spec).strip()
+    if not raw_spec:
+        msg = "Empty lit.scan_parallel_remote_hosts entry."
+        raise ValueError(msg)
+
+    port: int | None = None
+    host_and_devices = raw_spec
+    if "@" in raw_spec:
+        port_text, host_and_devices = raw_spec.split("@", 1)
+        try:
+            port = int(port_text)
+        except ValueError as exc:
+            msg = (
+                "Remote host specs with an explicit port must use "
+                f"'PORT@HOST:DEVICES', got {raw_spec!r}."
+            )
+            raise ValueError(msg) from exc
+
+    host, separator, devices_text = host_and_devices.rpartition(":")
+    if not separator or not host or not devices_text:
+        msg = (
+            "Remote host specs must use 'HOST:DEVICES' or "
+            f"'PORT@HOST:DEVICES', got {raw_spec!r}."
+        )
+        raise ValueError(msg)
+    return host, port, _parse_parallel_device_list(devices_text)
+
+
+def _parse_parallel_device_list(devices_text: str) -> tuple[str, ...]:
+    devices: list[str] = []
+    for item in devices_text.split(","):
+        token = item.strip()
+        if not token:
+            continue
+        start_text, dash, end_text = token.partition("-")
+        if dash and start_text.isdigit() and end_text.isdigit():
+            start = int(start_text)
+            end = int(end_text)
+            step = 1 if end >= start else -1
+            devices.extend(str(index) for index in range(start, end + step, step))
+        else:
+            devices.append(token)
+    if not devices:
+        msg = f"No CUDA devices parsed from {devices_text!r}."
+        raise ValueError(msg)
+    return tuple(devices)
+
+
+def _remote_parallel_shell_command(
+    *,
+    root: str,
+    command: list[str],
+    env: dict[str, str],
+    mkdirs: tuple[UPath, ...],
+) -> str:
+    mkdir_command = "mkdir -p " + " ".join(shlex.quote(str(path)) for path in mkdirs)
+    env_prefix = " ".join(
+        f"{key}={shlex.quote(str(value))}" for key, value in sorted(env.items())
+    )
+    worker_command = shlex.join(command)
+    if env_prefix:
+        worker_command = f"{env_prefix} {worker_command}"
+    return " && ".join(
+        (
+            f"cd {shlex.quote(root)}",
+            mkdir_command,
+            worker_command,
+        )
+    )
 
 
 def _parallel_worker_env(
@@ -2882,18 +3115,22 @@ def _parallel_worker_env(
     *,
     cache_dir: UPath | None = None,
     autotune_cache_dir: UPath | None = None,
+    base_env: dict[str, str] | None = None,
+    create_dirs: bool = True,
 ) -> dict[str, str]:
-    env = os.environ.copy()
+    env = os.environ.copy() if base_env is None else dict(base_env)
     env["CUDA_VISIBLE_DEVICES"] = str(device_id)
     env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     if cache_dir is not None:
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        if create_dirs:
+            cache_dir.mkdir(parents=True, exist_ok=True)
         env.setdefault("JAX_ENABLE_COMPILATION_CACHE", "true")
         env.setdefault("JAX_COMPILATION_CACHE_DIR", str(cache_dir))
         env.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
     if autotune_cache_dir is not None:
-        autotune_cache_dir.mkdir(parents=True, exist_ok=True)
-        (autotune_cache_dir / "tmp").mkdir(parents=True, exist_ok=True)
+        if create_dirs:
+            autotune_cache_dir.mkdir(parents=True, exist_ok=True)
+            (autotune_cache_dir / "tmp").mkdir(parents=True, exist_ok=True)
         flag = f"--xla_gpu_per_fusion_autotune_cache_dir={autotune_cache_dir}"
         xla_flags = env.get("XLA_FLAGS", "")
         if "xla_gpu_per_fusion_autotune_cache_dir" not in xla_flags:

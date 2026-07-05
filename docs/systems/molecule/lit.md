@@ -38,6 +38,15 @@ block. Each frequency point starts from the same axis warm-started response
 parameters, so peak positions are not path-dependent on neighboring frequencies
 or worker block boundaries.
 
+For a shared-filesystem cluster, set `lit.scan_parallel=distributed` and pass
+`lit.scan_parallel_remote_hosts` as entries of the form `PORT@HOST:DEVICES`,
+for example `10234@fdbd:dc03:16:340::210:0-7`. The final colon separates the
+GPU list, so IPv6 host addresses are supported. The coordinator still writes a
+single `parallel_scan` directory and the usual merged `lit_spectrum.npz`; it
+launches one worker process per remote GPU slot through SSH. Use
+`lit.scan_parallel_remote_root` and `lit.scan_parallel_remote_python` when the
+remote repository path or Python executable differ from the coordinator.
+
 ## End-To-End H Atom Reference
 
 This section gives a complete H atom reference workflow: first train a
