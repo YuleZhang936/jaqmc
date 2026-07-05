@@ -194,6 +194,8 @@ lit:
 
   # Fall back to direct pi_Psi sampling when source-pool reweighting ESS collapses.
   # The large source pool is evaluated in chunks to keep device memory bounded.
+  # Once a frequency point triggers the fallback, optimization and final
+  # diagnostics stay on the direct estimator for that point.
   nqs_reweight_ess_fraction_min: 0.05
   nqs_direct_psi_train: false
   nqs_direct_psi_burn_in: 5

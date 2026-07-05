@@ -65,8 +65,8 @@ lit:
   nqs_direct_psi_train: true
   nqs_direct_psi_burn_in: 10
   nqs_direct_psi_batches: 1
-  nqs_direct_psi_train_batches: 1
-  nqs_direct_psi_eval_batches: 4
+  nqs_direct_psi_train_batches: 2
+  nqs_direct_psi_eval_batches: 8
   nqs_direct_psi_stride: 2
 
   nqs_learning_rate: 0.002

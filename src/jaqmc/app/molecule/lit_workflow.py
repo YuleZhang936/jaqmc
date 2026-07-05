@@ -146,6 +146,7 @@ class _DirectPsiCarry(NamedTuple):
     sampler_state: dict[str, Any]
     rng: jax.Array
     initialized: jax.Array
+    use_direct: jax.Array
 
 
 class MoleculeLITWorkflow(Workflow):
@@ -397,6 +398,7 @@ class MoleculeLITWorkflow(Workflow):
                     source_norm=axis_phi_norm,
                     ground_energy=ground_energy,
                     omega=jnp.asarray(float(omega_value)),
+                    force_direct=bool(jax.device_get(point_direct_carry.use_direct)),
                 )
                 host_stats = jax.device_get(stats)
                 lit[axis_pos, omega_pos] = float(host_stats.lit)
@@ -967,6 +969,7 @@ class MoleculeLITWorkflow(Workflow):
             direct_sampler_state,
             direct_rng,
             direct_initialized,
+            direct_active,
             omega,
         ):
             source_stats, source_updates, source_sums = (
@@ -992,7 +995,9 @@ class MoleculeLITWorkflow(Workflow):
                 self.lit_config.nqs_reweight_ess_fraction_min,
                 dtype=source_stats.reweight_ess_fraction.dtype,
             )
-            use_direct = source_stats.reweight_ess_fraction < threshold
+            use_direct = direct_active | (
+                source_stats.reweight_ess_fraction < threshold
+            )
 
             def source_branch(_):
                 source_response_params = _apply_updates(response_params, source_updates)
@@ -1002,6 +1007,7 @@ class MoleculeLITWorkflow(Workflow):
                     direct_batched_data,
                     direct_sampler_state,
                     direct_rng,
+                    jnp.asarray(False),
                     jnp.asarray(False),
                 )
 
@@ -1062,6 +1068,7 @@ class MoleculeLITWorkflow(Workflow):
                     next_sampler_state,
                     next_rng,
                     jnp.asarray(True),
+                    jnp.asarray(True),
                 )
 
             return jax.lax.cond(
@@ -1083,7 +1090,10 @@ class MoleculeLITWorkflow(Workflow):
             batch_index: int = 0,
         ):
             if int(batch_index) == 0:
-                direct_carry = direct_carry._replace(initialized=jnp.asarray(False))
+                direct_carry = direct_carry._replace(
+                    initialized=jnp.asarray(False),
+                    use_direct=jnp.asarray(False),
+                )
             update_batch = _cyclic_batched_data_chunk(
                 batched_data,
                 self._nqs_train_update_batch_size(),
@@ -1103,6 +1113,7 @@ class MoleculeLITWorkflow(Workflow):
                 direct_sampler_state,
                 direct_rng,
                 direct_initialized,
+                direct_active,
             ) = fallback_update(
                 response_params,
                 update_batch,
@@ -1110,6 +1121,7 @@ class MoleculeLITWorkflow(Workflow):
                 direct_carry.sampler_state,
                 direct_carry.rng,
                 direct_carry.initialized,
+                direct_carry.use_direct,
                 omega,
             )
             return (
@@ -1120,6 +1132,7 @@ class MoleculeLITWorkflow(Workflow):
                     sampler_state=direct_sampler_state,
                     rng=direct_rng,
                     initialized=direct_initialized,
+                    use_direct=direct_active,
                 ),
             )
 
@@ -1168,6 +1181,7 @@ class MoleculeLITWorkflow(Workflow):
             direct_carry.sampler_state,
             direct_carry.rng,
             direct_carry.initialized,
+            direct_carry.use_direct,
             omega,
         ).compile()
         logger.info(
@@ -2005,6 +2019,7 @@ class MoleculeLITWorkflow(Workflow):
         source_norm: float,
         ground_energy: float,
         omega,
+        force_direct: bool = False,
     ):
         stats = self._nqs_stats_chunked(
             response_apply,
@@ -2018,7 +2033,7 @@ class MoleculeLITWorkflow(Workflow):
             ground_energy=ground_energy,
             omega=omega,
         )
-        if not self._should_use_direct_psi(stats):
+        if not force_direct and not self._should_use_direct_psi(stats):
             return stats, fallback_data, rng
         psi_pool, fallback_data, rng = self._collect_direct_psi_pool(
             response_apply,
@@ -2105,6 +2120,7 @@ class MoleculeLITWorkflow(Workflow):
             sampler_state=state.sampler_state,
             rng=state.rng,
             initialized=jnp.asarray(False),
+            use_direct=jnp.asarray(False),
         )
 
     def _collect_direct_psi_pool_from_state(
