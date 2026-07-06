@@ -65,8 +65,8 @@ lit:
   nqs_direct_psi_train: true
   nqs_direct_psi_burn_in: 10
   nqs_direct_psi_batches: 1
-  nqs_direct_psi_train_batches: 2
-  nqs_direct_psi_eval_batches: 8
+  nqs_direct_psi_train_batches: 4
+  nqs_direct_psi_eval_batches: 16
   nqs_direct_psi_stride: 2
 
   nqs_learning_rate: 0.002
@@ -75,12 +75,12 @@ lit:
   nqs_sr_score_eps: 1.0e-10
   nqs_warm_start_omega: -3.674932217565499
   nqs_warm_start_iterations: 1500
-  nqs_iterations: 6000
+  nqs_iterations: 10000
   nqs_log_interval: 100
 
-  nqs_response_ndets: 16
-  nqs_response_hidden_dims_single: [64, 64, 64, 64]
-  nqs_response_hidden_dims_double: [16, 16, 16, 16]
+  nqs_response_ndets: 32
+  nqs_response_hidden_dims_single: [128, 128, 128, 128]
+  nqs_response_hidden_dims_double: [32, 32, 32, 32]
   nqs_response_use_last_layer: false
   nqs_response_envelope: abs_isotropic
   nqs_response_orbitals_spin_split: true
