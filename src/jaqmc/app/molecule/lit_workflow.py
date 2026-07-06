@@ -34,7 +34,6 @@ from jaqmc.response.nqs_lit import (
     ground_local_energy,
     local_action_ratio,
     molecular_electronic_dipole,
-    nqs_lit_double_sampled_stats,
     nqs_lit_source_sampled_stats,
     nqs_lit_source_sampled_sums,
     nqs_lit_stats_from_source_sums,
@@ -993,6 +992,7 @@ class MoleculeLITWorkflow(Workflow):
             loss = _fidelity_loss(stats.fidelity, self.lit_config.nqs_sr_score_eps)
             return response_params, stats._replace(loss=loss)
 
+        direct_train_micro_batches = self._nqs_direct_psi_train_batches()
         direct_train_collect_initial = self._make_direct_psi_pool_collector(
             response_apply,
             ground_logpsi,
@@ -1000,7 +1000,7 @@ class MoleculeLITWorkflow(Workflow):
             axis=axis,
             source_center=source_center,
             ground_energy=ground_energy,
-            batches=self._nqs_direct_psi_train_batches(),
+            batches=1,
             burn_in=max(0, int(self.lit_config.nqs_direct_psi_burn_in)),
         )
         direct_train_collect_continue = self._make_direct_psi_pool_collector(
@@ -1010,7 +1010,7 @@ class MoleculeLITWorkflow(Workflow):
             axis=axis,
             source_center=source_center,
             ground_energy=ground_energy,
-            batches=self._nqs_direct_psi_train_batches(),
+            batches=1,
             burn_in=0,
         )
 
@@ -1025,19 +1025,24 @@ class MoleculeLITWorkflow(Workflow):
             direct_active,
             omega,
         ):
-            source_stats, source_updates, source_sums = (
-                self._source_sr_stats_updates_and_sums(
-                    response_apply,
-                    response_params,
-                    ground_logpsi,
-                    ground_params,
-                    source_batched_data,
-                    axis=axis,
-                    source_center=source_center,
-                    source_norm=source_norm,
-                    ground_energy=ground_energy,
-                    omega=omega,
-                )
+            source_sums = nqs_lit_source_sampled_sums(
+                response_apply,
+                response_params,
+                ground_logpsi,
+                ground_params,
+                source_batched_data,
+                axis=axis,
+                source_center=source_center,
+                ground_energy=ground_energy,
+                omega=omega,
+                eta=self.lit_config.eta,
+                source_floor=self.lit_config.nqs_source_floor,
+            )
+            source_stats = nqs_lit_stats_from_source_sums(
+                source_sums,
+                source_norm=source_norm,
+                omega=omega,
+                eta=self.lit_config.eta,
             )
             source_loss = _fidelity_loss(
                 source_stats.fidelity,
@@ -1053,6 +1058,17 @@ class MoleculeLITWorkflow(Workflow):
             )
 
             def source_branch(_):
+                source_updates = self._weighted_sr_updates(
+                    response_apply,
+                    response_params,
+                    ground_logpsi,
+                    ground_params,
+                    source_batched_data,
+                    axis=axis,
+                    source_center=source_center,
+                    ground_energy=ground_energy,
+                    omega=omega,
+                )
                 source_response_params = _apply_updates(response_params, source_updates)
                 return (
                     source_response_params,
@@ -1065,58 +1081,107 @@ class MoleculeLITWorkflow(Workflow):
                 )
 
             def direct_branch(_):
-                def collect_initial(_):
-                    return direct_train_collect_initial(
-                        response_params,
+                zero_updates = jax.tree.map(jnp.zeros_like, response_params)
+
+                def one_direct_micro_batch(carry, _):
+                    (
+                        update_sum,
+                        local_batched_data,
+                        local_sampler_state,
+                        local_rng,
+                        local_initialized,
+                        _,
+                    ) = carry
+
+                    def collect_initial(_):
+                        return direct_train_collect_initial(
+                            response_params,
+                            local_batched_data,
+                            local_sampler_state,
+                            local_rng,
+                            omega,
+                        )
+
+                    def collect_continue(_):
+                        return direct_train_collect_continue(
+                            response_params,
+                            local_batched_data,
+                            local_sampler_state,
+                            local_rng,
+                            omega,
+                        )
+
+                    psi_pool, next_batched_data, next_sampler_state, next_rng = (
+                        jax.lax.cond(
+                            local_initialized,
+                            collect_continue,
+                            collect_initial,
+                            operand=None,
+                        )
+                    )
+                    direct_stats, direct_updates = (
+                        self._direct_sr_stats_and_updates_from_source_sums(
+                            response_apply,
+                            response_params,
+                            ground_logpsi,
+                            ground_params,
+                            source_sums,
+                            psi_pool,
+                            axis=axis,
+                            source_center=source_center,
+                            source_norm=source_norm,
+                            ground_energy=ground_energy,
+                            omega=omega,
+                        )
+                    )
+                    direct_loss = _fidelity_loss(
+                        direct_stats.fidelity,
+                        self.lit_config.nqs_sr_score_eps,
+                    )
+                    update_sum = jax.tree.map(operator.add, update_sum, direct_updates)
+                    return (
+                        update_sum,
+                        next_batched_data,
+                        next_sampler_state,
+                        next_rng,
+                        jnp.asarray(True),
+                        direct_stats._replace(loss=direct_loss),
+                    ), None
+
+                (
+                    (
+                        direct_update_sum,
+                        next_batched_data,
+                        next_sampler_state,
+                        next_rng,
+                        _,
+                        direct_stats,
+                    ),
+                    _,
+                ) = jax.lax.scan(
+                    one_direct_micro_batch,
+                    (
+                        zero_updates,
                         direct_batched_data,
                         direct_sampler_state,
                         direct_rng,
-                        omega,
-                    )
-
-                def collect_continue(_):
-                    return direct_train_collect_continue(
-                        response_params,
-                        direct_batched_data,
-                        direct_sampler_state,
-                        direct_rng,
-                        omega,
-                    )
-
-                psi_pool, next_batched_data, next_sampler_state, next_rng = (
-                    jax.lax.cond(
                         direct_initialized,
-                        collect_continue,
-                        collect_initial,
-                        operand=None,
-                    )
+                        source_stats,
+                    ),
+                    None,
+                    length=direct_train_micro_batches,
                 )
-                direct_stats, direct_updates = (
-                    self._direct_sr_stats_and_updates_from_source_sums(
-                        response_apply,
-                        response_params,
-                        ground_logpsi,
-                        ground_params,
-                        source_sums,
-                        psi_pool,
-                        axis=axis,
-                        source_center=source_center,
-                        source_norm=source_norm,
-                        ground_energy=ground_energy,
-                        omega=omega,
-                    )
+                direct_updates = jax.tree.map(
+                    lambda update: update / direct_train_micro_batches,
+                    direct_update_sum,
                 )
                 direct_response_params = _apply_updates(
                     response_params,
                     direct_updates,
                 )
-                direct_loss = _fidelity_loss(
-                    direct_stats.fidelity,
-                    self.lit_config.nqs_sr_score_eps,
-                )
                 return (
                     direct_response_params,
-                    direct_stats._replace(loss=direct_loss),
+                    direct_stats,
                     next_batched_data,
                     next_sampler_state,
                     next_rng,
@@ -2041,20 +2106,93 @@ class MoleculeLITWorkflow(Workflow):
         ground_energy: float,
         omega,
     ):
-        return nqs_lit_double_sampled_stats(
+        source_stats = self._nqs_stats_chunked(
             response_apply,
             response_params,
             ground_logpsi,
             ground_params,
             source_batched_data,
-            psi_batched_data,
             axis=axis,
             source_center=source_center,
             source_norm=source_norm,
             ground_energy=ground_energy,
             omega=omega,
-            eta=self.lit_config.eta,
-            source_floor=self.lit_config.nqs_source_floor,
+        )
+
+        @jax.jit
+        def direct_hloc_sum(local_params, chunk, normalization, local_omega):
+            data = chunk.data
+            action = jax.vmap(
+                lambda one: local_action_ratio(
+                    response_apply,
+                    local_params,
+                    ground_logpsi,
+                    ground_params,
+                    one,
+                    ground_energy=ground_energy,
+                    omega=local_omega,
+                    eta=self.lit_config.eta,
+                )[0],
+                in_axes=(chunk.vmap_axis,),
+            )(data)
+            dipole = jax.vmap(
+                lambda one: molecular_electronic_dipole(one, axis),
+                in_axes=(chunk.vmap_axis,),
+            )(data)
+            eps = jnp.asarray(self.lit_config.nqs_sr_score_eps, dtype=dipole.dtype)
+            source = dipole - jnp.asarray(source_center, dtype=dipole.dtype)
+            safe_source = jnp.where(
+                jnp.abs(source) > eps,
+                source,
+                eps * jnp.where(source < 0, -1.0, 1.0),
+            )
+            ratio = action / safe_source
+            safe_ratio = jnp.where(
+                jnp.abs(ratio) > eps,
+                ratio,
+                jnp.asarray(eps, dtype=ratio.real.dtype) + 0j,
+            )
+            hloc = normalization / safe_ratio
+            finite = jnp.isfinite(jnp.real(hloc)) & jnp.isfinite(jnp.imag(hloc))
+            hloc = jnp.where(finite, hloc, jnp.asarray(0.0, dtype=hloc.dtype))
+            sample_count = jnp.asarray(action.shape[0], dtype=hloc.real.dtype)
+            return jnp.sum(hloc), sample_count
+
+        total_hloc = None
+        total_count = None
+        for chunk in _batched_data_chunks(
+            psi_batched_data, self._nqs_eval_batch_size()
+        ):
+            hloc_sum, sample_count = direct_hloc_sum(
+                response_params,
+                chunk,
+                source_stats.normalization,
+                omega,
+            )
+            total_hloc = hloc_sum if total_hloc is None else total_hloc + hloc_sum
+            total_count = (
+                sample_count if total_count is None else total_count + sample_count
+            )
+        if total_hloc is None or total_count is None:
+            msg = "Cannot evaluate direct NQS-LIT stats with an empty psi pool."
+            raise ValueError(msg)
+
+        eps = jnp.asarray(self.lit_config.nqs_sr_score_eps, dtype=total_count.dtype)
+        fidelity = jnp.clip(
+            jnp.real(total_hloc / jnp.maximum(total_count, eps)),
+            0.0,
+            1.0,
+        )
+        action_norm = (
+            jnp.asarray(source_norm, dtype=fidelity.dtype)
+            * jnp.abs(source_stats.normalization) ** 2
+            / jnp.maximum(fidelity, eps)
+        )
+        return source_stats._replace(
+            loss=1.0 - fidelity,
+            fidelity=fidelity,
+            action_norm=jnp.real(action_norm),
+            estimator_mode=jnp.asarray(1, dtype=jnp.int32),
         )
 
     def _nqs_eval_stats_with_fallback(
@@ -3121,6 +3259,7 @@ def _parallel_worker_env(
     env = os.environ.copy() if base_env is None else dict(base_env)
     env["CUDA_VISIBLE_DEVICES"] = str(device_id)
     env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    env.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
     if cache_dir is not None:
         if create_dirs:
             cache_dir.mkdir(parents=True, exist_ok=True)
