@@ -11,6 +11,7 @@ from jaqmc.app.molecule.lit_workflow import (
     _local_parallel_slots,
     _parallel_worker_slots,
     _parse_parallel_remote_hosts,
+    _solve_sr_direction_chunked,
 )
 from jaqmc.data import BatchedData
 from jaqmc.response.lit import (
@@ -121,3 +122,47 @@ def test_batched_data_chunks_cover_pool_and_cycle():
         np.concatenate([np.asarray(chunk.data.electrons[:, 0, 0]) for chunk in chunks]),
         np.arange(0, 30, 3),
     )
+
+
+def test_chunked_sr_solve_matches_full_metric_branch():
+    score_aug = jnp.asarray(np.arange(30, dtype=np.float32).reshape(10, 3) / 17.0)
+    grad = jnp.asarray([0.5, -0.25, 0.125], dtype=jnp.float32)
+    damping = jnp.asarray(0.03, dtype=jnp.float32)
+
+    full = _solve_sr_direction_chunked(
+        (10,),
+        lambda _: score_aug,
+        grad,
+        damping,
+    )
+    chunks = (score_aug[:4], score_aug[4:7], score_aug[7:])
+    chunked = _solve_sr_direction_chunked(
+        tuple(chunk.shape[0] for chunk in chunks),
+        lambda index: chunks[index],
+        grad,
+        damping,
+    )
+
+    np.testing.assert_allclose(np.asarray(chunked), np.asarray(full), rtol=5e-5)
+
+
+def test_chunked_sr_solve_matches_full_kernel_branch():
+    score_aug = jnp.asarray(np.arange(24, dtype=np.float32).reshape(4, 6) / 13.0)
+    grad = jnp.asarray([0.2, -0.1, 0.3, -0.4, 0.05, 0.7], dtype=jnp.float32)
+    damping = jnp.asarray(0.07, dtype=jnp.float32)
+
+    full = _solve_sr_direction_chunked(
+        (4,),
+        lambda _: score_aug,
+        grad,
+        damping,
+    )
+    chunks = (score_aug[:1], score_aug[1:3], score_aug[3:])
+    chunked = _solve_sr_direction_chunked(
+        tuple(chunk.shape[0] for chunk in chunks),
+        lambda index: chunks[index],
+        grad,
+        damping,
+    )
+
+    np.testing.assert_allclose(np.asarray(chunked), np.asarray(full), rtol=5e-5)

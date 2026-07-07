@@ -992,7 +992,6 @@ class MoleculeLITWorkflow(Workflow):
             loss = _fidelity_loss(stats.fidelity, self.lit_config.nqs_sr_score_eps)
             return response_params, stats._replace(loss=loss)
 
-        direct_train_micro_batches = self._nqs_direct_psi_train_batches()
         direct_train_collect_initial = self._make_direct_psi_pool_collector(
             response_apply,
             ground_logpsi,
@@ -1000,7 +999,7 @@ class MoleculeLITWorkflow(Workflow):
             axis=axis,
             source_center=source_center,
             ground_energy=ground_energy,
-            batches=1,
+            batches=self._nqs_direct_psi_train_batches(),
             burn_in=max(0, int(self.lit_config.nqs_direct_psi_burn_in)),
         )
         direct_train_collect_continue = self._make_direct_psi_pool_collector(
@@ -1010,7 +1009,7 @@ class MoleculeLITWorkflow(Workflow):
             axis=axis,
             source_center=source_center,
             ground_energy=ground_energy,
-            batches=1,
+            batches=self._nqs_direct_psi_train_batches(),
             burn_in=0,
         )
 
@@ -1081,99 +1080,50 @@ class MoleculeLITWorkflow(Workflow):
                 )
 
             def direct_branch(_):
-                zero_updates = jax.tree.map(jnp.zeros_like, response_params)
-
-                def one_direct_micro_batch(carry, _):
-                    (
-                        update_sum,
-                        local_batched_data,
-                        local_sampler_state,
-                        local_rng,
-                        local_initialized,
-                        _,
-                    ) = carry
-
-                    def collect_initial(_):
-                        return direct_train_collect_initial(
-                            response_params,
-                            local_batched_data,
-                            local_sampler_state,
-                            local_rng,
-                            omega,
-                        )
-
-                    def collect_continue(_):
-                        return direct_train_collect_continue(
-                            response_params,
-                            local_batched_data,
-                            local_sampler_state,
-                            local_rng,
-                            omega,
-                        )
-
-                    psi_pool, next_batched_data, next_sampler_state, next_rng = (
-                        jax.lax.cond(
-                            local_initialized,
-                            collect_continue,
-                            collect_initial,
-                            operand=None,
-                        )
-                    )
-                    direct_stats, direct_updates = (
-                        self._direct_sr_stats_and_updates_from_source_sums(
-                            response_apply,
-                            response_params,
-                            ground_logpsi,
-                            ground_params,
-                            source_sums,
-                            psi_pool,
-                            axis=axis,
-                            source_center=source_center,
-                            source_norm=source_norm,
-                            ground_energy=ground_energy,
-                            omega=omega,
-                        )
-                    )
-                    direct_loss = _fidelity_loss(
-                        direct_stats.fidelity,
-                        self.lit_config.nqs_sr_score_eps,
-                    )
-                    update_sum = jax.tree.map(operator.add, update_sum, direct_updates)
-                    return (
-                        update_sum,
-                        next_batched_data,
-                        next_sampler_state,
-                        next_rng,
-                        jnp.asarray(True),
-                        direct_stats._replace(loss=direct_loss),
-                    ), None
-
-                (
-                    (
-                        direct_update_sum,
-                        next_batched_data,
-                        next_sampler_state,
-                        next_rng,
-                        _,
-                        direct_stats,
-                    ),
-                    _,
-                ) = jax.lax.scan(
-                    one_direct_micro_batch,
-                    (
-                        zero_updates,
+                def collect_initial(_):
+                    return direct_train_collect_initial(
+                        response_params,
                         direct_batched_data,
                         direct_sampler_state,
                         direct_rng,
+                        omega,
+                    )
+
+                def collect_continue(_):
+                    return direct_train_collect_continue(
+                        response_params,
+                        direct_batched_data,
+                        direct_sampler_state,
+                        direct_rng,
+                        omega,
+                    )
+
+                psi_pool, next_batched_data, next_sampler_state, next_rng = (
+                    jax.lax.cond(
                         direct_initialized,
-                        source_stats,
-                    ),
-                    None,
-                    length=direct_train_micro_batches,
+                        collect_continue,
+                        collect_initial,
+                        operand=None,
+                    )
                 )
-                direct_updates = jax.tree.map(
-                    lambda update: update / direct_train_micro_batches,
-                    direct_update_sum,
+                direct_stats, direct_updates = (
+                    self._direct_sr_stats_and_updates_from_source_sums(
+                        response_apply,
+                        response_params,
+                        ground_logpsi,
+                        ground_params,
+                        source_sums,
+                        psi_pool,
+                        axis=axis,
+                        source_center=source_center,
+                        source_norm=source_norm,
+                        ground_energy=ground_energy,
+                        omega=omega,
+                    )
+                )
+                direct_loss = _fidelity_loss(
+                    direct_stats.fidelity,
+                    self.lit_config.nqs_sr_score_eps,
                 )
                 direct_response_params = _apply_updates(
                     response_params,
@@ -1181,7 +1131,7 @@ class MoleculeLITWorkflow(Workflow):
                 )
                 return (
                     direct_response_params,
-                    direct_stats,
+                    direct_stats._replace(loss=direct_loss),
                     next_batched_data,
                     next_sampler_state,
                     next_rng,
@@ -1604,50 +1554,128 @@ class MoleculeLITWorkflow(Workflow):
             omega=omega,
             eta=self.lit_config.eta,
         )
-        score, ratio, _ = self._source_sampled_action_scores(
-            response_apply,
-            response_params,
-            ground_logpsi,
-            ground_params,
-            psi_batched_data,
-            axis=axis,
-            source_center=source_center,
-            ground_energy=ground_energy,
-            omega=omega,
-        )
-        eps = jnp.asarray(self.lit_config.nqs_sr_score_eps, dtype=ratio.real.dtype)
-        safe_ratio = jnp.where(
-            jnp.abs(ratio) > eps,
-            ratio,
-            jnp.asarray(eps, dtype=ratio.real.dtype) + 0j,
-        )
         normalization = source_stats.normalization
-        hloc = normalization / safe_ratio
-        finite = jnp.isfinite(jnp.real(hloc)) & jnp.isfinite(jnp.imag(hloc))
-        hloc = jnp.where(finite, hloc, jnp.asarray(0.0, dtype=hloc.dtype))
-        fidelity = jnp.clip(jnp.real(jnp.mean(hloc)), 0.0, 1.0)
+        chunks = tuple(
+            _batched_data_chunks(psi_batched_data, self._nqs_eval_batch_size())
+        )
+        if not chunks:
+            msg = "Cannot compute direct SR update with an empty psi pool."
+            raise ValueError(msg)
+
+        def score_and_hloc(chunk):
+            score, ratio, _ = self._source_sampled_action_scores(
+                response_apply,
+                response_params,
+                ground_logpsi,
+                ground_params,
+                chunk,
+                axis=axis,
+                source_center=source_center,
+                ground_energy=ground_energy,
+                omega=omega,
+            )
+            eps = jnp.asarray(
+                self.lit_config.nqs_sr_score_eps,
+                dtype=ratio.real.dtype,
+            )
+            safe_ratio = jnp.where(
+                jnp.abs(ratio) > eps,
+                ratio,
+                jnp.asarray(eps, dtype=ratio.real.dtype) + 0j,
+            )
+            hloc = normalization / safe_ratio
+            finite = jnp.isfinite(jnp.real(hloc)) & jnp.isfinite(jnp.imag(hloc))
+            hloc = jnp.where(finite, hloc, jnp.asarray(0.0, dtype=hloc.dtype))
+            score = jnp.where(
+                finite[:, None],
+                score,
+                jnp.asarray(0.0, dtype=score.dtype),
+            )
+            return score, hloc
+
+        score_sum = None
+        score_hloc_conj_sum = None
+        hloc_sum = None
+        hloc_conj_sum = None
+        for chunk in chunks:
+            score, hloc = score_and_hloc(chunk)
+            local_score_sum = jnp.sum(score, axis=0)
+            local_score_hloc_conj_sum = jnp.sum(
+                score * jnp.conj(hloc)[:, None],
+                axis=0,
+            )
+            local_hloc_sum = jnp.sum(hloc)
+            local_hloc_conj_sum = jnp.sum(jnp.conj(hloc))
+            score_sum = (
+                local_score_sum if score_sum is None else score_sum + local_score_sum
+            )
+            score_hloc_conj_sum = (
+                local_score_hloc_conj_sum
+                if score_hloc_conj_sum is None
+                else score_hloc_conj_sum + local_score_hloc_conj_sum
+            )
+            hloc_sum = local_hloc_sum if hloc_sum is None else hloc_sum + local_hloc_sum
+            hloc_conj_sum = (
+                local_hloc_conj_sum
+                if hloc_conj_sum is None
+                else hloc_conj_sum + local_hloc_conj_sum
+            )
+        if (
+            score_sum is None
+            or score_hloc_conj_sum is None
+            or hloc_sum is None
+            or hloc_conj_sum is None
+        ):
+            msg = "Cannot compute direct SR update with an empty psi pool."
+            raise ValueError(msg)
+
+        sample_count_int = sum(chunk.batch_size for chunk in chunks)
+        sample_count = jnp.asarray(sample_count_int, dtype=score_sum.real.dtype)
+        score_mean = score_sum / jnp.maximum(
+            sample_count,
+            jnp.asarray(1, dtype=sample_count.dtype),
+        )
+        hloc_conj_mean = hloc_conj_sum / jnp.maximum(
+            sample_count,
+            jnp.asarray(1, dtype=sample_count.dtype),
+        )
+        fidelity = jnp.clip(
+            jnp.real(hloc_sum / jnp.maximum(sample_count, 1)),
+            0.0,
+            1.0,
+        )
+        eps = jnp.asarray(self.lit_config.nqs_sr_score_eps, dtype=fidelity.dtype)
         action_norm = (
             jnp.asarray(source_norm, dtype=fidelity.dtype)
             * jnp.abs(normalization) ** 2
             / jnp.maximum(fidelity, eps)
         )
 
-        hloc_conj = jnp.conj(hloc)
-        score = jnp.where(finite[:, None], score, jnp.asarray(0.0, dtype=score.dtype))
-        sample_count = jnp.maximum(score.shape[0], 1)
-        score_mean = jnp.mean(score, axis=0, keepdims=True)
-        centered_score = score - score_mean
-        grad_flat = 2.0 * jnp.real(
-            jnp.mean(centered_score * hloc_conj[:, None], axis=0)
+        score_hloc_conj_mean = score_hloc_conj_sum / jnp.maximum(
+            sample_count,
+            jnp.asarray(1, dtype=sample_count.dtype),
         )
-        score_scale = jnp.sqrt(jnp.asarray(sample_count, dtype=grad_flat.dtype))
-        weighted_score = centered_score / score_scale
-        score_aug = jnp.concatenate([weighted_score.real, weighted_score.imag], axis=0)
+        grad_flat = 2.0 * jnp.real(score_hloc_conj_mean - score_mean * hloc_conj_mean)
+        score_scale = jnp.sqrt(sample_count)
+
+        def score_aug_chunk(index: int):
+            score, _ = score_and_hloc(chunks[index])
+            centered_score = score - score_mean
+            weighted_score = centered_score / score_scale
+            return jnp.concatenate(
+                [weighted_score.real, weighted_score.imag],
+                axis=0,
+            )
 
         _, unravel_fn = ravel_pytree(response_params)
         damping = jnp.asarray(self.lit_config.nqs_sr_damping, dtype=grad_flat.dtype)
         damping = jnp.maximum(damping, jnp.asarray(1e-12, dtype=grad_flat.dtype))
-        preconditioned = self._solve_sr_direction(score_aug, grad_flat, damping)
+        preconditioned = _solve_sr_direction_chunked(
+            tuple(2 * chunk.batch_size for chunk in chunks),
+            score_aug_chunk,
+            grad_flat,
+            damping,
+        )
         scale = jnp.asarray(self.lit_config.nqs_learning_rate, dtype=grad_flat.dtype)
         if self.lit_config.nqs_sr_max_norm is not None:
             update_norm = jnp.linalg.norm(preconditioned)
@@ -1668,17 +1696,12 @@ class MoleculeLITWorkflow(Workflow):
         return stats, unravel_fn(scale * preconditioned)
 
     def _solve_sr_direction(self, score_aug, grad_flat, damping):
-        parameter_count = grad_flat.shape[0]
-        sample_count = score_aug.shape[0]
-        if parameter_count <= sample_count:
-            metric = score_aug.T @ score_aug
-            metric = metric + damping * jnp.eye(parameter_count, dtype=metric.dtype)
-            return jnp.linalg.solve(metric, grad_flat)
-        kernel = score_aug @ score_aug.T
-        kernel = kernel + damping * jnp.eye(sample_count, dtype=kernel.dtype)
-        rhs = score_aug @ grad_flat
-        projected = score_aug.T @ jnp.linalg.solve(kernel, rhs)
-        return (grad_flat - projected) / damping
+        return _solve_sr_direction_chunked(
+            (score_aug.shape[0],),
+            lambda _: score_aug,
+            grad_flat,
+            damping,
+        )
 
     def _source_sampled_action_scores_and_sums(
         self,
@@ -3424,6 +3447,68 @@ def _batched_data_chunks(pool: BatchedData, requested_size: int):
 
 def _add_source_sums(left, right):
     return jax.tree.map(operator.add, left, right)
+
+
+def _solve_sr_direction_chunked(
+    chunk_rows: tuple[int, ...],
+    score_aug_chunk,
+    grad_flat,
+    damping,
+):
+    """Solve the SR system from score chunks without materializing all scores.
+
+    Args:
+        chunk_rows: Row count for each real-augmented score chunk.
+        score_aug_chunk: Callable returning one real-augmented score chunk.
+        grad_flat: Flattened objective gradient.
+        damping: Positive SR damping added to the metric.
+
+    Returns:
+        Flattened preconditioned SR direction.
+
+    Raises:
+        ValueError: If no score chunks are provided.
+    """
+    if not chunk_rows:
+        msg = "At least one SR score chunk is required."
+        raise ValueError(msg)
+    parameter_count = grad_flat.shape[0]
+    sample_count = sum(int(rows) for rows in chunk_rows)
+    if parameter_count <= sample_count:
+        metric = None
+        for index in range(len(chunk_rows)):
+            score_aug = score_aug_chunk(index)
+            local_metric = score_aug.T @ score_aug
+            metric = local_metric if metric is None else metric + local_metric
+        if metric is None:
+            msg = "At least one SR score chunk is required."
+            raise ValueError(msg)
+        metric = metric + damping * jnp.eye(parameter_count, dtype=metric.dtype)
+        return jnp.linalg.solve(metric, grad_flat)
+
+    row_blocks = []
+    for row_index in range(len(chunk_rows)):
+        row_score_aug = score_aug_chunk(row_index)
+        column_blocks = []
+        for column_index in range(len(chunk_rows)):
+            column_score_aug = score_aug_chunk(column_index)
+            column_blocks.append(row_score_aug @ column_score_aug.T)
+        row_blocks.append(jnp.concatenate(column_blocks, axis=1))
+    kernel = jnp.concatenate(row_blocks, axis=0)
+    kernel = kernel + damping * jnp.eye(sample_count, dtype=kernel.dtype)
+    rhs = jnp.concatenate(
+        [score_aug_chunk(index) @ grad_flat for index in range(len(chunk_rows))],
+        axis=0,
+    )
+    alpha = jnp.linalg.solve(kernel, rhs)
+    projected = jnp.zeros_like(grad_flat)
+    start = 0
+    for index, rows in enumerate(chunk_rows):
+        score_aug = score_aug_chunk(index)
+        stop = start + int(rows)
+        projected = projected + score_aug.T @ alpha[start:stop]
+        start = stop
+    return (grad_flat - projected) / damping
 
 
 def _save_batched_pool(
