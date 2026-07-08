@@ -172,6 +172,8 @@ lit:
   omega_min: 0.420
   omega_max: 0.490
   omega_points: 71
+  # Optional: set explicit, strictly increasing points instead of linspace.
+  # omega_values: [0.444, 0.46875, 0.480]
   axes: x
   output_filename: lit_spectrum.npz
   peak_min_height_fraction: 0.02

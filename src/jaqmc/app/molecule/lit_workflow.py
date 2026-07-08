@@ -59,6 +59,7 @@ class MolecularLITConfig:
     omega_min: float = 0.0
     omega_max: float = 1.0
     omega_points: int = 501
+    omega_values: tuple[float, ...] = field(default_factory=tuple)
     axes: str = "xyz"
     peak_min_height_fraction: float = 0.05
     output_filename: str = "lit_spectrum.npz"
@@ -193,11 +194,7 @@ class MoleculeLITWorkflow(Workflow):
 
     def _run_serial_scan(self) -> None:
         axes = _axis_indices(self.lit_config.axes)
-        omega = np.linspace(
-            self.lit_config.omega_min,
-            self.lit_config.omega_max,
-            self.lit_config.omega_points,
-        )
+        omega = self._omega_grid()
         seed = self.config.seed if self.config.seed is not None else int(time.time())
         rng = jax.random.PRNGKey(seed)
         rng, data_rng, ground_rng, response_rng, sample_rng = jax.random.split(rng, 5)
@@ -507,7 +504,11 @@ class MoleculeLITWorkflow(Workflow):
         )
         self._log_nqs_summary(str(output_path), peaks, fidelity)
 
+    def _omega_grid(self) -> np.ndarray:
+        return _lit_omega_grid(self.lit_config)
+
     def _validate_config(self) -> None:
+        _lit_omega_grid(self.lit_config)
         scan_parallel = self.lit_config.scan_parallel.lower()
         allowed_scan_parallel = (
             "auto",
@@ -2574,7 +2575,7 @@ class MoleculeLITWorkflow(Workflow):
         mode = self.lit_config.scan_parallel.lower()
         if mode in ("off", "false", "none", "0"):
             return False
-        if self.lit_config.omega_points < 2:
+        if self._omega_grid().size < 2:
             return False
         slots = self._parallel_slots()
         if len(slots) < 2:
@@ -2607,7 +2608,7 @@ class MoleculeLITWorkflow(Workflow):
             1,
             int(
                 np.ceil(
-                    self.lit_config.omega_points
+                    self._omega_grid().size
                     / self.lit_config.scan_parallel_min_points_per_worker
                 )
             ),
@@ -2616,14 +2617,10 @@ class MoleculeLITWorkflow(Workflow):
 
     def _run_parallel_scan(self) -> None:
         axes = _axis_indices(self.lit_config.axes)
-        omega = np.linspace(
-            self.lit_config.omega_min,
-            self.lit_config.omega_max,
-            self.lit_config.omega_points,
-        )
+        omega = self._omega_grid()
         slots = self._parallel_slots()
         worker_count = self._parallel_worker_count(len(slots))
-        blocks = _split_omega_blocks(self.lit_config.omega_points, worker_count)
+        blocks = _split_omega_blocks(omega.size, worker_count)
         if len(blocks) <= 1:
             logger.info("Parallel LIT scan requested but only one block is needed.")
             self._run_serial_scan()
@@ -2964,6 +2961,9 @@ class MoleculeLITWorkflow(Workflow):
             if shared_source is not None
             else part_dir / "source_pools"
         )
+        block_omega_values = (
+            "[" + ", ".join(repr(float(value)) for value in block_omega) + "]"
+        )
         command = [
             python_executable or sys.executable,
             "-c",
@@ -2980,6 +2980,7 @@ class MoleculeLITWorkflow(Workflow):
             f"lit.omega_min={float(block_omega[0])}",
             f"lit.omega_max={float(block_omega[-1])}",
             f"lit.omega_points={int(block_omega.size)}",
+            f"lit.omega_values={block_omega_values}",
             f"lit.nqs_source_pool_dir={source_pool_dir}",
             f"lit.scan_parallel_worker_index={int(worker_index)}",
         ]
@@ -3104,6 +3105,29 @@ class MoleculeLITWorkflow(Workflow):
 
 _AXIS_NAMES = ("x", "y", "z")
 _REMOTE_PARALLEL_MODES = frozenset({"distributed", "remote", "remote_devices"})
+
+
+def _lit_omega_grid(config: MolecularLITConfig) -> np.ndarray:
+    if config.omega_values:
+        omega = np.asarray(tuple(float(value) for value in config.omega_values))
+        if omega.ndim != 1 or omega.size == 0:
+            msg = "lit.omega_values must be a non-empty one-dimensional sequence."
+            raise ValueError(msg)
+        if not np.all(np.isfinite(omega)):
+            msg = "lit.omega_values must contain only finite values."
+            raise ValueError(msg)
+        if np.any(np.diff(omega) <= 0.0):
+            msg = "lit.omega_values must be strictly increasing."
+            raise ValueError(msg)
+        return omega
+    if config.omega_points < 1:
+        msg = "lit.omega_points must be positive."
+        raise ValueError(msg)
+    return np.linspace(
+        config.omega_min,
+        config.omega_max,
+        config.omega_points,
+    )
 
 
 def _visible_cuda_devices() -> tuple[str, ...]:

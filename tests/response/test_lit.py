@@ -2,12 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
+import pytest
 from jax import numpy as jnp
+from upath import UPath
 
 from jaqmc.app.molecule.data import MoleculeData
 from jaqmc.app.molecule.lit_workflow import (
+    MolecularLITConfig,
+    MoleculeLITWorkflow,
     _batched_data_chunks,
     _cyclic_batched_data_chunk,
+    _lit_omega_grid,
     _local_parallel_slots,
     _parallel_worker_slots,
     _parse_parallel_remote_hosts,
@@ -98,6 +103,43 @@ def test_parallel_remote_hosts_parse_ipv6_ranges():
     assert slots[0].root == "/opt/tiger/jaqmc"
     assert slots[0].python == ".venv-gpu/bin/python"
     assert slots[0].ssh_options == ("-o", "BatchMode=yes")
+
+
+def test_lit_omega_values_override_linspace():
+    config = MolecularLITConfig(
+        omega_min=0.0,
+        omega_max=1.0,
+        omega_points=5,
+        omega_values=(0.774, 0.775, 0.7765),
+    )
+
+    np.testing.assert_allclose(_lit_omega_grid(config), [0.774, 0.775, 0.7765])
+
+
+def test_lit_omega_values_must_be_strictly_increasing():
+    config = MolecularLITConfig(omega_values=(0.775, 0.775, 0.776))
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        _lit_omega_grid(config)
+
+
+def test_parallel_worker_command_passes_exact_omega_values():
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig()
+    workflow.restore_path = UPath("ground")
+
+    command = workflow._parallel_worker_command(
+        UPath("base_config.yaml"),
+        UPath("part"),
+        np.asarray([0.774, 0.7765, 0.78]),
+        run_seed=123,
+        worker_index=2,
+    )
+
+    assert "lit.omega_min=0.774" in command
+    assert "lit.omega_max=0.78" in command
+    assert "lit.omega_points=3" in command
+    assert "lit.omega_values=[0.774, 0.7765, 0.78]" in command
 
 
 def test_batched_data_chunks_cover_pool_and_cycle():
