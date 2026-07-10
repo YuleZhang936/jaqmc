@@ -229,12 +229,16 @@ class MoleculeLITWorkflow(Workflow):
         broadened = np.zeros_like(lit)
         fidelity = np.zeros_like(lit)
         residual_norm = np.zeros_like(lit)
+        equation_relative_residual = np.zeros_like(lit)
         action_norm = np.zeros_like(lit)
         source_norm = np.zeros_like(lit)
         error_bound_monitor = np.zeros_like(lit)
         error_d = np.zeros_like(lit)
         reweight_ess = np.zeros_like(lit)
         reweight_ess_fraction = np.zeros_like(lit)
+        direct_hloc_rmse = np.full_like(lit, np.nan)
+        direct_hloc_std = np.full_like(lit, np.nan)
+        direct_hloc_sem = np.full_like(lit, np.nan)
         estimator_mode = np.zeros_like(lit, dtype=np.int64)
         normalization = np.zeros((len(axes), len(omega)), dtype=np.complex128)
         correction_overlap = np.zeros_like(normalization)
@@ -428,6 +432,9 @@ class MoleculeLITWorkflow(Workflow):
                 broadened[axis_pos, omega_pos] = float(host_stats.broadened)
                 fidelity[axis_pos, omega_pos] = float(host_stats.fidelity)
                 residual_norm[axis_pos, omega_pos] = float(host_stats.residual_norm)
+                equation_relative_residual[axis_pos, omega_pos] = float(
+                    host_stats.equation_relative_residual
+                )
                 action_norm[axis_pos, omega_pos] = float(host_stats.action_norm)
                 source_norm[axis_pos, omega_pos] = float(host_stats.source_norm)
                 error_bound_monitor[axis_pos, omega_pos] = _lit_error_monitor(
@@ -442,6 +449,11 @@ class MoleculeLITWorkflow(Workflow):
                 reweight_ess_fraction[axis_pos, omega_pos] = float(
                     host_stats.reweight_ess_fraction
                 )
+                direct_hloc_rmse[axis_pos, omega_pos] = float(
+                    host_stats.direct_hloc_rmse
+                )
+                direct_hloc_std[axis_pos, omega_pos] = float(host_stats.direct_hloc_std)
+                direct_hloc_sem[axis_pos, omega_pos] = float(host_stats.direct_hloc_sem)
                 estimator_mode[axis_pos, omega_pos] = int(host_stats.estimator_mode)
                 normalization[axis_pos, omega_pos] = complex(host_stats.normalization)
                 correction_overlap[axis_pos, omega_pos] = complex(
@@ -467,12 +479,16 @@ class MoleculeLITWorkflow(Workflow):
             total_broadened=total_broadened,
             fidelity=fidelity,
             residual_norm=residual_norm,
+            equation_relative_residual=equation_relative_residual,
             action_norm=action_norm,
             source_norm=source_norm,
             error_bound_monitor=error_bound_monitor,
             error_d=error_d,
             reweight_ess=reweight_ess,
             reweight_ess_fraction=reweight_ess_fraction,
+            direct_hloc_rmse=direct_hloc_rmse,
+            direct_hloc_std=direct_hloc_std,
+            direct_hloc_sem=direct_hloc_sem,
             estimator_mode=estimator_mode,
             normalization=normalization,
             correction_overlap=correction_overlap,
@@ -1598,6 +1614,8 @@ class MoleculeLITWorkflow(Workflow):
         score_hloc_conj_sum = None
         hloc_sum = None
         hloc_conj_sum = None
+        hloc_abs2_sum = None
+        hloc_error_abs2_sum = None
         for chunk in chunks:
             score, hloc = score_and_hloc(chunk)
             local_score_sum = jnp.sum(score, axis=0)
@@ -1607,6 +1625,8 @@ class MoleculeLITWorkflow(Workflow):
             )
             local_hloc_sum = jnp.sum(hloc)
             local_hloc_conj_sum = jnp.sum(jnp.conj(hloc))
+            local_hloc_abs2_sum = jnp.sum(jnp.abs(hloc) ** 2)
+            local_hloc_error_abs2_sum = jnp.sum(jnp.abs(hloc - 1.0) ** 2)
             score_sum = (
                 local_score_sum if score_sum is None else score_sum + local_score_sum
             )
@@ -1621,30 +1641,44 @@ class MoleculeLITWorkflow(Workflow):
                 if hloc_conj_sum is None
                 else hloc_conj_sum + local_hloc_conj_sum
             )
+            hloc_abs2_sum = (
+                local_hloc_abs2_sum
+                if hloc_abs2_sum is None
+                else hloc_abs2_sum + local_hloc_abs2_sum
+            )
+            hloc_error_abs2_sum = (
+                local_hloc_error_abs2_sum
+                if hloc_error_abs2_sum is None
+                else hloc_error_abs2_sum + local_hloc_error_abs2_sum
+            )
         if (
             score_sum is None
             or score_hloc_conj_sum is None
             or hloc_sum is None
             or hloc_conj_sum is None
+            or hloc_abs2_sum is None
+            or hloc_error_abs2_sum is None
         ):
             msg = "Cannot compute direct SR update with an empty psi pool."
             raise ValueError(msg)
 
         sample_count_int = sum(chunk.batch_size for chunk in chunks)
         sample_count = jnp.asarray(sample_count_int, dtype=score_sum.real.dtype)
-        score_mean = score_sum / jnp.maximum(
+        safe_sample_count = jnp.maximum(
             sample_count,
             jnp.asarray(1, dtype=sample_count.dtype),
         )
-        hloc_conj_mean = hloc_conj_sum / jnp.maximum(
-            sample_count,
-            jnp.asarray(1, dtype=sample_count.dtype),
+        score_mean = score_sum / safe_sample_count
+        hloc_mean = hloc_sum / safe_sample_count
+        hloc_conj_mean = hloc_conj_sum / safe_sample_count
+        hloc_abs2_mean = hloc_abs2_sum / safe_sample_count
+        hloc_error_abs2_mean = hloc_error_abs2_sum / safe_sample_count
+        direct_hloc_rmse = jnp.sqrt(jnp.maximum(jnp.real(hloc_error_abs2_mean), 0.0))
+        direct_hloc_std = jnp.sqrt(
+            jnp.maximum(jnp.real(hloc_abs2_mean - jnp.abs(hloc_mean) ** 2), 0.0)
         )
-        fidelity = jnp.clip(
-            jnp.real(hloc_sum / jnp.maximum(sample_count, 1)),
-            0.0,
-            1.0,
-        )
+        direct_hloc_sem = direct_hloc_std / jnp.sqrt(safe_sample_count)
+        fidelity = jnp.clip(jnp.real(hloc_mean), 0.0, 1.0)
         eps = jnp.asarray(self.lit_config.nqs_sr_score_eps, dtype=fidelity.dtype)
         action_norm = (
             jnp.asarray(source_norm, dtype=fidelity.dtype)
@@ -1652,10 +1686,7 @@ class MoleculeLITWorkflow(Workflow):
             / jnp.maximum(fidelity, eps)
         )
 
-        score_hloc_conj_mean = score_hloc_conj_sum / jnp.maximum(
-            sample_count,
-            jnp.asarray(1, dtype=sample_count.dtype),
-        )
+        score_hloc_conj_mean = score_hloc_conj_sum / safe_sample_count
         grad_flat = 2.0 * jnp.real(score_hloc_conj_mean - score_mean * hloc_conj_mean)
         score_scale = jnp.sqrt(sample_count)
 
@@ -1693,6 +1724,9 @@ class MoleculeLITWorkflow(Workflow):
             fidelity=fidelity,
             action_norm=jnp.real(action_norm),
             estimator_mode=jnp.asarray(1, dtype=jnp.int32),
+            direct_hloc_rmse=jnp.real(direct_hloc_rmse),
+            direct_hloc_std=jnp.real(direct_hloc_std),
+            direct_hloc_sem=jnp.real(direct_hloc_sem),
         )
         return stats, unravel_fn(scale * preconditioned)
 
@@ -2180,33 +2214,62 @@ class MoleculeLITWorkflow(Workflow):
             finite = jnp.isfinite(jnp.real(hloc)) & jnp.isfinite(jnp.imag(hloc))
             hloc = jnp.where(finite, hloc, jnp.asarray(0.0, dtype=hloc.dtype))
             sample_count = jnp.asarray(action.shape[0], dtype=hloc.real.dtype)
-            return jnp.sum(hloc), sample_count
+            return (
+                jnp.sum(hloc),
+                jnp.sum(jnp.abs(hloc) ** 2),
+                jnp.sum(jnp.abs(hloc - 1.0) ** 2),
+                sample_count,
+            )
 
         total_hloc = None
+        total_hloc_abs2 = None
+        total_hloc_error_abs2 = None
         total_count = None
         for chunk in _batched_data_chunks(
             psi_batched_data, self._nqs_eval_batch_size()
         ):
-            hloc_sum, sample_count = direct_hloc_sum(
-                response_params,
-                chunk,
-                source_stats.normalization,
-                omega,
+            hloc_sum, hloc_abs2_sum, hloc_error_abs2_sum, sample_count = (
+                direct_hloc_sum(
+                    response_params,
+                    chunk,
+                    source_stats.normalization,
+                    omega,
+                )
             )
             total_hloc = hloc_sum if total_hloc is None else total_hloc + hloc_sum
+            total_hloc_abs2 = (
+                hloc_abs2_sum
+                if total_hloc_abs2 is None
+                else total_hloc_abs2 + hloc_abs2_sum
+            )
+            total_hloc_error_abs2 = (
+                hloc_error_abs2_sum
+                if total_hloc_error_abs2 is None
+                else total_hloc_error_abs2 + hloc_error_abs2_sum
+            )
             total_count = (
                 sample_count if total_count is None else total_count + sample_count
             )
-        if total_hloc is None or total_count is None:
+        if (
+            total_hloc is None
+            or total_hloc_abs2 is None
+            or total_hloc_error_abs2 is None
+            or total_count is None
+        ):
             msg = "Cannot evaluate direct NQS-LIT stats with an empty psi pool."
             raise ValueError(msg)
 
         eps = jnp.asarray(self.lit_config.nqs_sr_score_eps, dtype=total_count.dtype)
-        fidelity = jnp.clip(
-            jnp.real(total_hloc / jnp.maximum(total_count, eps)),
-            0.0,
-            1.0,
+        safe_count = jnp.maximum(total_count, eps)
+        hloc_mean = total_hloc / safe_count
+        hloc_abs2_mean = total_hloc_abs2 / safe_count
+        hloc_error_abs2_mean = total_hloc_error_abs2 / safe_count
+        direct_hloc_rmse = jnp.sqrt(jnp.maximum(jnp.real(hloc_error_abs2_mean), 0.0))
+        direct_hloc_std = jnp.sqrt(
+            jnp.maximum(jnp.real(hloc_abs2_mean - jnp.abs(hloc_mean) ** 2), 0.0)
         )
+        direct_hloc_sem = direct_hloc_std / jnp.sqrt(safe_count)
+        fidelity = jnp.clip(jnp.real(hloc_mean), 0.0, 1.0)
         action_norm = (
             jnp.asarray(source_norm, dtype=fidelity.dtype)
             * jnp.abs(source_stats.normalization) ** 2
@@ -2217,6 +2280,9 @@ class MoleculeLITWorkflow(Workflow):
             fidelity=fidelity,
             action_norm=jnp.real(action_norm),
             estimator_mode=jnp.asarray(1, dtype=jnp.int32),
+            direct_hloc_rmse=jnp.real(direct_hloc_rmse),
+            direct_hloc_std=jnp.real(direct_hloc_std),
+            direct_hloc_sem=jnp.real(direct_hloc_sem),
         )
 
     def _nqs_eval_stats_with_fallback(
@@ -3021,12 +3087,16 @@ class MoleculeLITWorkflow(Workflow):
             "broadened",
             "fidelity",
             "residual_norm",
+            "equation_relative_residual",
             "action_norm",
             "source_norm",
             "error_bound_monitor",
             "error_d",
             "reweight_ess",
             "reweight_ess_fraction",
+            "direct_hloc_rmse",
+            "direct_hloc_std",
+            "direct_hloc_sem",
             "estimator_mode",
             "normalization",
             "correction_overlap",

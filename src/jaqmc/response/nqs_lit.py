@@ -53,6 +53,7 @@ class NQSLITStats(NamedTuple):
     correction_overlap: jnp.ndarray
     normalization: jnp.ndarray
     residual_norm: jnp.ndarray
+    equation_relative_residual: jnp.ndarray
     ground_energy_mean: jnp.ndarray
     correction_norm: jnp.ndarray
     shifted_hamiltonian_norm: jnp.ndarray
@@ -60,6 +61,9 @@ class NQSLITStats(NamedTuple):
     reweight_ess: jnp.ndarray
     reweight_ess_fraction: jnp.ndarray
     estimator_mode: jnp.ndarray
+    direct_hloc_rmse: jnp.ndarray
+    direct_hloc_std: jnp.ndarray
+    direct_hloc_sem: jnp.ndarray
 
 
 class NQSLITSourceSums(NamedTuple):
@@ -420,10 +424,12 @@ def nqs_lit_stats_from_source_sums(
         - 2.0 * jnp.real(normalization / safe_normalization)
         + 1.0
     )
-    residual_norm = phi_norm * jnp.maximum(
+    residual_mean = jnp.maximum(
         jnp.real(residual_mean),
         jnp.asarray(0.0, dtype=real_dtype),
     )
+    residual_norm = phi_norm * residual_mean
+    equation_relative_residual = jnp.sqrt(residual_mean)
     correction_norm, shifted_hamiltonian_norm, error_d = _source_sampled_error_d_sums(
         sums,
         phi_norm,
@@ -437,6 +443,7 @@ def nqs_lit_stats_from_source_sums(
         sums.sample_count,
         jnp.asarray(1, dtype=real_dtype),
     )
+    nan_real = jnp.asarray(jnp.nan, dtype=real_dtype)
     return NQSLITStats(
         loss=jnp.real(loss),
         fidelity=fidelity,
@@ -447,6 +454,7 @@ def nqs_lit_stats_from_source_sums(
         correction_overlap=correction_overlap,
         normalization=normalization,
         residual_norm=jnp.real(residual_norm),
+        equation_relative_residual=jnp.real(equation_relative_residual),
         ground_energy_mean=jnp.real(sums.ground_energy_sum / safe_sample_count),
         correction_norm=jnp.real(correction_norm),
         shifted_hamiltonian_norm=jnp.real(shifted_hamiltonian_norm),
@@ -454,6 +462,9 @@ def nqs_lit_stats_from_source_sums(
         reweight_ess=jnp.real(reweight_ess),
         reweight_ess_fraction=jnp.real(reweight_ess_fraction),
         estimator_mode=jnp.asarray(0, dtype=jnp.int32),
+        direct_hloc_rmse=nan_real,
+        direct_hloc_std=nan_real,
+        direct_hloc_sem=nan_real,
     )
 
 
@@ -590,7 +601,12 @@ def nqs_lit_double_sampled_stats(
     hloc = source_stats.normalization / safe_ratio
     finite = jnp.isfinite(jnp.real(hloc)) & jnp.isfinite(jnp.imag(hloc))
     hloc = jnp.where(finite, hloc, jnp.asarray(0.0, dtype=hloc.dtype))
-    fidelity = jnp.clip(jnp.real(jnp.mean(hloc)), 0.0, 1.0)
+    hloc_mean = jnp.mean(hloc)
+    direct_hloc_rmse = jnp.sqrt(jnp.real(jnp.mean(jnp.abs(hloc - 1.0) ** 2)))
+    direct_hloc_std = jnp.sqrt(jnp.real(jnp.mean(jnp.abs(hloc - hloc_mean) ** 2)))
+    sample_count = jnp.asarray(hloc.shape[0], dtype=direct_hloc_std.dtype)
+    direct_hloc_sem = direct_hloc_std / jnp.sqrt(jnp.maximum(sample_count, 1.0))
+    fidelity = jnp.clip(jnp.real(hloc_mean), 0.0, 1.0)
     action_norm = (
         jnp.asarray(source_norm, dtype=fidelity.dtype)
         * jnp.abs(source_stats.normalization) ** 2
@@ -601,6 +617,9 @@ def nqs_lit_double_sampled_stats(
         fidelity=fidelity,
         action_norm=jnp.real(action_norm),
         estimator_mode=jnp.asarray(1, dtype=jnp.int32),
+        direct_hloc_rmse=jnp.real(direct_hloc_rmse),
+        direct_hloc_std=jnp.real(direct_hloc_std),
+        direct_hloc_sem=jnp.real(direct_hloc_sem),
     )
 
 

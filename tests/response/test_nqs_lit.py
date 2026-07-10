@@ -103,6 +103,11 @@ def test_full_response_source_sampled_hydrogen_stats_are_finite():
     assert float(stats.reweight_ess) > 0.0
     assert 0.0 < float(stats.reweight_ess_fraction) <= 1.0
     assert np.isfinite(float(stats.error_d))
+    assert np.isfinite(float(stats.equation_relative_residual))
+    assert float(stats.equation_relative_residual) >= 0.0
+    assert np.isnan(float(stats.direct_hloc_rmse))
+    assert np.isnan(float(stats.direct_hloc_std))
+    assert np.isnan(float(stats.direct_hloc_sem))
     np.testing.assert_allclose(float(stats.source_norm), 1.0)
 
 
@@ -160,6 +165,10 @@ def test_fused_source_scores_preserve_source_sampled_sums():
         float(fused_stats.fidelity),
         float(reference_stats.fidelity),
     )
+    np.testing.assert_allclose(
+        float(fused_stats.equation_relative_residual),
+        float(reference_stats.equation_relative_residual),
+    )
 
 
 def test_double_sampled_hydrogen_stats_reports_direct_estimator():
@@ -184,6 +193,13 @@ def test_double_sampled_hydrogen_stats_reports_direct_estimator():
     assert int(stats.estimator_mode) == 1
     assert 0.0 <= float(stats.fidelity) <= 1.0
     assert float(stats.action_norm) >= 0.0
+    assert np.isfinite(float(stats.equation_relative_residual))
+    assert np.isfinite(float(stats.direct_hloc_rmse))
+    assert np.isfinite(float(stats.direct_hloc_std))
+    assert np.isfinite(float(stats.direct_hloc_sem))
+    assert float(stats.direct_hloc_rmse) >= 0.0
+    assert float(stats.direct_hloc_std) >= 0.0
+    assert float(stats.direct_hloc_sem) >= 0.0
 
 
 def test_molecular_response_ferminet_returns_complex_logpsi():
