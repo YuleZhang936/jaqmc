@@ -75,7 +75,7 @@ lit:
   nqs_sr_score_eps: 1.0e-10
   nqs_warm_start_omega: -3.674932217565499
   nqs_warm_start_iterations: 1500
-  nqs_iterations: 8000
+  nqs_iterations: 6000
   nqs_log_interval: 100
 
   nqs_response_ndets: 16
