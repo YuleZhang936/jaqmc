@@ -7,20 +7,15 @@ from __future__ import annotations
 
 import logging
 import operator
-import os
-import shlex
-import subprocess
-import sys
 import time
-from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 from typing import Any, NamedTuple
 
 import jax
 import numpy as np
 from flax.core import freeze, unfreeze
 from jax import numpy as jnp
+from jax import scipy as jsp
 from jax.flatten_util import ravel_pytree
 from upath import UPath
 
@@ -34,7 +29,6 @@ from jaqmc.response.nqs_lit import (
     ground_local_energy,
     local_action_ratio,
     molecular_electronic_dipole,
-    nqs_lit_source_sampled_stats,
     nqs_lit_source_sampled_sums,
     nqs_lit_stats_from_source_sums,
     restore_params_from_checkpoint,
@@ -45,6 +39,11 @@ from jaqmc.sampler.mcmc import MCMCSampler, MCMCState
 from jaqmc.utils.config import ConfigManager, configurable_dataclass
 from jaqmc.wavefunction.output.envelope import EnvelopeType
 from jaqmc.workflow.base import Workflow
+
+try:
+    from jax import enable_x64 as _enable_x64
+except ImportError:
+    from jax.experimental import enable_x64 as _enable_x64  # type: ignore[no-redef]
 
 logger = logging.LoggerAdapter(
     logging.getLogger(__name__), extra={"category": "response"}
@@ -64,7 +63,10 @@ class MolecularLITConfig:
     peak_min_height_fraction: float = 0.05
     output_filename: str = "lit_spectrum.npz"
     preview_roots: int = 5
-    scan_parallel: str = "auto"
+    # Kept for one release so old configuration files still deserialize.  Any
+    # non-serial value is rejected because frequency continuation is a single
+    # predecessor chain.
+    scan_parallel: str = "off"
     scan_parallel_workers: int = 0
     scan_parallel_procs_per_device: int = 1
     scan_parallel_min_points_per_worker: int = 2
@@ -97,7 +99,7 @@ class MolecularLITConfig:
     nqs_source_pool_dir: str = ""
     nqs_reuse_source_pool: bool = True
     nqs_save_source_pool: bool = True
-    nqs_reweight_ess_fraction_min: float = 0.05
+    nqs_reweight_ess_fraction_min: float = 0.0
     nqs_direct_psi_train: bool = False
     nqs_direct_psi_burn_in: int = 5
     nqs_direct_psi_batches: int = 1
@@ -110,11 +112,20 @@ class MolecularLITConfig:
     nqs_burn_in: int = 20
     nqs_iterations: int = 200
     nqs_learning_rate: float = 1e-3
-    nqs_sr_damping: float = 1e-3
+    nqs_reverse_kl_weight: float = 1.0
+    nqs_spring_epsilon: float = 1e-3
+    nqs_spring_decay: float = 0.99
+    nqs_spring_damping_floor: float = 1e-12
+    nqs_sr_damping: float | None = None
     nqs_sr_max_norm: float | None = 0.1
     nqs_sr_score_eps: float = 1e-10
     nqs_warm_start_omega: float | None = -3.674932217565499
     nqs_warm_start_iterations: int = 100
+    nqs_continuation_iterations: int = 100
+    nqs_continuation_step_fraction: float = 0.2
+    nqs_continuation_fidelity_retention: float = 0.95
+    nqs_continuation_min_step: float | None = None
+    nqs_continuation_max_points: int = 256
     nqs_response_ndets: int = 16
     nqs_response_hidden_dims_single: tuple[int, ...] = field(
         default_factory=lambda: (256, 256, 256, 256)
@@ -125,40 +136,8 @@ class MolecularLITConfig:
     nqs_response_use_last_layer: bool = False
     nqs_response_envelope: EnvelopeType = EnvelopeType.abs_isotropic
     nqs_response_orbitals_spin_split: bool = True
+    nqs_selection_interval: int = 50
     nqs_log_interval: int = 50
-
-
-@dataclass(frozen=True)
-class _ParallelWorker:
-    index: int
-    block: np.ndarray
-    path: UPath
-    log_path: UPath
-    process: subprocess.Popen[bytes]
-    device: str
-
-
-@dataclass(frozen=True)
-class _ParallelSlot:
-    device: str
-    label: str
-    host: str = ""
-    port: int | None = None
-    root: str = ""
-    python: str = ""
-    ssh_options: tuple[str, ...] = ()
-
-    @property
-    def is_remote(self) -> bool:
-        return bool(self.host)
-
-
-@dataclass(frozen=True)
-class _ParallelSharedSource:
-    ground_energy: float
-    source_center: float
-    source_norm: float
-    source_pool_dir: UPath
 
 
 @dataclass
@@ -176,6 +155,29 @@ class _DirectPsiCarry(NamedTuple):
     use_direct: jax.Array
 
 
+class _SpringState(NamedTuple):
+    """Unscaled SPRING direction associated with the current frequency."""
+
+    previous_direction: jax.Array
+
+
+class _NQSUpdateCarry(NamedTuple):
+    direct: _DirectPsiCarry
+    spring: _SpringState
+
+
+class _ContinuationRecord(NamedTuple):
+    omega: float
+    optimized: bool
+    selected_iteration: int
+    stats: Any
+    inherited_fidelity: float
+    step: float
+    bisections: int
+    probe_accepted: bool
+    min_step_override: bool
+
+
 class MoleculeLITWorkflow(Workflow):
     """Compute a molecular dipole response spectrum with NQS-LIT."""
 
@@ -187,9 +189,6 @@ class MoleculeLITWorkflow(Workflow):
         self._validate_config()
 
     def run(self) -> None:
-        if self._should_run_parallel_scan():
-            self._run_parallel_scan()
-            return
         self._run_serial_scan()
 
     def _run_serial_scan(self) -> None:
@@ -226,8 +225,10 @@ class MoleculeLITWorkflow(Workflow):
         logger.info("Using NQS-LIT ground energy %.10f Ha", ground_energy)
 
         lit = np.zeros((len(axes), len(omega)), dtype=np.float64)
+        signed_lit = np.zeros_like(lit)
         broadened = np.zeros_like(lit)
         fidelity = np.zeros_like(lit)
+        reverse_kl = np.zeros_like(lit)
         residual_norm = np.zeros_like(lit)
         equation_relative_residual = np.zeros_like(lit)
         action_norm = np.zeros_like(lit)
@@ -236,14 +237,29 @@ class MoleculeLITWorkflow(Workflow):
         error_d = np.zeros_like(lit)
         reweight_ess = np.zeros_like(lit)
         reweight_ess_fraction = np.zeros_like(lit)
+        invalid_sample_fraction = np.zeros_like(lit)
         direct_hloc_rmse = np.full_like(lit, np.nan)
         direct_hloc_std = np.full_like(lit, np.nan)
         direct_hloc_sem = np.full_like(lit, np.nan)
         estimator_mode = np.zeros_like(lit, dtype=np.int64)
+        selected_iteration = np.zeros_like(lit, dtype=np.int64)
         normalization = np.zeros((len(axes), len(omega)), dtype=np.complex128)
         correction_overlap = np.zeros_like(normalization)
         source_centers = np.zeros(len(axes), dtype=np.float64)
         axis_source_norm = np.zeros(len(axes), dtype=np.float64)
+        warm_start_selected_iteration = np.zeros(len(axes), dtype=np.int64)
+        continuation_axis: list[int] = []
+        continuation_omega: list[float] = []
+        continuation_optimized: list[bool] = []
+        continuation_selected_iteration: list[int] = []
+        continuation_fidelity: list[float] = []
+        continuation_reverse_kl: list[float] = []
+        continuation_invalid_sample_fraction: list[float] = []
+        continuation_inherited_fidelity: list[float] = []
+        continuation_step: list[float] = []
+        continuation_bisections: list[int] = []
+        continuation_probe_accepted: list[bool] = []
+        continuation_min_step_override: list[bool] = []
 
         for axis_pos, axis in enumerate(axes):
             (
@@ -344,7 +360,7 @@ class MoleculeLITWorkflow(Workflow):
                 if self.lit_config.nqs_warm_start_omega is not None
                 else float(omega[0])
             )
-            rng = self._coordinate_parallel_direct_precompile(
+            rng = self._precompile_direct_estimator(
                 update_step,
                 response_params,
                 train_pool,
@@ -353,84 +369,111 @@ class MoleculeLITWorkflow(Workflow):
                 axis=axis,
                 omega=jnp.asarray(precompile_omega),
             )
-            axis_direct_carry = update_step.init_direct_carry(axis_batched_data, rng)
-            response_params, axis_direct_carry = self._warm_start_axis(
+            (
+                response_params,
+                warm_start_stats,
+                warm_start_selected_iteration[axis_pos],
+                rng,
+            ) = self._warm_start_axis(
                 update_step,
                 response_params,
                 train_pool,
-                axis_direct_carry,
+                eval_pool,
+                axis_batched_data,
+                rng,
+                response_apply=response_apply,
+                ground_logpsi=ground_logpsi,
+                ground_params=ground_params,
                 axis=axis,
+                source_center=source_center,
+                source_norm=axis_phi_norm,
+                ground_energy=ground_energy,
             )
-            axis_start_response_params = response_params
-            axis_start_batched_data = axis_direct_carry.batched_data
-            rng = axis_direct_carry.rng
+            response_params, _, bridge_records, rng = self._continue_nqs_to_spectrum(
+                update_step,
+                response_params,
+                warm_start_stats,
+                train_pool,
+                eval_pool,
+                axis_batched_data,
+                rng,
+                response_apply=response_apply,
+                ground_logpsi=ground_logpsi,
+                ground_params=ground_params,
+                axis=axis,
+                source_center=source_center,
+                source_norm=axis_phi_norm,
+                ground_energy=ground_energy,
+                target_omega=float(omega[0]),
+                spectrum_omega=omega,
+            )
+            for record in bridge_records:
+                host_bridge_stats = jax.device_get(record.stats)
+                continuation_axis.append(axis)
+                continuation_omega.append(record.omega)
+                continuation_optimized.append(record.optimized)
+                continuation_selected_iteration.append(record.selected_iteration)
+                continuation_fidelity.append(float(host_bridge_stats.fidelity))
+                continuation_reverse_kl.append(float(host_bridge_stats.reverse_kl))
+                continuation_invalid_sample_fraction.append(
+                    float(host_bridge_stats.invalid_sample_fraction)
+                )
+                continuation_inherited_fidelity.append(record.inherited_fidelity)
+                continuation_step.append(record.step)
+                continuation_bisections.append(record.bisections)
+                continuation_probe_accepted.append(record.probe_accepted)
+                continuation_min_step_override.append(record.min_step_override)
             logger.info(
-                "axis=%s omega_points independent_response_start=true",
+                "axis=%s frequency_continuation=serial bridge_points=%d "
+                "spectrum_points=%d",
                 _AXIS_NAMES[axis],
+                sum(record.optimized for record in bridge_records),
+                len(omega),
             )
             for omega_pos, omega_value in enumerate(omega):
-                point_response_params = axis_start_response_params
-                point_direct_carry = update_step.init_direct_carry(
-                    axis_start_batched_data,
+                (
+                    response_params,
+                    _,
+                    selected_iteration[axis_pos, omega_pos],
                     rng,
+                ) = self._optimize_nqs_frequency(
+                    update_step,
+                    response_params,
+                    train_pool,
+                    eval_pool,
+                    axis_batched_data,
+                    rng,
+                    response_apply=response_apply,
+                    ground_logpsi=ground_logpsi,
+                    ground_params=ground_params,
+                    axis=axis,
+                    source_center=source_center,
+                    source_norm=axis_phi_norm,
+                    ground_energy=ground_energy,
+                    omega=float(omega_value),
+                    iterations=self.lit_config.nqs_iterations,
+                    stage="spectrum",
                 )
-                stats = None
-                for iteration in range(self.lit_config.nqs_iterations):
-                    point_response_params, stats, point_direct_carry = update_step(
-                        point_response_params,
-                        train_pool,
-                        jnp.asarray(float(omega_value)),
-                        point_direct_carry,
-                        iteration,
-                    )
-                    if (
-                        self.lit_config.nqs_log_interval > 0
-                        and (iteration + 1) % self.lit_config.nqs_log_interval == 0
-                    ):
-                        logger.info(
-                            "axis=%s omega=%.6f iter=%d loss=%.6e "
-                            "fidelity=%.6f lit=%.6e ess=%.3f mode=%d",
-                            _AXIS_NAMES[axis],
-                            float(omega_value),
-                            iteration + 1,
-                            float(stats.loss),
-                            float(stats.fidelity),
-                            float(stats.lit),
-                            float(stats.reweight_ess_fraction),
-                            int(stats.estimator_mode),
-                        )
-                if stats is None:
-                    stats = self._nqs_stats_chunked(
-                        response_apply,
-                        point_response_params,
-                        ground_logpsi,
-                        ground_params,
-                        train_pool,
-                        axis=axis,
-                        source_center=source_center,
-                        source_norm=axis_phi_norm,
-                        ground_energy=ground_energy,
-                        omega=float(omega_value),
-                    )
                 stats, _, rng = self._nqs_eval_stats_with_fallback(
                     response_apply,
-                    point_response_params,
+                    response_params,
                     ground_logpsi,
                     ground_params,
                     eval_pool,
-                    point_direct_carry.batched_data,
-                    point_direct_carry.rng,
+                    axis_batched_data,
+                    rng,
                     axis=axis,
                     source_center=source_center,
                     source_norm=axis_phi_norm,
                     ground_energy=ground_energy,
                     omega=jnp.asarray(float(omega_value)),
-                    force_direct=bool(jax.device_get(point_direct_carry.use_direct)),
                 )
                 host_stats = jax.device_get(stats)
+                signed_lit[axis_pos, omega_pos] = float(host_stats.signed_lit)
                 lit[axis_pos, omega_pos] = float(host_stats.lit)
                 broadened[axis_pos, omega_pos] = float(host_stats.broadened)
                 fidelity[axis_pos, omega_pos] = float(host_stats.fidelity)
+                reverse_kl[axis_pos, omega_pos] = float(host_stats.reverse_kl)
                 residual_norm[axis_pos, omega_pos] = float(host_stats.residual_norm)
                 equation_relative_residual[axis_pos, omega_pos] = float(
                     host_stats.equation_relative_residual
@@ -448,6 +491,9 @@ class MoleculeLITWorkflow(Workflow):
                 reweight_ess[axis_pos, omega_pos] = float(host_stats.reweight_ess)
                 reweight_ess_fraction[axis_pos, omega_pos] = float(
                     host_stats.reweight_ess_fraction
+                )
+                invalid_sample_fraction[axis_pos, omega_pos] = float(
+                    host_stats.invalid_sample_fraction
                 )
                 direct_hloc_rmse[axis_pos, omega_pos] = float(
                     host_stats.direct_hloc_rmse
@@ -475,9 +521,11 @@ class MoleculeLITWorkflow(Workflow):
             axes=self.lit_config.axes,
             axis_indices=np.asarray(axes, dtype=np.int64),
             lit=lit,
+            signed_lit=signed_lit,
             broadened=broadened,
             total_broadened=total_broadened,
             fidelity=fidelity,
+            reverse_kl=reverse_kl,
             residual_norm=residual_norm,
             equation_relative_residual=equation_relative_residual,
             action_norm=action_norm,
@@ -486,10 +534,12 @@ class MoleculeLITWorkflow(Workflow):
             error_d=error_d,
             reweight_ess=reweight_ess,
             reweight_ess_fraction=reweight_ess_fraction,
+            invalid_sample_fraction=invalid_sample_fraction,
             direct_hloc_rmse=direct_hloc_rmse,
             direct_hloc_std=direct_hloc_std,
             direct_hloc_sem=direct_hloc_sem,
             estimator_mode=estimator_mode,
+            selected_iteration=selected_iteration,
             normalization=normalization,
             correction_overlap=correction_overlap,
             ground_energy=ground_energy,
@@ -500,6 +550,11 @@ class MoleculeLITWorkflow(Workflow):
             nqs_reweight_ess_fraction_min=(
                 self.lit_config.nqs_reweight_ess_fraction_min
             ),
+            nqs_reverse_kl_weight=self.lit_config.nqs_reverse_kl_weight,
+            nqs_spring_epsilon=self.lit_config.nqs_spring_epsilon,
+            nqs_spring_decay=self.lit_config.nqs_spring_decay,
+            nqs_spring_damping_floor=self.lit_config.nqs_spring_damping_floor,
+            nqs_selection_interval=self.lit_config.nqs_selection_interval,
             nqs_direct_psi_train=bool(self.lit_config.nqs_direct_psi_train),
             nqs_direct_psi_burn_in=self.lit_config.nqs_direct_psi_burn_in,
             nqs_direct_psi_batches=self.lit_config.nqs_direct_psi_batches,
@@ -512,6 +567,57 @@ class MoleculeLITWorkflow(Workflow):
             ),
             nqs_warm_start_omega=_optional_float(self.lit_config.nqs_warm_start_omega),
             nqs_warm_start_iterations=self.lit_config.nqs_warm_start_iterations,
+            warm_start_selected_iteration=warm_start_selected_iteration,
+            continuation_axis=np.asarray(continuation_axis, dtype=np.int64),
+            continuation_omega=np.asarray(continuation_omega, dtype=np.float64),
+            continuation_optimized=np.asarray(
+                continuation_optimized,
+                dtype=np.bool_,
+            ),
+            continuation_selected_iteration=np.asarray(
+                continuation_selected_iteration,
+                dtype=np.int64,
+            ),
+            continuation_fidelity=np.asarray(
+                continuation_fidelity,
+                dtype=np.float64,
+            ),
+            continuation_reverse_kl=np.asarray(
+                continuation_reverse_kl,
+                dtype=np.float64,
+            ),
+            continuation_invalid_sample_fraction=np.asarray(
+                continuation_invalid_sample_fraction,
+                dtype=np.float64,
+            ),
+            continuation_inherited_fidelity=np.asarray(
+                continuation_inherited_fidelity,
+                dtype=np.float64,
+            ),
+            continuation_step=np.asarray(continuation_step, dtype=np.float64),
+            continuation_bisections=np.asarray(
+                continuation_bisections,
+                dtype=np.int64,
+            ),
+            continuation_probe_accepted=np.asarray(
+                continuation_probe_accepted,
+                dtype=np.bool_,
+            ),
+            continuation_min_step_override=np.asarray(
+                continuation_min_step_override,
+                dtype=np.bool_,
+            ),
+            nqs_continuation_iterations=self.lit_config.nqs_continuation_iterations,
+            nqs_continuation_step_fraction=(
+                self.lit_config.nqs_continuation_step_fraction
+            ),
+            nqs_continuation_fidelity_retention=(
+                self.lit_config.nqs_continuation_fidelity_retention
+            ),
+            nqs_continuation_min_step=_optional_float(
+                self.lit_config.nqs_continuation_min_step
+            ),
+            nqs_continuation_max_points=self.lit_config.nqs_continuation_max_points,
             source_centers=source_centers,
             axis_source_norm=axis_source_norm,
             peak_energies=np.asarray([peak.energy for peak in peaks]),
@@ -524,52 +630,11 @@ class MoleculeLITWorkflow(Workflow):
         return _lit_omega_grid(self.lit_config)
 
     def _validate_config(self) -> None:
-        _lit_omega_grid(self.lit_config)
-        scan_parallel = self.lit_config.scan_parallel.lower()
-        allowed_scan_parallel = (
-            "auto",
-            "off",
-            "false",
-            "none",
-            "0",
-            "local_devices",
-            "distributed",
-            "remote",
-            "remote_devices",
-        )
-        if scan_parallel not in allowed_scan_parallel:
-            msg = (
-                "lit.scan_parallel must be one of 'auto', 'off', "
-                "'local_devices', or 'distributed', got "
-                f"{self.lit_config.scan_parallel!r}."
-            )
+        omega = _lit_omega_grid(self.lit_config)
+        if not np.isfinite(self.lit_config.eta) or self.lit_config.eta <= 0.0:
+            msg = "lit.eta must be finite and positive."
             raise ValueError(msg)
-        if scan_parallel in _REMOTE_PARALLEL_MODES:
-            if not self.lit_config.scan_parallel_remote_hosts:
-                msg = (
-                    "lit.scan_parallel=distributed requires at least one "
-                    "lit.scan_parallel_remote_hosts entry."
-                )
-                raise ValueError(msg)
-            _parse_parallel_remote_hosts(
-                self.lit_config.scan_parallel_remote_hosts,
-                remote_root=self.lit_config.scan_parallel_remote_root,
-                remote_python=self.lit_config.scan_parallel_remote_python,
-                ssh_options=tuple(self.lit_config.scan_parallel_ssh_options),
-                procs_per_device=int(self.lit_config.scan_parallel_procs_per_device),
-            )
-        if self.lit_config.scan_parallel_workers < 0:
-            msg = "lit.scan_parallel_workers must be nonnegative."
-            raise ValueError(msg)
-        if self.lit_config.scan_parallel_procs_per_device < 1:
-            msg = "lit.scan_parallel_procs_per_device must be positive."
-            raise ValueError(msg)
-        if self.lit_config.scan_parallel_min_points_per_worker < 1:
-            msg = "lit.scan_parallel_min_points_per_worker must be positive."
-            raise ValueError(msg)
-        if self.lit_config.scan_parallel_worker_index < 0:
-            msg = "lit.scan_parallel_worker_index must be nonnegative."
-            raise ValueError(msg)
+        self._validate_serial_scan_config(omega)
         self._validate_chunk_config()
         if not 0.0 <= self.lit_config.nqs_reweight_ess_fraction_min <= 1.0:
             msg = (
@@ -578,6 +643,128 @@ class MoleculeLITWorkflow(Workflow):
             )
             raise ValueError(msg)
         self._validate_direct_psi_config()
+        self._validate_nqs_stabilizer_config()
+        self._validate_nqs_iteration_config()
+        self._validate_continuation_config()
+
+    def _validate_serial_scan_config(self, omega: np.ndarray) -> None:
+        scan_parallel = str(self.lit_config.scan_parallel).lower()
+        serial_modes = ("off", "false", "none", "0", "serial")
+        if scan_parallel not in serial_modes:
+            msg = (
+                "Frequency-block parallel scans are incompatible with the "
+                "published serial continuation chain; set "
+                f"lit.scan_parallel=off, got {self.lit_config.scan_parallel!r}."
+            )
+            raise ValueError(msg)
+        legacy_parallel_requested = (
+            self.lit_config.scan_parallel_worker
+            or self.lit_config.scan_parallel_worker_index != 0
+            or self.lit_config.scan_parallel_workers != 0
+            or self.lit_config.scan_parallel_procs_per_device != 1
+            or self.lit_config.scan_parallel_min_points_per_worker != 2
+            or bool(self.lit_config.scan_parallel_remote_hosts)
+            or bool(self.lit_config.scan_parallel_remote_root)
+            or bool(self.lit_config.scan_parallel_remote_python)
+            or tuple(self.lit_config.scan_parallel_ssh_options)
+            != (
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=no",
+            )
+        )
+        if legacy_parallel_requested:
+            msg = (
+                "Legacy lit.scan_parallel_* worker settings cannot be used "
+                "with serial frequency continuation."
+            )
+            raise ValueError(msg)
+        warm_omega = self.lit_config.nqs_warm_start_omega
+        if warm_omega is not None:
+            if not np.isfinite(warm_omega):
+                msg = "lit.nqs_warm_start_omega must be finite or null."
+                raise ValueError(msg)
+            if warm_omega >= float(omega[0]):
+                msg = (
+                    "lit.nqs_warm_start_omega must be below the first spectrum "
+                    "frequency for increasing serial continuation."
+                )
+                raise ValueError(msg)
+
+    def _validate_nqs_stabilizer_config(self) -> None:
+        if (
+            not np.isfinite(self.lit_config.nqs_reverse_kl_weight)
+            or self.lit_config.nqs_reverse_kl_weight < 0.0
+        ):
+            msg = "lit.nqs_reverse_kl_weight must be nonnegative."
+            raise ValueError(msg)
+        if (
+            not np.isfinite(self.lit_config.nqs_spring_epsilon)
+            or self.lit_config.nqs_spring_epsilon <= 0.0
+        ):
+            msg = "lit.nqs_spring_epsilon must be positive."
+            raise ValueError(msg)
+        if not 0.0 <= self.lit_config.nqs_spring_decay < 1.0:
+            msg = "lit.nqs_spring_decay must satisfy 0 <= value < 1."
+            raise ValueError(msg)
+        if (
+            not np.isfinite(self.lit_config.nqs_spring_damping_floor)
+            or self.lit_config.nqs_spring_damping_floor <= 0.0
+        ):
+            msg = "lit.nqs_spring_damping_floor must be positive."
+            raise ValueError(msg)
+        if (
+            not np.isfinite(self.lit_config.nqs_learning_rate)
+            or self.lit_config.nqs_learning_rate <= 0.0
+        ):
+            msg = "lit.nqs_learning_rate must be finite and positive."
+            raise ValueError(msg)
+        max_norm = self.lit_config.nqs_sr_max_norm
+        if max_norm is not None and (
+            not np.isfinite(max_norm) or float(max_norm) <= 0.0
+        ):
+            msg = "lit.nqs_sr_max_norm must be positive or null."
+            raise ValueError(msg)
+        if self.lit_config.nqs_sr_damping is not None:
+            msg = (
+                "lit.nqs_sr_damping is an obsolete absolute damping; use "
+                "lit.nqs_spring_epsilon for scale-invariant SPRING damping."
+            )
+            raise ValueError(msg)
+
+    def _validate_nqs_iteration_config(self) -> None:
+        if self.lit_config.nqs_selection_interval < 1:
+            msg = "lit.nqs_selection_interval must be positive."
+            raise ValueError(msg)
+        if self.lit_config.nqs_warm_start_iterations < 0:
+            msg = "lit.nqs_warm_start_iterations must be nonnegative."
+            raise ValueError(msg)
+        if self.lit_config.nqs_iterations < 1:
+            msg = "lit.nqs_iterations must be positive."
+            raise ValueError(msg)
+
+    def _validate_continuation_config(self) -> None:
+        if self.lit_config.nqs_continuation_iterations < 1:
+            msg = "lit.nqs_continuation_iterations must be positive."
+            raise ValueError(msg)
+        step_fraction = self.lit_config.nqs_continuation_step_fraction
+        if not np.isfinite(step_fraction) or step_fraction <= 0.0:
+            msg = "lit.nqs_continuation_step_fraction must be positive."
+            raise ValueError(msg)
+        retention = self.lit_config.nqs_continuation_fidelity_retention
+        if not 0.0 < retention <= 1.0:
+            msg = "lit.nqs_continuation_fidelity_retention must satisfy 0 < value <= 1."
+            raise ValueError(msg)
+        min_step = self.lit_config.nqs_continuation_min_step
+        if min_step is not None and (
+            not np.isfinite(min_step) or float(min_step) <= 0.0
+        ):
+            msg = "lit.nqs_continuation_min_step must be positive or null."
+            raise ValueError(msg)
+        if self.lit_config.nqs_continuation_max_points < 1:
+            msg = "lit.nqs_continuation_max_points must be positive."
+            raise ValueError(msg)
 
     def _validate_direct_psi_config(self) -> None:
         if self.lit_config.nqs_direct_psi_burn_in < 0:
@@ -797,7 +984,7 @@ class MoleculeLITWorkflow(Workflow):
             "source_floor": float(self.lit_config.nqs_source_floor),
         }
 
-    def _coordinate_parallel_direct_precompile(
+    def _precompile_direct_estimator(
         self,
         update_step,
         response_params,
@@ -819,42 +1006,365 @@ class MoleculeLITWorkflow(Workflow):
             return rng
         return precompile(response_params, train_pool, fallback_data, rng, omega)
 
+    def _evaluate_nqs_checkpoint(
+        self,
+        response_apply,
+        response_params,
+        ground_logpsi,
+        ground_params,
+        eval_pool,
+        *,
+        axis: int,
+        source_center: float,
+        source_norm: float,
+        ground_energy: float,
+        omega: float,
+    ):
+        stats = self._nqs_stats_chunked(
+            response_apply,
+            response_params,
+            ground_logpsi,
+            ground_params,
+            eval_pool,
+            axis=axis,
+            source_center=source_center,
+            source_norm=source_norm,
+            ground_energy=ground_energy,
+            omega=jnp.asarray(float(omega)),
+        )
+        return stats._replace(
+            loss=_regularized_loss(
+                stats,
+                self.lit_config.nqs_reverse_kl_weight,
+            )
+        )
+
+    def _optimize_nqs_frequency(
+        self,
+        update_step,
+        initial_params,
+        train_pool,
+        eval_pool,
+        fallback_data,
+        rng,
+        *,
+        response_apply,
+        ground_logpsi,
+        ground_params,
+        axis: int,
+        source_center: float,
+        source_norm: float,
+        ground_energy: float,
+        omega: float,
+        iterations: int,
+        stage: str,
+    ):
+        """Optimize one frequency and select parameters on a fixed eval pool.
+
+        Returns:
+            Best parameters, their held-out statistics, selected iteration,
+            and the next random key.
+        """
+
+        def evaluate(params):
+            return self._evaluate_nqs_checkpoint(
+                response_apply,
+                params,
+                ground_logpsi,
+                ground_params,
+                eval_pool,
+                axis=axis,
+                source_center=source_center,
+                source_norm=source_norm,
+                ground_energy=ground_energy,
+                omega=float(omega),
+            )
+
+        response_params = initial_params
+        update_carry = update_step.init_carry(fallback_data, rng, response_params)
+        best_params = response_params
+        best_stats = evaluate(response_params)
+        best_iteration = 0
+        last_train_stats = None
+        for iteration in range(max(0, int(iterations))):
+            response_params, last_train_stats, update_carry = update_step(
+                response_params,
+                train_pool,
+                jnp.asarray(float(omega)),
+                update_carry,
+                iteration,
+            )
+            completed = iteration + 1
+            should_select = (
+                completed % self.lit_config.nqs_selection_interval == 0
+                or completed == int(iterations)
+            )
+            if should_select:
+                candidate_stats = evaluate(response_params)
+                if _is_better_nqs_checkpoint(candidate_stats, best_stats):
+                    best_params = response_params
+                    best_stats = candidate_stats
+                    best_iteration = completed
+            if (
+                self.lit_config.nqs_log_interval > 0
+                and completed % self.lit_config.nqs_log_interval == 0
+            ):
+                logger.info(
+                    "axis=%s stage=%s omega=%.6f iter=%d train_loss=%.6e "
+                    "train_fidelity=%.6f train_reverse_kl=%.6e "
+                    "best_iter=%d best_fidelity=%.6f best_reverse_kl=%.6e",
+                    _AXIS_NAMES[axis],
+                    stage,
+                    float(omega),
+                    completed,
+                    float(last_train_stats.loss),
+                    float(last_train_stats.fidelity),
+                    float(last_train_stats.reverse_kl),
+                    best_iteration,
+                    float(best_stats.fidelity),
+                    float(best_stats.reverse_kl),
+                )
+        rng = update_carry.direct.rng
+        logger.info(
+            "axis=%s stage=%s omega=%.6f selected_iter=%d/%d "
+            "heldout_loss=%.6e fidelity=%.6f reverse_kl=%.6e ess=%.3f",
+            _AXIS_NAMES[axis],
+            stage,
+            float(omega),
+            best_iteration,
+            max(0, int(iterations)),
+            float(best_stats.loss),
+            float(best_stats.fidelity),
+            float(best_stats.reverse_kl),
+            float(best_stats.reweight_ess_fraction),
+        )
+        return best_params, best_stats, best_iteration, rng
+
+    def _continue_nqs_to_spectrum(
+        self,
+        update_step,
+        response_params,
+        current_stats,
+        train_pool,
+        eval_pool,
+        fallback_data,
+        rng,
+        *,
+        response_apply,
+        ground_logpsi,
+        ground_params,
+        axis: int,
+        source_center: float,
+        source_norm: float,
+        ground_energy: float,
+        target_omega: float,
+        spectrum_omega: np.ndarray,
+    ):
+        """Adaptively bridge the warm start to the first reported frequency.
+
+        If ``psi_omega`` solves ``A(omega) psi = Phi``, reusing it at
+        ``omega + delta`` gives a relative residual of order
+        ``|delta| sqrt(L(omega) / ||Phi||^2)``.  We bound that quantity by the
+        configured step fraction and verify every proposed step on the fixed
+        held-out pool, bisecting when fidelity degrades too much.
+
+        Returns:
+            Parameters prepared for the target, the latest optimized held-out
+            statistics, continuation records (including the target probe), and
+            the next random key.
+
+        Raises:
+            RuntimeError: If a probe is invalid, an optimized bridge checkpoint
+                is invalid, or the configured bridge-point cap is exhausted.
+        """
+        start_omega = self.lit_config.nqs_warm_start_omega
+        if start_omega is None or float(start_omega) >= float(target_omega):
+            return response_params, current_stats, [], rng
+
+        common = dict(
+            response_apply=response_apply,
+            ground_logpsi=ground_logpsi,
+            ground_params=ground_params,
+            axis=axis,
+            source_center=source_center,
+            source_norm=source_norm,
+            ground_energy=ground_energy,
+        )
+        current_omega = float(start_omega)
+        if current_stats is None:
+            current_stats = self._evaluate_nqs_checkpoint(
+                response_params=response_params,
+                eval_pool=eval_pool,
+                omega=current_omega,
+                **common,
+            )
+        min_step = _continuation_min_step(self.lit_config, spectrum_omega)
+        records = []
+        tolerance = np.finfo(np.float64).eps * max(1.0, abs(target_omega)) * 8.0
+
+        while target_omega - current_omega > tolerance:
+            gap = float(target_omega - current_omega)
+            step = _physics_continuation_step(
+                current_stats,
+                gap=gap,
+                fraction=self.lit_config.nqs_continuation_step_fraction,
+                min_step=min_step,
+            )
+            candidate_omega = current_omega + step
+            bisections = 0
+            while True:
+                probe_stats = self._evaluate_nqs_checkpoint(
+                    response_params=response_params,
+                    eval_pool=eval_pool,
+                    omega=candidate_omega,
+                    **common,
+                )
+                probe_ok = _continuation_probe_is_acceptable(
+                    current_stats,
+                    probe_stats,
+                    retention=self.lit_config.nqs_continuation_fidelity_retention,
+                )
+                candidate_gap = candidate_omega - current_omega
+                if probe_ok or candidate_gap <= min_step * (1.0 + 1e-12):
+                    break
+                candidate_gap = max(min_step, 0.5 * candidate_gap)
+                candidate_omega = min(target_omega, current_omega + candidate_gap)
+                bisections += 1
+
+            if not _finite_valid_nqs_stats(probe_stats):
+                msg = (
+                    "Frequency continuation produced non-finite/invalid held-out "
+                    f"statistics at omega={candidate_omega:.8g}; refusing to "
+                    "propagate a corrupted checkpoint."
+                )
+                raise RuntimeError(msg)
+            actual_step = float(candidate_omega - current_omega)
+            min_step_override = not probe_ok and actual_step <= min_step * (1.0 + 1e-12)
+            if target_omega - candidate_omega <= tolerance:
+                records.append(
+                    _ContinuationRecord(
+                        omega=float(candidate_omega),
+                        optimized=False,
+                        selected_iteration=-1,
+                        stats=probe_stats,
+                        inherited_fidelity=float(probe_stats.fidelity),
+                        step=actual_step,
+                        bisections=bisections,
+                        probe_accepted=probe_ok,
+                        min_step_override=min_step_override,
+                    )
+                )
+                logger.info(
+                    "axis=%s continuation_probe target=%.6f inherited_fidelity=%.6f "
+                    "step=%.6e bisections=%d accepted=%s min_step_override=%s",
+                    _AXIS_NAMES[axis],
+                    target_omega,
+                    float(probe_stats.fidelity),
+                    actual_step,
+                    bisections,
+                    probe_ok,
+                    min_step_override,
+                )
+                break
+
+            optimized_count = sum(record.optimized for record in records)
+            if optimized_count >= self.lit_config.nqs_continuation_max_points:
+                msg = (
+                    "Adaptive frequency continuation exceeded "
+                    f"{self.lit_config.nqs_continuation_max_points} bridge points "
+                    f"before omega={target_omega:.8g}."
+                )
+                raise RuntimeError(msg)
+            inherited_fidelity = float(probe_stats.fidelity)
+            response_params, current_stats, selected_iteration, rng = (
+                self._optimize_nqs_frequency(
+                    update_step,
+                    response_params,
+                    train_pool,
+                    eval_pool,
+                    fallback_data,
+                    rng,
+                    omega=candidate_omega,
+                    iterations=self.lit_config.nqs_continuation_iterations,
+                    stage="continuation",
+                    **common,
+                )
+            )
+            if not _finite_valid_nqs_stats(current_stats):
+                msg = (
+                    "Frequency continuation failed to obtain a finite held-out "
+                    f"checkpoint at omega={candidate_omega:.8g}."
+                )
+                raise RuntimeError(msg)
+            records.append(
+                _ContinuationRecord(
+                    omega=float(candidate_omega),
+                    optimized=True,
+                    selected_iteration=selected_iteration,
+                    stats=current_stats,
+                    inherited_fidelity=inherited_fidelity,
+                    step=actual_step,
+                    bisections=bisections,
+                    probe_accepted=probe_ok,
+                    min_step_override=min_step_override,
+                )
+            )
+            logger.info(
+                "axis=%s continuation_step omega=%.6f inherited_fidelity=%.6f "
+                "selected_fidelity=%.6f step=%.6e bisections=%d accepted=%s "
+                "min_step_override=%s",
+                _AXIS_NAMES[axis],
+                candidate_omega,
+                inherited_fidelity,
+                float(current_stats.fidelity),
+                actual_step,
+                bisections,
+                probe_ok,
+                min_step_override,
+            )
+            current_omega = candidate_omega
+
+        return response_params, current_stats, records, rng
+
     def _warm_start_axis(
         self,
         update_step,
         response_params,
         train_pool,
-        direct_carry,
-        *,
-        axis: int,
+        eval_pool,
+        fallback_data,
+        rng,
+        **kwargs,
     ):
         if (
             self.lit_config.nqs_warm_start_omega is None
             or self.lit_config.nqs_warm_start_iterations <= 0
         ):
-            return response_params, direct_carry
-        stats = None
-        for iteration in range(self.lit_config.nqs_warm_start_iterations):
-            response_params, stats, direct_carry = update_step(
-                response_params,
-                train_pool,
-                jnp.asarray(float(self.lit_config.nqs_warm_start_omega)),
-                direct_carry,
-                iteration,
-            )
-        if stats is not None:
+            return response_params, None, 0, rng
+        result = self._optimize_nqs_frequency(
+            update_step,
+            response_params,
+            train_pool,
+            eval_pool,
+            fallback_data,
+            rng,
+            omega=float(self.lit_config.nqs_warm_start_omega),
+            iterations=self.lit_config.nqs_warm_start_iterations,
+            stage="warm_start",
+            **kwargs,
+        )
+        if result[1] is not None:
             logger.info(
                 "axis=%s warm_start omega=%.6f iterations=%d "
-                "fidelity=%.6f lit=%.6e ess=%.3f mode=%d",
-                _AXIS_NAMES[axis],
+                "selected_iter=%d fidelity=%.6f reverse_kl=%.6e",
+                _AXIS_NAMES[kwargs["axis"]],
                 float(self.lit_config.nqs_warm_start_omega),
                 self.lit_config.nqs_warm_start_iterations,
-                float(stats.fidelity),
-                float(stats.lit),
-                float(stats.reweight_ess_fraction),
-                int(stats.estimator_mode),
+                result[2],
+                float(result[1].fidelity),
+                float(result[1].reverse_kl),
             )
-        return response_params, direct_carry
+        return result
 
     def _resolve_nqs_ground_state(self, example, ground_rng):
         fallback_ground_params = self.wf.init_params(example, ground_rng)
@@ -992,13 +1502,14 @@ class MoleculeLITWorkflow(Workflow):
         source_norm: float,
     ):
         @jax.jit
-        def source_update(response_params, batched_data, omega):
-            stats, updates = self._source_sr_stats_and_updates(
+        def source_update(response_params, batched_data, spring_previous, omega):
+            stats, updates, spring_state, damping = self._source_sr_stats_and_updates(
                 response_apply,
                 response_params,
                 ground_logpsi,
                 ground_params,
                 batched_data,
+                spring_state=_SpringState(spring_previous),
                 axis=axis,
                 source_center=source_center,
                 source_norm=source_norm,
@@ -1006,8 +1517,16 @@ class MoleculeLITWorkflow(Workflow):
                 omega=omega,
             )
             response_params = _apply_updates(response_params, updates)
-            loss = _fidelity_loss(stats.fidelity, self.lit_config.nqs_sr_score_eps)
-            return response_params, stats._replace(loss=loss)
+            loss = _regularized_loss(
+                stats,
+                self.lit_config.nqs_reverse_kl_weight,
+            )
+            return (
+                response_params,
+                stats._replace(loss=loss),
+                spring_state.previous_direction,
+                damping,
+            )
 
         direct_train_collect_initial = self._make_direct_psi_pool_collector(
             response_apply,
@@ -1039,6 +1558,7 @@ class MoleculeLITWorkflow(Workflow):
             direct_rng,
             direct_initialized,
             direct_active,
+            spring_previous,
             omega,
         ):
             source_sums = nqs_lit_source_sampled_sums(
@@ -1060,30 +1580,37 @@ class MoleculeLITWorkflow(Workflow):
                 omega=omega,
                 eta=self.lit_config.eta,
             )
-            source_loss = _fidelity_loss(
-                source_stats.fidelity,
-                self.lit_config.nqs_sr_score_eps,
+            source_loss = _regularized_loss(
+                source_stats,
+                self.lit_config.nqs_reverse_kl_weight,
             )
             source_stats = source_stats._replace(loss=source_loss)
             threshold = jnp.asarray(
                 self.lit_config.nqs_reweight_ess_fraction_min,
                 dtype=source_stats.reweight_ess_fraction.dtype,
             )
-            use_direct = direct_active | (
-                source_stats.reweight_ess_fraction < threshold
+            use_direct = (
+                direct_active
+                | ~jnp.isfinite(source_stats.reweight_ess_fraction)
+                | ~jnp.isfinite(source_stats.loss)
+                | (source_stats.invalid_sample_fraction > 0.0)
+                | (source_stats.reweight_ess_fraction < threshold)
             )
 
             def source_branch(_):
-                source_updates = self._weighted_sr_updates(
-                    response_apply,
-                    response_params,
-                    ground_logpsi,
-                    ground_params,
-                    source_batched_data,
-                    axis=axis,
-                    source_center=source_center,
-                    ground_energy=ground_energy,
-                    omega=omega,
+                source_updates, next_spring_state, spring_damping = (
+                    self._weighted_sr_updates(
+                        response_apply,
+                        response_params,
+                        ground_logpsi,
+                        ground_params,
+                        source_batched_data,
+                        spring_state=_SpringState(spring_previous),
+                        axis=axis,
+                        source_center=source_center,
+                        ground_energy=ground_energy,
+                        omega=omega,
+                    )
                 )
                 source_response_params = _apply_updates(response_params, source_updates)
                 return (
@@ -1094,6 +1621,8 @@ class MoleculeLITWorkflow(Workflow):
                     direct_rng,
                     jnp.asarray(False),
                     jnp.asarray(False),
+                    next_spring_state.previous_direction,
+                    spring_damping,
                 )
 
             def direct_branch(_):
@@ -1123,7 +1652,7 @@ class MoleculeLITWorkflow(Workflow):
                         operand=None,
                     )
                 )
-                direct_stats, direct_updates = (
+                direct_stats, direct_updates, next_spring_state, spring_damping = (
                     self._direct_sr_stats_and_updates_from_source_sums(
                         response_apply,
                         response_params,
@@ -1131,6 +1660,7 @@ class MoleculeLITWorkflow(Workflow):
                         ground_params,
                         source_sums,
                         psi_pool,
+                        spring_state=_SpringState(spring_previous),
                         axis=axis,
                         source_center=source_center,
                         source_norm=source_norm,
@@ -1138,9 +1668,9 @@ class MoleculeLITWorkflow(Workflow):
                         omega=omega,
                     )
                 )
-                direct_loss = _fidelity_loss(
-                    direct_stats.fidelity,
-                    self.lit_config.nqs_sr_score_eps,
+                direct_loss = _regularized_loss(
+                    direct_stats,
+                    self.lit_config.nqs_reverse_kl_weight,
                 )
                 direct_response_params = _apply_updates(
                     response_params,
@@ -1154,6 +1684,8 @@ class MoleculeLITWorkflow(Workflow):
                     next_rng,
                     jnp.asarray(True),
                     jnp.asarray(True),
+                    next_spring_state.previous_direction,
+                    spring_damping,
                 )
 
             return jax.lax.cond(
@@ -1171,13 +1703,15 @@ class MoleculeLITWorkflow(Workflow):
             response_params,
             batched_data,
             omega,
-            direct_carry,
+            update_carry,
             batch_index: int = 0,
         ):
             if int(batch_index) == 0:
-                direct_carry = direct_carry._replace(
-                    initialized=jnp.asarray(False),
-                    use_direct=jnp.asarray(False),
+                update_carry = update_carry._replace(
+                    direct=update_carry.direct._replace(
+                        initialized=jnp.asarray(False),
+                        use_direct=jnp.asarray(False),
+                    )
                 )
             update_batch = _cyclic_batched_data_chunk(
                 batched_data,
@@ -1185,12 +1719,17 @@ class MoleculeLITWorkflow(Workflow):
                 batch_index,
             )
             if not direct_enabled:
-                response_params, stats = source_update(
+                response_params, stats, spring_previous, _ = source_update(
                     response_params,
                     update_batch,
+                    update_carry.spring.previous_direction,
                     omega,
                 )
-                return response_params, stats, direct_carry
+                return (
+                    response_params,
+                    stats,
+                    update_carry._replace(spring=_SpringState(spring_previous)),
+                )
             (
                 response_params,
                 stats,
@@ -1199,25 +1738,31 @@ class MoleculeLITWorkflow(Workflow):
                 direct_rng,
                 direct_initialized,
                 direct_active,
+                spring_previous,
+                _,
             ) = fallback_update(
                 response_params,
                 update_batch,
-                direct_carry.batched_data,
-                direct_carry.sampler_state,
-                direct_carry.rng,
-                direct_carry.initialized,
-                direct_carry.use_direct,
+                update_carry.direct.batched_data,
+                update_carry.direct.sampler_state,
+                update_carry.direct.rng,
+                update_carry.direct.initialized,
+                update_carry.direct.use_direct,
+                update_carry.spring.previous_direction,
                 omega,
             )
             return (
                 response_params,
                 stats,
-                _DirectPsiCarry(
-                    batched_data=direct_batched_data,
-                    sampler_state=direct_sampler_state,
-                    rng=direct_rng,
-                    initialized=direct_initialized,
-                    use_direct=direct_active,
+                _NQSUpdateCarry(
+                    direct=_DirectPsiCarry(
+                        batched_data=direct_batched_data,
+                        sampler_state=direct_sampler_state,
+                        rng=direct_rng,
+                        initialized=direct_initialized,
+                        use_direct=direct_active,
+                    ),
+                    spring=_SpringState(spring_previous),
                 ),
             )
 
@@ -1232,7 +1777,7 @@ class MoleculeLITWorkflow(Workflow):
                 fallback_update=fallback_update,
             )
 
-        update.init_direct_carry = self._init_direct_psi_carry  # type: ignore[attr-defined]
+        update.init_carry = self._init_nqs_update_carry  # type: ignore[attr-defined]
         update.precompile_direct = precompile_direct  # type: ignore[attr-defined]
         return update
 
@@ -1258,15 +1803,20 @@ class MoleculeLITWorkflow(Workflow):
             self._nqs_train_update_batch_size(),
             0,
         )
-        direct_carry = self._init_direct_psi_carry(fallback_data, rng)
+        update_carry = self._init_nqs_update_carry(
+            fallback_data,
+            rng,
+            response_params,
+        )
         fallback_update.lower(
             response_params,
             update_batch,
-            direct_carry.batched_data,
-            direct_carry.sampler_state,
-            direct_carry.rng,
-            direct_carry.initialized,
-            direct_carry.use_direct,
+            update_carry.direct.batched_data,
+            update_carry.direct.sampler_state,
+            update_carry.direct.rng,
+            update_carry.direct.initialized,
+            update_carry.direct.use_direct,
+            update_carry.spring.previous_direction,
             omega,
         ).compile()
         logger.info(
@@ -1274,47 +1824,6 @@ class MoleculeLITWorkflow(Workflow):
             _AXIS_NAMES[axis],
         )
         return rng
-
-    def _source_sr_stats_updates_and_sums(
-        self,
-        response_apply,
-        response_params,
-        ground_logpsi,
-        ground_params,
-        batched_data,
-        *,
-        axis: int,
-        source_center: float,
-        source_norm: float,
-        ground_energy: float,
-        omega,
-    ):
-        score, ratio, source_weight, source_sums = (
-            self._source_sampled_action_scores_and_sums(
-                response_apply,
-                response_params,
-                ground_logpsi,
-                ground_params,
-                batched_data,
-                axis=axis,
-                source_center=source_center,
-                ground_energy=ground_energy,
-                omega=omega,
-            )
-        )
-        stats = nqs_lit_stats_from_source_sums(
-            source_sums,
-            source_norm=source_norm,
-            omega=omega,
-            eta=self.lit_config.eta,
-        )
-        updates = self._weighted_sr_updates_from_scores(
-            response_params,
-            score,
-            ratio,
-            source_weight,
-        )
-        return stats, updates, source_sums
 
     def _source_sr_stats_and_updates(
         self,
@@ -1324,6 +1833,7 @@ class MoleculeLITWorkflow(Workflow):
         ground_params,
         batched_data,
         *,
+        spring_state: _SpringState,
         axis: int,
         source_center: float,
         source_norm: float,
@@ -1349,13 +1859,14 @@ class MoleculeLITWorkflow(Workflow):
             omega=omega,
             eta=self.lit_config.eta,
         )
-        updates = self._weighted_sr_updates_from_scores(
+        updates, spring_state, damping = self._weighted_sr_updates_from_scores(
             response_params,
             score,
             ratio,
             source_weight,
+            spring_state,
         )
-        return stats, updates
+        return stats, updates, spring_state, damping
 
     def _weighted_sr_updates_from_scores(
         self,
@@ -1363,40 +1874,50 @@ class MoleculeLITWorkflow(Workflow):
         score,
         ratio,
         source_weight,
+        spring_state: _SpringState,
     ):
-        eps = jnp.asarray(self.lit_config.nqs_sr_score_eps, dtype=ratio.real.dtype)
-        phi_weight = source_weight / jnp.maximum(jnp.sum(source_weight), eps)
-        amplitude = jnp.sum(phi_weight * ratio)
-        ratio_norm = jnp.sum(phi_weight * jnp.abs(ratio) ** 2)
-        psi_weight = phi_weight * jnp.abs(ratio) ** 2 / jnp.maximum(ratio_norm, eps)
-        score_mean_psi = jnp.sum(psi_weight[:, None] * score, axis=0, keepdims=True)
-        centered_score = score - score_mean_psi
-        score_covariance = jnp.sum(
-            phi_weight[:, None] * ratio[:, None] * centered_score,
-            axis=0,
-        )
-        grad_flat = 2.0 * jnp.real(
-            jnp.conj(amplitude) * score_covariance / jnp.maximum(ratio_norm, eps)
+        (
+            grad_flat,
+            _,
+            _,
+            psi_weight,
+            centered_score,
+            _,
+            _,
+        ) = _regularized_action_gradient(
+            score,
+            ratio,
+            source_weight,
+            reverse_kl_weight=self.lit_config.nqs_reverse_kl_weight,
+            eps=self.lit_config.nqs_sr_score_eps,
         )
         weighted_score = jnp.sqrt(psi_weight)[:, None] * centered_score
         score_aug = jnp.concatenate([weighted_score.real, weighted_score.imag], axis=0)
-
-        _, unravel_fn = ravel_pytree(response_params)
-        damping = jnp.asarray(self.lit_config.nqs_sr_damping, dtype=grad_flat.dtype)
-        damping = jnp.maximum(damping, jnp.asarray(1e-12, dtype=grad_flat.dtype))
-        preconditioned = self._solve_sr_direction(score_aug, grad_flat, damping)
-        scale = jnp.asarray(self.lit_config.nqs_learning_rate, dtype=grad_flat.dtype)
-        if self.lit_config.nqs_sr_max_norm is not None:
-            update_norm = jnp.linalg.norm(preconditioned)
-            max_norm = jnp.asarray(
-                self.lit_config.nqs_sr_max_norm,
-                dtype=grad_flat.dtype,
-            )
-            scale = jnp.minimum(
-                scale,
-                max_norm / (update_norm + jnp.asarray(1e-12, dtype=grad_flat.dtype)),
-            )
-        return unravel_fn(scale * preconditioned)
+        centering_null = jnp.sqrt(psi_weight)
+        zero_null = jnp.zeros_like(centering_null)
+        kernel_null_vectors = jnp.stack(
+            [
+                jnp.concatenate([centering_null, zero_null]),
+                jnp.concatenate([zero_null, centering_null]),
+            ]
+        )
+        direction, spring_state, damping = _spring_direction_chunked(
+            (score_aug.shape[0],),
+            lambda _: score_aug,
+            grad_flat,
+            spring_state,
+            epsilon_scale=self.lit_config.nqs_spring_epsilon,
+            damping_floor=self.lit_config.nqs_spring_damping_floor,
+            decay=self.lit_config.nqs_spring_decay,
+            kernel_null_vectors=kernel_null_vectors,
+        )
+        updates = _scaled_direction_updates(
+            response_params,
+            direction,
+            learning_rate=self.lit_config.nqs_learning_rate,
+            max_norm=self.lit_config.nqs_sr_max_norm,
+        )
+        return updates, spring_state, damping
 
     def _weighted_sr_updates(
         self,
@@ -1406,6 +1927,7 @@ class MoleculeLITWorkflow(Workflow):
         ground_params,
         batched_data,
         *,
+        spring_state: _SpringState,
         axis: int,
         source_center: float,
         ground_energy: float,
@@ -1427,127 +1949,7 @@ class MoleculeLITWorkflow(Workflow):
             score,
             ratio,
             source_weight,
-        )
-
-    def _direct_sr_updates(
-        self,
-        response_apply,
-        response_params,
-        ground_logpsi,
-        ground_params,
-        source_batched_data,
-        psi_batched_data,
-        *,
-        axis: int,
-        source_center: float,
-        ground_energy: float,
-        omega,
-    ):
-        source_ratio, source_weight = self._source_sampled_action_ratios(
-            response_apply,
-            response_params,
-            ground_logpsi,
-            ground_params,
-            source_batched_data,
-            axis=axis,
-            source_center=source_center,
-            ground_energy=ground_energy,
-            omega=omega,
-        )
-        eps = jnp.asarray(
-            self.lit_config.nqs_sr_score_eps,
-            dtype=source_ratio.real.dtype,
-        )
-        phi_weight = source_weight / jnp.maximum(jnp.sum(source_weight), eps)
-        amplitude = jnp.sum(phi_weight * source_ratio)
-
-        score, ratio, _ = self._source_sampled_action_scores(
-            response_apply,
-            response_params,
-            ground_logpsi,
-            ground_params,
-            psi_batched_data,
-            axis=axis,
-            source_center=source_center,
-            ground_energy=ground_energy,
-            omega=omega,
-        )
-        safe_ratio = jnp.where(
-            jnp.abs(ratio) > eps,
-            ratio,
-            jnp.asarray(eps, dtype=ratio.real.dtype) + 0j,
-        )
-        hloc_conj = jnp.conj(amplitude / safe_ratio)
-        finite = jnp.isfinite(jnp.real(hloc_conj)) & jnp.isfinite(jnp.imag(hloc_conj))
-        hloc_conj = jnp.where(finite, hloc_conj, jnp.asarray(0.0, dtype=ratio.dtype))
-        score = jnp.where(finite[:, None], score, jnp.asarray(0.0, dtype=score.dtype))
-        sample_count = jnp.maximum(score.shape[0], 1)
-        score_mean = jnp.mean(score, axis=0, keepdims=True)
-        centered_score = score - score_mean
-        grad_flat = 2.0 * jnp.real(
-            jnp.mean(centered_score * hloc_conj[:, None], axis=0)
-        )
-        score_scale = jnp.sqrt(jnp.asarray(sample_count, dtype=grad_flat.dtype))
-        weighted_score = centered_score / score_scale
-        score_aug = jnp.concatenate([weighted_score.real, weighted_score.imag], axis=0)
-
-        _, unravel_fn = ravel_pytree(response_params)
-        damping = jnp.asarray(self.lit_config.nqs_sr_damping, dtype=grad_flat.dtype)
-        damping = jnp.maximum(damping, jnp.asarray(1e-12, dtype=grad_flat.dtype))
-        preconditioned = self._solve_sr_direction(score_aug, grad_flat, damping)
-        scale = jnp.asarray(self.lit_config.nqs_learning_rate, dtype=grad_flat.dtype)
-        if self.lit_config.nqs_sr_max_norm is not None:
-            update_norm = jnp.linalg.norm(preconditioned)
-            max_norm = jnp.asarray(
-                self.lit_config.nqs_sr_max_norm,
-                dtype=grad_flat.dtype,
-            )
-            scale = jnp.minimum(
-                scale,
-                max_norm / (update_norm + jnp.asarray(1e-12, dtype=grad_flat.dtype)),
-            )
-        return unravel_fn(scale * preconditioned)
-
-    def _direct_sr_stats_and_updates(
-        self,
-        response_apply,
-        response_params,
-        ground_logpsi,
-        ground_params,
-        source_batched_data,
-        psi_batched_data,
-        *,
-        axis: int,
-        source_center: float,
-        source_norm: float,
-        ground_energy: float,
-        omega,
-    ):
-        source_sums = nqs_lit_source_sampled_sums(
-            response_apply,
-            response_params,
-            ground_logpsi,
-            ground_params,
-            source_batched_data,
-            axis=axis,
-            source_center=source_center,
-            ground_energy=ground_energy,
-            omega=omega,
-            eta=self.lit_config.eta,
-            source_floor=self.lit_config.nqs_source_floor,
-        )
-        return self._direct_sr_stats_and_updates_from_source_sums(
-            response_apply,
-            response_params,
-            ground_logpsi,
-            ground_params,
-            source_sums,
-            psi_batched_data,
-            axis=axis,
-            source_center=source_center,
-            source_norm=source_norm,
-            ground_energy=ground_energy,
-            omega=omega,
+            spring_state,
         )
 
     def _direct_sr_stats_and_updates_from_source_sums(
@@ -1559,6 +1961,7 @@ class MoleculeLITWorkflow(Workflow):
         source_sums,
         psi_batched_data,
         *,
+        spring_state: _SpringState,
         axis: int,
         source_center: float,
         source_norm: float,
@@ -1579,7 +1982,7 @@ class MoleculeLITWorkflow(Workflow):
             msg = "Cannot compute direct SR update with an empty psi pool."
             raise ValueError(msg)
 
-        def score_and_hloc(chunk):
+        def score_hloc_and_log_ratio(chunk):
             score, ratio, _ = self._source_sampled_action_scores(
                 response_apply,
                 response_params,
@@ -1601,14 +2004,32 @@ class MoleculeLITWorkflow(Workflow):
                 jnp.asarray(eps, dtype=ratio.real.dtype) + 0j,
             )
             hloc = normalization / safe_ratio
-            finite = jnp.isfinite(jnp.real(hloc)) & jnp.isfinite(jnp.imag(hloc))
-            hloc = jnp.where(finite, hloc, jnp.asarray(0.0, dtype=hloc.dtype))
+            finite_ratio = jnp.isfinite(jnp.real(ratio)) & jnp.isfinite(jnp.imag(ratio))
+            finite_score = jnp.all(
+                jnp.isfinite(jnp.real(score)) & jnp.isfinite(jnp.imag(score)),
+                axis=1,
+            )
+            valid = (
+                (jnp.abs(ratio) > eps)
+                & finite_ratio
+                & jnp.isfinite(jnp.real(hloc))
+                & jnp.isfinite(jnp.imag(hloc))
+                & finite_score
+            )
+            hloc = jnp.where(valid, hloc, jnp.asarray(0.0, dtype=hloc.dtype))
             score = jnp.where(
-                finite[:, None],
+                valid[:, None],
                 score,
                 jnp.asarray(0.0, dtype=score.dtype),
             )
-            return score, hloc
+            log_ratio_abs2 = 2.0 * jnp.log(
+                jnp.maximum(
+                    jnp.where(finite_ratio, jnp.abs(ratio), 0.0),
+                    eps,
+                )
+            )
+            log_ratio_abs2 = jnp.where(valid, log_ratio_abs2, 0.0)
+            return score, hloc, log_ratio_abs2, valid
 
         score_sum = None
         score_hloc_conj_sum = None
@@ -1616,8 +2037,12 @@ class MoleculeLITWorkflow(Workflow):
         hloc_conj_sum = None
         hloc_abs2_sum = None
         hloc_error_abs2_sum = None
+        score_log_ratio_sum = None
+        log_ratio_sum = None
+        score_abs2_sum = None
+        valid_count = None
         for chunk in chunks:
-            score, hloc = score_and_hloc(chunk)
+            score, hloc, log_ratio_abs2, valid = score_hloc_and_log_ratio(chunk)
             local_score_sum = jnp.sum(score, axis=0)
             local_score_hloc_conj_sum = jnp.sum(
                 score * jnp.conj(hloc)[:, None],
@@ -1626,7 +2051,16 @@ class MoleculeLITWorkflow(Workflow):
             local_hloc_sum = jnp.sum(hloc)
             local_hloc_conj_sum = jnp.sum(jnp.conj(hloc))
             local_hloc_abs2_sum = jnp.sum(jnp.abs(hloc) ** 2)
-            local_hloc_error_abs2_sum = jnp.sum(jnp.abs(hloc - 1.0) ** 2)
+            local_hloc_error_abs2_sum = jnp.sum(
+                jnp.where(valid, jnp.abs(hloc - 1.0) ** 2, 0.0)
+            )
+            local_score_log_ratio_sum = jnp.sum(
+                score * log_ratio_abs2[:, None],
+                axis=0,
+            )
+            local_log_ratio_sum = jnp.sum(log_ratio_abs2)
+            local_score_abs2_sum = jnp.sum(jnp.abs(score) ** 2)
+            local_valid_count = jnp.sum(valid)
             score_sum = (
                 local_score_sum if score_sum is None else score_sum + local_score_sum
             )
@@ -1651,6 +2085,26 @@ class MoleculeLITWorkflow(Workflow):
                 if hloc_error_abs2_sum is None
                 else hloc_error_abs2_sum + local_hloc_error_abs2_sum
             )
+            score_log_ratio_sum = (
+                local_score_log_ratio_sum
+                if score_log_ratio_sum is None
+                else score_log_ratio_sum + local_score_log_ratio_sum
+            )
+            log_ratio_sum = (
+                local_log_ratio_sum
+                if log_ratio_sum is None
+                else log_ratio_sum + local_log_ratio_sum
+            )
+            score_abs2_sum = (
+                local_score_abs2_sum
+                if score_abs2_sum is None
+                else score_abs2_sum + local_score_abs2_sum
+            )
+            valid_count = (
+                local_valid_count
+                if valid_count is None
+                else valid_count + local_valid_count
+            )
         if (
             score_sum is None
             or score_hloc_conj_sum is None
@@ -1658,6 +2112,10 @@ class MoleculeLITWorkflow(Workflow):
             or hloc_conj_sum is None
             or hloc_abs2_sum is None
             or hloc_error_abs2_sum is None
+            or score_log_ratio_sum is None
+            or log_ratio_sum is None
+            or score_abs2_sum is None
+            or valid_count is None
         ):
             msg = "Cannot compute direct SR update with an empty psi pool."
             raise ValueError(msg)
@@ -1665,7 +2123,7 @@ class MoleculeLITWorkflow(Workflow):
         sample_count_int = sum(chunk.batch_size for chunk in chunks)
         sample_count = jnp.asarray(sample_count_int, dtype=score_sum.real.dtype)
         safe_sample_count = jnp.maximum(
-            sample_count,
+            valid_count,
             jnp.asarray(1, dtype=sample_count.dtype),
         )
         score_mean = score_sum / safe_sample_count
@@ -1687,56 +2145,94 @@ class MoleculeLITWorkflow(Workflow):
         )
 
         score_hloc_conj_mean = score_hloc_conj_sum / safe_sample_count
-        grad_flat = 2.0 * jnp.real(score_hloc_conj_mean - score_mean * hloc_conj_mean)
-        score_scale = jnp.sqrt(sample_count)
+        fidelity_gradient = 2.0 * jnp.real(
+            score_hloc_conj_mean - score_mean * hloc_conj_mean
+        )
+        log_ratio_mean = log_ratio_sum / safe_sample_count
+        reverse_kl_gradient = 2.0 * jnp.real(
+            score_log_ratio_sum / safe_sample_count - score_mean * log_ratio_mean
+        )
+        grad_flat = (
+            fidelity_gradient
+            - jnp.asarray(
+                self.lit_config.nqs_reverse_kl_weight,
+                dtype=fidelity_gradient.dtype,
+            )
+            * reverse_kl_gradient
+        )
+        score_scale = jnp.sqrt(safe_sample_count)
 
         def score_aug_chunk(index: int):
-            score, _ = score_and_hloc(chunks[index])
-            centered_score = score - score_mean
+            score, _, _, valid = score_hloc_and_log_ratio(chunks[index])
+            centered_score = jnp.where(
+                valid[:, None],
+                score - score_mean,
+                jnp.asarray(0.0, dtype=score.dtype),
+            )
             weighted_score = centered_score / score_scale
             return jnp.concatenate(
                 [weighted_score.real, weighted_score.imag],
                 axis=0,
             )
 
-        _, unravel_fn = ravel_pytree(response_params)
-        damping = jnp.asarray(self.lit_config.nqs_sr_damping, dtype=grad_flat.dtype)
-        damping = jnp.maximum(damping, jnp.asarray(1e-12, dtype=grad_flat.dtype))
-        preconditioned = _solve_sr_direction_chunked(
+        qfi_trace = jnp.maximum(
+            score_abs2_sum / safe_sample_count - jnp.sum(jnp.abs(score_mean) ** 2),
+            jnp.asarray(0.0, dtype=grad_flat.dtype),
+        )
+        real_null_blocks = []
+        imag_null_blocks = []
+        for chunk in chunks:
+            _, _, _, valid = score_hloc_and_log_ratio(chunk)
+            valid_float = valid.astype(grad_flat.dtype)
+            zero_block = jnp.zeros_like(valid_float)
+            real_null_blocks.append(jnp.concatenate([valid_float, zero_block]))
+            imag_null_blocks.append(jnp.concatenate([zero_block, valid_float]))
+        kernel_null_vectors = jnp.stack(
+            [jnp.concatenate(real_null_blocks), jnp.concatenate(imag_null_blocks)]
+        )
+        direction, spring_state, damping = _spring_direction_chunked(
             tuple(2 * chunk.batch_size for chunk in chunks),
             score_aug_chunk,
             grad_flat,
-            damping,
+            spring_state,
+            epsilon_scale=self.lit_config.nqs_spring_epsilon,
+            damping_floor=self.lit_config.nqs_spring_damping_floor,
+            decay=self.lit_config.nqs_spring_decay,
+            qfi_trace=qfi_trace,
+            kernel_null_vectors=kernel_null_vectors,
         )
-        scale = jnp.asarray(self.lit_config.nqs_learning_rate, dtype=grad_flat.dtype)
-        if self.lit_config.nqs_sr_max_norm is not None:
-            update_norm = jnp.linalg.norm(preconditioned)
-            max_norm = jnp.asarray(
-                self.lit_config.nqs_sr_max_norm,
-                dtype=grad_flat.dtype,
-            )
-            scale = jnp.minimum(
-                scale,
-                max_norm / (update_norm + jnp.asarray(1e-12, dtype=grad_flat.dtype)),
-            )
+        updates = _scaled_direction_updates(
+            response_params,
+            direction,
+            learning_rate=self.lit_config.nqs_learning_rate,
+            max_norm=self.lit_config.nqs_sr_max_norm,
+        )
+        reverse_kl = jnp.where(
+            valid_count > 0,
+            jnp.maximum(
+                log_ratio_mean - source_stats.log_ratio_norm,
+                jnp.asarray(0.0, dtype=fidelity.dtype),
+            ),
+            jnp.asarray(0.0, dtype=fidelity.dtype),
+        )
+        equation_relative_residual = jnp.sqrt(
+            jnp.maximum(1.0 / jnp.maximum(fidelity, eps) - 1.0, 0.0)
+        )
         stats = source_stats._replace(
-            loss=1.0 - fidelity,
+            loss=1.0 - fidelity + self.lit_config.nqs_reverse_kl_weight * reverse_kl,
             fidelity=fidelity,
+            reverse_kl=reverse_kl,
+            residual_norm=jnp.asarray(source_norm, dtype=fidelity.dtype)
+            * equation_relative_residual**2,
+            equation_relative_residual=equation_relative_residual,
             action_norm=jnp.real(action_norm),
+            invalid_sample_fraction=1.0 - valid_count / jnp.maximum(sample_count, 1.0),
             estimator_mode=jnp.asarray(1, dtype=jnp.int32),
             direct_hloc_rmse=jnp.real(direct_hloc_rmse),
             direct_hloc_std=jnp.real(direct_hloc_std),
             direct_hloc_sem=jnp.real(direct_hloc_sem),
         )
-        return stats, unravel_fn(scale * preconditioned)
-
-    def _solve_sr_direction(self, score_aug, grad_flat, damping):
-        return _solve_sr_direction_chunked(
-            (score_aug.shape[0],),
-            lambda _: score_aug,
-            grad_flat,
-            damping,
-        )
+        return stats, updates, spring_state, damping
 
     def _source_sampled_action_scores_and_sums(
         self,
@@ -1802,7 +2298,7 @@ class MoleculeLITWorkflow(Workflow):
         stats_source_weight = (
             jnp.abs(source) / jnp.maximum(stats_sampled_source, stats_eps)
         ) ** 2
-        finite_sums = (
+        base_finite_sums = (
             jnp.isfinite(jnp.real(action))
             & jnp.isfinite(jnp.imag(action))
             & jnp.isfinite(jnp.real(response_ratio))
@@ -1810,6 +2306,16 @@ class MoleculeLITWorkflow(Workflow):
             & jnp.isfinite(source)
             & jnp.isfinite(stats_source_weight)
         )
+        safe_source_stats = jnp.where(
+            jnp.abs(source) > stats_eps,
+            source,
+            stats_eps * jnp.where(source < 0, -1.0, 1.0),
+        )
+        raw_stats_ratio = action / safe_source_stats
+        finite_stats_ratio = jnp.isfinite(jnp.real(raw_stats_ratio)) & jnp.isfinite(
+            jnp.imag(raw_stats_ratio)
+        )
+        finite_sums = base_finite_sums & finite_stats_ratio
         stats_action = jnp.where(
             finite_sums,
             action,
@@ -1825,13 +2331,28 @@ class MoleculeLITWorkflow(Workflow):
             stats_source_weight,
             jnp.asarray(0.0, dtype=stats_source_weight.dtype),
         )
-        safe_source_stats = jnp.where(
-            jnp.abs(source) > stats_eps,
-            source,
-            stats_eps * jnp.where(source < 0, -1.0, 1.0),
+        stats_ratio = jnp.where(
+            finite_sums,
+            raw_stats_ratio,
+            jnp.asarray(0.0, dtype=raw_stats_ratio.dtype),
         )
-        stats_ratio = stats_action / safe_source_stats
-        psi_weight_unnormalized = stats_source_weight * jnp.abs(stats_ratio) ** 2
+        stats_ratio_abs = jnp.where(
+            stats_source_weight > 0.0,
+            jnp.abs(stats_ratio),
+            0.0,
+        )
+        max_stats_ratio_abs = jnp.max(stats_ratio_abs)
+        stats_ratio_scale = jnp.where(
+            max_stats_ratio_abs > 0.0,
+            max_stats_ratio_abs,
+            jnp.asarray(1.0, dtype=stats_ratio_abs.dtype),
+        )
+        scaled_stats_ratio = stats_ratio / jax.lax.stop_gradient(stats_ratio_scale)
+        scaled_stats_ratio_abs2 = jnp.abs(scaled_stats_ratio) ** 2
+        psi_weight_unnormalized = stats_source_weight * scaled_stats_ratio_abs2
+        log_ratio_abs2 = 2.0 * jnp.log(
+            jnp.maximum(jnp.abs(scaled_stats_ratio), stats_eps)
+        )
         shift = jnp.asarray(omega, dtype=stats_response_ratio.real.dtype) + 1j * (
             jnp.asarray(self.lit_config.eta, dtype=stats_response_ratio.real.dtype)
         )
@@ -1848,13 +2369,13 @@ class MoleculeLITWorkflow(Workflow):
         source_sums = NQSLITSourceSums(
             sample_count=sample_count,
             weight_sum=jnp.sum(stats_source_weight),
-            valid_sample_count=jnp.sum(
-                stats_source_weight > jnp.asarray(0.0, dtype=stats_source_weight.dtype)
-            ),
-            ratio_sum=jnp.sum(stats_source_weight * stats_ratio),
-            ratio_abs2_sum=jnp.sum(stats_source_weight * jnp.abs(stats_ratio) ** 2),
+            valid_sample_count=jnp.sum(finite_sums),
+            ratio_scale=stats_ratio_scale,
+            ratio_sum=jnp.sum(stats_source_weight * scaled_stats_ratio),
+            ratio_abs2_sum=jnp.sum(stats_source_weight * scaled_stats_ratio_abs2),
             psi_weight_sum=jnp.sum(psi_weight_unnormalized),
             psi_weight_sq_sum=jnp.sum(psi_weight_unnormalized**2),
+            psi_log_ratio_abs2_sum=jnp.sum(psi_weight_unnormalized * log_ratio_abs2),
             response_conj_over_source_sum=jnp.sum(
                 stats_source_weight * jnp.conj(stats_response_ratio) / safe_source_stats
             ),
@@ -1984,123 +2505,6 @@ class MoleculeLITWorkflow(Workflow):
         )
         return score, ratio, source_weight
 
-    def _source_sampled_action_ratios(
-        self,
-        response_apply,
-        response_params,
-        ground_logpsi,
-        ground_params,
-        batched_data,
-        *,
-        axis: int,
-        source_center: float,
-        ground_energy: float,
-        omega,
-    ):
-        data = batched_data.data
-        eps = float(self.lit_config.nqs_sr_score_eps)
-        action = jax.vmap(
-            lambda one: local_action_ratio(
-                response_apply,
-                response_params,
-                ground_logpsi,
-                ground_params,
-                one,
-                ground_energy=ground_energy,
-                omega=omega,
-                eta=self.lit_config.eta,
-            )[0],
-            in_axes=(batched_data.vmap_axis,),
-        )(data)
-        dipole = jax.vmap(
-            lambda one: molecular_electronic_dipole(one, axis),
-            in_axes=(batched_data.vmap_axis,),
-        )(data)
-        source = dipole - jnp.asarray(source_center, dtype=dipole.dtype)
-        safe_source = jnp.where(
-            jnp.abs(source) > eps,
-            source,
-            jnp.asarray(eps, dtype=source.dtype) * jnp.where(source < 0, -1.0, 1.0),
-        )
-        sampled_source = jnp.maximum(
-            jnp.abs(source),
-            jnp.asarray(self.lit_config.nqs_source_floor, dtype=dipole.dtype),
-        )
-        source_weight = (jnp.abs(source) / jnp.maximum(sampled_source, eps)) ** 2
-        ratio = action / safe_source
-        finite = (
-            jnp.isfinite(jnp.real(ratio))
-            & jnp.isfinite(jnp.imag(ratio))
-            & jnp.isfinite(source_weight)
-        )
-        ratio = jnp.where(finite, ratio, jnp.asarray(0.0, dtype=ratio.dtype))
-        source_weight = jnp.where(
-            finite,
-            source_weight,
-            jnp.asarray(0.0, dtype=source_weight.dtype),
-        )
-        return ratio, source_weight
-
-    def _nqs_loss(
-        self,
-        response_apply,
-        response_params,
-        ground_logpsi,
-        ground_params,
-        batched_data,
-        *,
-        axis: int,
-        source_center: float,
-        source_norm: float,
-        ground_energy: float,
-        omega,
-    ):
-        stats = nqs_lit_source_sampled_stats(
-            response_apply,
-            response_params,
-            ground_logpsi,
-            ground_params,
-            batched_data,
-            axis=axis,
-            source_center=source_center,
-            source_norm=source_norm,
-            ground_energy=ground_energy,
-            omega=omega,
-            eta=self.lit_config.eta,
-            source_floor=self.lit_config.nqs_source_floor,
-        )
-        objective = _fidelity_loss(stats.fidelity, self.lit_config.nqs_sr_score_eps)
-        return objective, stats._replace(loss=objective)
-
-    def _nqs_stats(
-        self,
-        response_apply,
-        response_params,
-        ground_logpsi,
-        ground_params,
-        batched_data,
-        *,
-        axis: int,
-        source_center: float,
-        source_norm: float,
-        ground_energy: float,
-        omega,
-    ):
-        return nqs_lit_source_sampled_stats(
-            response_apply,
-            response_params,
-            ground_logpsi,
-            ground_params,
-            batched_data,
-            axis=axis,
-            source_center=source_center,
-            source_norm=source_norm,
-            ground_energy=ground_energy,
-            omega=omega,
-            eta=self.lit_config.eta,
-            source_floor=self.lit_config.nqs_source_floor,
-        )
-
     def _nqs_stats_chunked(
         self,
         response_apply,
@@ -2211,30 +2615,51 @@ class MoleculeLITWorkflow(Workflow):
                 jnp.asarray(eps, dtype=ratio.real.dtype) + 0j,
             )
             hloc = normalization / safe_ratio
-            finite = jnp.isfinite(jnp.real(hloc)) & jnp.isfinite(jnp.imag(hloc))
+            finite_ratio = jnp.isfinite(jnp.real(ratio)) & jnp.isfinite(jnp.imag(ratio))
+            finite = (
+                (jnp.abs(ratio) > eps)
+                & finite_ratio
+                & jnp.isfinite(jnp.real(hloc))
+                & jnp.isfinite(jnp.imag(hloc))
+            )
             hloc = jnp.where(finite, hloc, jnp.asarray(0.0, dtype=hloc.dtype))
+            log_ratio_abs2 = 2.0 * jnp.log(
+                jnp.maximum(
+                    jnp.where(finite_ratio, jnp.abs(ratio), 0.0),
+                    eps,
+                )
+            )
             sample_count = jnp.asarray(action.shape[0], dtype=hloc.real.dtype)
             return (
                 jnp.sum(hloc),
                 jnp.sum(jnp.abs(hloc) ** 2),
-                jnp.sum(jnp.abs(hloc - 1.0) ** 2),
+                jnp.sum(jnp.where(finite, jnp.abs(hloc - 1.0) ** 2, 0.0)),
+                jnp.sum(jnp.where(finite, log_ratio_abs2, 0.0)),
+                jnp.sum(finite),
                 sample_count,
             )
 
         total_hloc = None
         total_hloc_abs2 = None
         total_hloc_error_abs2 = None
+        total_log_ratio_abs2 = None
+        total_valid_count = None
         total_count = None
         for chunk in _batched_data_chunks(
             psi_batched_data, self._nqs_eval_batch_size()
         ):
-            hloc_sum, hloc_abs2_sum, hloc_error_abs2_sum, sample_count = (
-                direct_hloc_sum(
-                    response_params,
-                    chunk,
-                    source_stats.normalization,
-                    omega,
-                )
+            (
+                hloc_sum,
+                hloc_abs2_sum,
+                hloc_error_abs2_sum,
+                log_ratio_abs2_sum,
+                valid_count,
+                sample_count,
+            ) = direct_hloc_sum(
+                response_params,
+                chunk,
+                source_stats.normalization,
+                omega,
             )
             total_hloc = hloc_sum if total_hloc is None else total_hloc + hloc_sum
             total_hloc_abs2 = (
@@ -2247,6 +2672,16 @@ class MoleculeLITWorkflow(Workflow):
                 if total_hloc_error_abs2 is None
                 else total_hloc_error_abs2 + hloc_error_abs2_sum
             )
+            total_log_ratio_abs2 = (
+                log_ratio_abs2_sum
+                if total_log_ratio_abs2 is None
+                else total_log_ratio_abs2 + log_ratio_abs2_sum
+            )
+            total_valid_count = (
+                valid_count
+                if total_valid_count is None
+                else total_valid_count + valid_count
+            )
             total_count = (
                 sample_count if total_count is None else total_count + sample_count
             )
@@ -2254,13 +2689,15 @@ class MoleculeLITWorkflow(Workflow):
             total_hloc is None
             or total_hloc_abs2 is None
             or total_hloc_error_abs2 is None
+            or total_log_ratio_abs2 is None
+            or total_valid_count is None
             or total_count is None
         ):
             msg = "Cannot evaluate direct NQS-LIT stats with an empty psi pool."
             raise ValueError(msg)
 
         eps = jnp.asarray(self.lit_config.nqs_sr_score_eps, dtype=total_count.dtype)
-        safe_count = jnp.maximum(total_count, eps)
+        safe_count = jnp.maximum(total_valid_count, eps)
         hloc_mean = total_hloc / safe_count
         hloc_abs2_mean = total_hloc_abs2 / safe_count
         hloc_error_abs2_mean = total_hloc_error_abs2 / safe_count
@@ -2270,15 +2707,33 @@ class MoleculeLITWorkflow(Workflow):
         )
         direct_hloc_sem = direct_hloc_std / jnp.sqrt(safe_count)
         fidelity = jnp.clip(jnp.real(hloc_mean), 0.0, 1.0)
+        direct_log_ratio_mean = total_log_ratio_abs2 / safe_count
+        reverse_kl = jnp.where(
+            total_valid_count > 0,
+            jnp.maximum(
+                direct_log_ratio_mean - source_stats.log_ratio_norm,
+                jnp.asarray(0.0, dtype=fidelity.dtype),
+            ),
+            jnp.asarray(0.0, dtype=fidelity.dtype),
+        )
+        equation_relative_residual = jnp.sqrt(
+            jnp.maximum(1.0 / jnp.maximum(fidelity, eps) - 1.0, 0.0)
+        )
         action_norm = (
             jnp.asarray(source_norm, dtype=fidelity.dtype)
             * jnp.abs(source_stats.normalization) ** 2
             / jnp.maximum(fidelity, eps)
         )
         return source_stats._replace(
-            loss=1.0 - fidelity,
+            loss=1.0 - fidelity + self.lit_config.nqs_reverse_kl_weight * reverse_kl,
             fidelity=fidelity,
+            reverse_kl=jnp.real(reverse_kl),
+            residual_norm=jnp.asarray(source_norm, dtype=fidelity.dtype)
+            * equation_relative_residual**2,
+            equation_relative_residual=equation_relative_residual,
             action_norm=jnp.real(action_norm),
+            invalid_sample_fraction=1.0
+            - total_valid_count / jnp.maximum(total_count, 1.0),
             estimator_mode=jnp.asarray(1, dtype=jnp.int32),
             direct_hloc_rmse=jnp.real(direct_hloc_rmse),
             direct_hloc_std=jnp.real(direct_hloc_std),
@@ -2351,7 +2806,14 @@ class MoleculeLITWorkflow(Workflow):
         threshold = float(self.lit_config.nqs_reweight_ess_fraction_min)
         if threshold <= 0.0:
             return False
-        return float(jax.device_get(stats.reweight_ess_fraction)) < threshold
+        ess_fraction = float(jax.device_get(stats.reweight_ess_fraction))
+        invalid_fraction = float(jax.device_get(stats.invalid_sample_fraction))
+        return (
+            not np.isfinite(ess_fraction)
+            or not np.isfinite(invalid_fraction)
+            or invalid_fraction > 0.0
+            or ess_fraction < threshold
+        )
 
     def _needs_direct_psi_estimator(self) -> bool:
         return float(self.lit_config.nqs_reweight_ess_fraction_min) > 0.0
@@ -2402,6 +2864,18 @@ class MoleculeLITWorkflow(Workflow):
             rng=state.rng,
             initialized=jnp.asarray(False),
             use_direct=jnp.asarray(False),
+        )
+
+    def _init_nqs_update_carry(
+        self,
+        batched_data,
+        rng,
+        response_params,
+    ) -> _NQSUpdateCarry:
+        flat_params, _ = ravel_pytree(response_params)
+        return _NQSUpdateCarry(
+            direct=self._init_direct_psi_carry(batched_data, rng),
+            spring=_SpringState(previous_direction=jnp.zeros_like(flat_params)),
         )
 
     def _collect_direct_psi_pool_from_state(
@@ -2635,546 +3109,8 @@ class MoleculeLITWorkflow(Workflow):
                 float(peak.intensity),
             )
 
-    def _should_run_parallel_scan(self) -> bool:
-        if self.lit_config.scan_parallel_worker:
-            return False
-        mode = self.lit_config.scan_parallel.lower()
-        if mode in ("off", "false", "none", "0"):
-            return False
-        if self._omega_grid().size < 2:
-            return False
-        slots = self._parallel_slots()
-        if len(slots) < 2:
-            return False
-        return self._parallel_worker_count(len(slots)) > 1
-
-    def _parallel_slots(self) -> tuple[_ParallelSlot, ...]:
-        mode = self.lit_config.scan_parallel.lower()
-        if mode in _REMOTE_PARALLEL_MODES:
-            return _parse_parallel_remote_hosts(
-                self.lit_config.scan_parallel_remote_hosts,
-                remote_root=self.lit_config.scan_parallel_remote_root,
-                remote_python=self.lit_config.scan_parallel_remote_python,
-                ssh_options=tuple(self.lit_config.scan_parallel_ssh_options),
-                procs_per_device=int(self.lit_config.scan_parallel_procs_per_device),
-            )
-        device_ids = _visible_cuda_devices()
-        return _local_parallel_slots(
-            device_ids,
-            procs_per_device=int(self.lit_config.scan_parallel_procs_per_device),
-        )
-
-    def _parallel_worker_count(self, available_slots: int) -> int:
-        worker_limit = (
-            int(self.lit_config.scan_parallel_workers)
-            if self.lit_config.scan_parallel_workers > 0
-            else available_slots
-        )
-        points_limit = max(
-            1,
-            int(
-                np.ceil(
-                    self._omega_grid().size
-                    / self.lit_config.scan_parallel_min_points_per_worker
-                )
-            ),
-        )
-        return max(1, min(available_slots, worker_limit, points_limit))
-
-    def _run_parallel_scan(self) -> None:
-        axes = _axis_indices(self.lit_config.axes)
-        omega = self._omega_grid()
-        slots = self._parallel_slots()
-        worker_count = self._parallel_worker_count(len(slots))
-        blocks = _split_omega_blocks(omega.size, worker_count)
-        if len(blocks) <= 1:
-            logger.info("Parallel LIT scan requested but only one block is needed.")
-            self._run_serial_scan()
-            return
-        worker_slots = _parallel_worker_slots(slots, len(blocks))
-
-        parallel_root = self.save_path / "parallel_scan"
-        parallel_root.mkdir(parents=True, exist_ok=True)
-        base_config_path = parallel_root / "base_config.yaml"
-        base_config_path.write_text(self.cfg.to_yaml())
-        compile_cache_dir = parallel_root / "jax_compile_cache"
-        run_seed = (
-            int(self.config.seed) if self.config.seed is not None else int(time.time())
-        )
-        shared_pool_root = (
-            UPath(self.lit_config.nqs_source_pool_dir)
-            if self.lit_config.nqs_source_pool_dir
-            else parallel_root / "source_pools"
-        )
-        shared_source = self._prepare_parallel_shared_source(
-            axes,
-            run_seed=run_seed,
-            source_pool_dir=shared_pool_root,
-        )
-
-        parallel_mode = (
-            "distributed"
-            if self.lit_config.scan_parallel.lower() in _REMOTE_PARALLEL_MODES
-            else "local-device"
-        )
-        logger.info(
-            "Starting %s LIT scan: workers=%d slots=%s blocks=%s",
-            parallel_mode,
-            len(blocks),
-            ",".join(slot.label for slot in worker_slots),
-            ",".join(f"{block[0]}:{block[-1] + 1}" for block in blocks),
-        )
-        failures: list[_ParallelWorker] = []
-        with ExitStack() as stack:
-            workers: list[_ParallelWorker] = []
-            for worker_index, block in enumerate(blocks):
-                part_dir = parallel_root / f"block_{worker_index:03d}"
-                part_dir.mkdir(parents=True, exist_ok=True)
-                log_path = part_dir / "worker.log"
-                command = self._parallel_worker_command(
-                    base_config_path,
-                    part_dir,
-                    omega[block],
-                    run_seed=run_seed,
-                    shared_source=shared_source,
-                    worker_index=worker_index,
-                    python_executable=worker_slots[worker_index].python or None,
-                )
-                slot = worker_slots[worker_index]
-                cache_dir = compile_cache_dir / f"worker_{worker_index:03d}"
-                autotune_cache_dir = (
-                    parallel_root / "xla_autotune_cache" / f"worker_{worker_index:03d}"
-                )
-                log_file = stack.enter_context(log_path.open("w", encoding="utf8"))
-                process = self._start_parallel_worker(
-                    slot,
-                    command,
-                    log_file,
-                    cache_dir=cache_dir,
-                    autotune_cache_dir=autotune_cache_dir,
-                )
-                workers.append(
-                    _ParallelWorker(
-                        index=worker_index,
-                        block=block,
-                        path=part_dir / self.lit_config.output_filename,
-                        log_path=log_path,
-                        process=process,
-                        device=slot.label,
-                    )
-                )
-            for worker in workers:
-                process = worker.process
-                returncode = process.wait()
-                if returncode != 0:
-                    failures.append(worker)
-        if failures:
-            details = "\n".join(
-                f"worker {worker.index} device={worker.device} "
-                f"returncode={worker.process.returncode}\n"
-                f"{_tail_text(worker.log_path)}"
-                for worker in failures
-            )
-            msg = f"Parallel LIT scan failed:\n{details}"
-            raise RuntimeError(msg)
-
-        logger.info("All parallel LIT workers finished; merging partial spectra.")
-        self._merge_parallel_outputs(
-            [worker.path for worker in workers],
-            devices=[worker.device for worker in workers],
-            blocks=[worker.block for worker in workers],
-            axes=axes,
-        )
-
-    def _start_parallel_worker(
-        self,
-        slot: _ParallelSlot,
-        command: list[str],
-        log_file,
-        *,
-        cache_dir: UPath,
-        autotune_cache_dir: UPath,
-    ) -> subprocess.Popen[bytes]:
-        if not slot.is_remote:
-            env = _parallel_worker_env(
-                slot.device,
-                cache_dir=cache_dir,
-                autotune_cache_dir=autotune_cache_dir,
-            )
-            return subprocess.Popen(
-                command,
-                cwd=Path.cwd(),
-                env=env,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-            )
-
-        env = _parallel_worker_env(
-            slot.device,
-            cache_dir=cache_dir,
-            autotune_cache_dir=autotune_cache_dir,
-            base_env={},
-            create_dirs=False,
-        )
-        remote_command = _remote_parallel_shell_command(
-            root=slot.root or str(Path.cwd()),
-            command=command,
-            env=env,
-            mkdirs=(cache_dir, autotune_cache_dir, autotune_cache_dir / "tmp"),
-        )
-        ssh_command = ["ssh", *slot.ssh_options]
-        if slot.port is not None:
-            ssh_command.extend(["-p", str(slot.port)])
-        ssh_command.extend([slot.host, remote_command])
-        return subprocess.Popen(
-            ssh_command,
-            cwd=Path.cwd(),
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-        )
-
-    def _prepare_parallel_shared_source(
-        self,
-        axes: tuple[int, ...],
-        *,
-        run_seed: int,
-        source_pool_dir: UPath,
-    ) -> _ParallelSharedSource | None:
-        if len(axes) != 1:
-            logger.info(
-                "Parallel shared source pools are only used for single-axis "
-                "scans; falling back to per-worker source preparation."
-            )
-            return None
-
-        axis = axes[0]
-        fast_source = self._parallel_shared_source_from_overrides(
-            axis,
-            run_seed=run_seed,
-            source_pool_dir=source_pool_dir,
-        )
-        if fast_source is not None:
-            return fast_source
-
-        logger.info(
-            "Preparing shared source pool for parallel LIT workers on axis=%s.",
-            _AXIS_NAMES[axis],
-        )
-        rng = jax.random.PRNGKey(run_seed)
-        rng, data_rng, ground_rng, _, sample_rng = jax.random.split(rng, 5)
-        batched_data = data_init(self.system_config, self.config.batch_size, data_rng)
-        example = batched_data.unbatched_example()
-        checkpoint_step, ground_params, ground_logpsi = self._resolve_nqs_ground_state(
-            example, ground_rng
-        )
-        ground_sample_plan = SamplePlan(ground_logpsi, {"electrons": self.sampler})
-        sampler_state = ground_sample_plan.init(batched_data, sample_rng)
-        for _ in range(self.lit_config.nqs_burn_in):
-            rng, sample_rng = jax.random.split(rng)
-            batched_data, _, sampler_state = ground_sample_plan.step(
-                ground_params,
-                batched_data,
-                sampler_state,
-                sample_rng,
-            )
-
-        ground_energy, batched_data, sampler_state, rng = self._resolve_ground_energy(
-            ground_logpsi,
-            ground_params,
-            batched_data,
-            sampler_state,
-            ground_sample_plan,
-            rng,
-        )
-        source_center, source_norm, batched_data, sampler_state, rng = (
-            self._estimate_source_stats(
-                ground_params,
-                batched_data,
-                sampler_state,
-                ground_sample_plan,
-                rng,
-                axis=axis,
-            )
-        )
-
-        loaded_pools = self._try_load_source_pools(
-            batched_data,
-            axis=axis,
-            source_center=source_center,
-            pool_root=source_pool_dir,
-        )
-        if loaded_pools is None:
-            source_sample_plan, source_state, axis_batched_data, rng = (
-                self._prepare_source_sampler(
-                    self.sampler,
-                    batched_data,
-                    ground_params,
-                    ground_logpsi,
-                    rng,
-                    axis=axis,
-                    source_center=source_center,
-                )
-            )
-            train_pool, axis_batched_data, source_state, rng = (
-                self._load_or_collect_source_pool(
-                    source_sample_plan,
-                    ground_params,
-                    axis_batched_data,
-                    source_state,
-                    rng,
-                    axis=axis,
-                    source_center=source_center,
-                    split="train",
-                    batches=self.lit_config.nqs_train_pool_batches,
-                    pool_root=source_pool_dir,
-                )
-            )
-            eval_pool, _, _, _ = self._load_or_collect_source_pool(
-                source_sample_plan,
-                ground_params,
-                axis_batched_data,
-                source_state,
-                rng,
-                axis=axis,
-                source_center=source_center,
-                split="eval",
-                batches=self.lit_config.nqs_eval_pool_batches,
-                pool_root=source_pool_dir,
-            )
-        else:
-            train_pool, eval_pool = loaded_pools
-
-        logger.info(
-            "Prepared shared source axis=%s checkpoint=%d energy=%.10f "
-            "source_center=%.8e source_norm=%.8e train=%d eval=%d dir=%s",
-            _AXIS_NAMES[axis],
-            checkpoint_step,
-            ground_energy,
-            source_center,
-            source_norm,
-            train_pool.batch_size,
-            eval_pool.batch_size,
-            source_pool_dir,
-        )
-        return _ParallelSharedSource(
-            ground_energy=float(ground_energy),
-            source_center=float(source_center),
-            source_norm=float(source_norm),
-            source_pool_dir=source_pool_dir,
-        )
-
-    def _parallel_shared_source_from_overrides(
-        self,
-        axis: int,
-        *,
-        run_seed: int,
-        source_pool_dir: UPath,
-    ) -> _ParallelSharedSource | None:
-        if (
-            self.lit_config.nqs_ground_energy is None
-            or self.lit_config.nqs_source_center_override is None
-            or self.lit_config.nqs_source_norm_override is None
-        ):
-            return None
-
-        rng = jax.random.PRNGKey(run_seed)
-        _, data_rng, _, _, _ = jax.random.split(rng, 5)
-        batched_data = data_init(self.system_config, self.config.batch_size, data_rng)
-        source_center = float(self.lit_config.nqs_source_center_override)
-        source_norm = float(self.lit_config.nqs_source_norm_override)
-        loaded_pools = self._try_load_source_pools(
-            batched_data,
-            axis=axis,
-            source_center=source_center,
-            pool_root=source_pool_dir,
-        )
-        if loaded_pools is None:
-            return None
-
-        train_pool, eval_pool = loaded_pools
-        ground_energy = float(self.lit_config.nqs_ground_energy)
-        logger.info(
-            "Using configured shared source axis=%s energy=%.10f "
-            "source_center=%.8e source_norm=%.8e train=%d eval=%d dir=%s",
-            _AXIS_NAMES[axis],
-            ground_energy,
-            source_center,
-            source_norm,
-            train_pool.batch_size,
-            eval_pool.batch_size,
-            source_pool_dir,
-        )
-        return _ParallelSharedSource(
-            ground_energy=ground_energy,
-            source_center=source_center,
-            source_norm=source_norm,
-            source_pool_dir=source_pool_dir,
-        )
-
-    def _parallel_worker_command(
-        self,
-        base_config_path: UPath,
-        part_dir: UPath,
-        block_omega: np.ndarray,
-        *,
-        run_seed: int,
-        shared_source: _ParallelSharedSource | None = None,
-        worker_index: int = 0,
-        python_executable: str | None = None,
-    ) -> list[str]:
-        source_pool_dir = (
-            shared_source.source_pool_dir
-            if shared_source is not None
-            else part_dir / "source_pools"
-        )
-        block_omega_values = (
-            "[" + ", ".join(repr(float(value)) for value in block_omega) + "]"
-        )
-        command = [
-            python_executable or sys.executable,
-            "-c",
-            "from jaqmc.app.cli import cli; cli()",
-            "molecule",
-            "lit",
-            "--yml",
-            str(base_config_path),
-            f"workflow.seed={run_seed}",
-            f"workflow.save_path={part_dir}",
-            f"workflow.restore_path={self.restore_path}",
-            "lit.scan_parallel=off",
-            "lit.scan_parallel_worker=true",
-            f"lit.omega_min={float(block_omega[0])}",
-            f"lit.omega_max={float(block_omega[-1])}",
-            f"lit.omega_points={int(block_omega.size)}",
-            f"lit.omega_values={block_omega_values}",
-            f"lit.nqs_source_pool_dir={source_pool_dir}",
-            f"lit.scan_parallel_worker_index={int(worker_index)}",
-        ]
-        if shared_source is not None:
-            command.extend(
-                [
-                    f"lit.nqs_ground_energy={float(shared_source.ground_energy)!r}",
-                    "lit.nqs_source_center_steps=0",
-                    "lit.nqs_source_center_override="
-                    f"{float(shared_source.source_center)!r}",
-                    "lit.nqs_source_norm_override="
-                    f"{float(shared_source.source_norm)!r}",
-                ]
-            )
-        return command
-
-    def _merge_parallel_outputs(
-        self,
-        paths: list[UPath],
-        *,
-        devices: list[str],
-        blocks: list[np.ndarray],
-        axes: tuple[int, ...],
-    ) -> None:
-        loaded = []
-        for path in paths:
-            if not path.exists():
-                msg = f"Parallel LIT worker did not produce {path}"
-                raise FileNotFoundError(msg)
-            with path.open("rb") as f_in, np.load(f_in) as data:
-                loaded.append({key: data[key] for key in data.files})
-
-        omega = np.concatenate([part["omega"] for part in loaded])
-        order = np.argsort(omega)
-        omega = omega[order]
-        concat_axis_fields = (
-            "lit",
-            "broadened",
-            "fidelity",
-            "residual_norm",
-            "equation_relative_residual",
-            "action_norm",
-            "source_norm",
-            "error_bound_monitor",
-            "error_d",
-            "reweight_ess",
-            "reweight_ess_fraction",
-            "direct_hloc_rmse",
-            "direct_hloc_std",
-            "direct_hloc_sem",
-            "estimator_mode",
-            "normalization",
-            "correction_overlap",
-        )
-        combined = {}
-        for field_name in concat_axis_fields:
-            arr = np.concatenate([part[field_name] for part in loaded], axis=1)
-            combined[field_name] = arr[:, order]
-
-        total_broadened = np.sum(combined["broadened"], axis=0)
-        peaks = find_spectrum_peaks(
-            omega,
-            total_broadened,
-            min_height_fraction=self.lit_config.peak_min_height_fraction,
-        )
-        source_centers_blocks = np.asarray(
-            [part["source_centers"] for part in loaded],
-            dtype=np.float64,
-        )
-        axis_source_norm_blocks = np.asarray(
-            [part["axis_source_norm"] for part in loaded],
-            dtype=np.float64,
-        )
-        ground_energies = np.asarray(
-            [float(part["ground_energy"]) for part in loaded],
-            dtype=np.float64,
-        )
-        output_path = self.save_path / self.lit_config.output_filename
-        _save_npz(
-            output_path,
-            backend="nqs_lit",
-            omega=omega,
-            eta=self.lit_config.eta,
-            axes=self.lit_config.axes,
-            axis_indices=np.asarray(axes, dtype=np.int64),
-            total_broadened=total_broadened,
-            ground_energy=float(np.mean(ground_energies)),
-            ground_energy_blocks=ground_energies,
-            ground_checkpoint_step=loaded[0]["ground_checkpoint_step"],
-            nqs_train_pool_batches=self.lit_config.nqs_train_pool_batches,
-            nqs_eval_pool_batches=self.lit_config.nqs_eval_pool_batches,
-            nqs_pool_stride=self.lit_config.nqs_pool_stride,
-            nqs_reweight_ess_fraction_min=(
-                self.lit_config.nqs_reweight_ess_fraction_min
-            ),
-            nqs_direct_psi_train=bool(self.lit_config.nqs_direct_psi_train),
-            nqs_direct_psi_burn_in=self.lit_config.nqs_direct_psi_burn_in,
-            nqs_direct_psi_batches=self.lit_config.nqs_direct_psi_batches,
-            nqs_direct_psi_train_batches=self._nqs_direct_psi_train_batches(),
-            nqs_direct_psi_eval_batches=self._nqs_direct_psi_eval_batches(),
-            nqs_direct_psi_stride=self.lit_config.nqs_direct_psi_stride,
-            nqs_direct_psi_precompile=bool(self.lit_config.nqs_direct_psi_precompile),
-            nqs_direct_psi_persistent_sampler=bool(
-                self.lit_config.nqs_direct_psi_persistent_sampler
-            ),
-            nqs_warm_start_omega=_optional_float(self.lit_config.nqs_warm_start_omega),
-            nqs_warm_start_iterations=self.lit_config.nqs_warm_start_iterations,
-            source_centers=np.mean(source_centers_blocks, axis=0),
-            axis_source_norm=np.mean(axis_source_norm_blocks, axis=0),
-            source_centers_blocks=source_centers_blocks,
-            axis_source_norm_blocks=axis_source_norm_blocks,
-            peak_energies=np.asarray([peak.energy for peak in peaks]),
-            peak_intensities=np.asarray([peak.intensity for peak in peaks]),
-            peak_indices=np.asarray([peak.index for peak in peaks]),
-            parallel_scan_enabled=True,
-            parallel_scan_devices=np.asarray(devices, dtype=str),
-            parallel_scan_blocks=np.asarray(
-                [[int(block[0]), int(block[-1] + 1)] for block in blocks],
-                dtype=np.int64,
-            ),
-            parallel_scan_part_paths=np.asarray([str(path) for path in paths]),
-            **combined,
-        )
-        self._log_nqs_summary(str(output_path), peaks, combined["fidelity"])
-
 
 _AXIS_NAMES = ("x", "y", "z")
-_REMOTE_PARALLEL_MODES = frozenset({"distributed", "remote", "remote_devices"})
 
 
 def _lit_omega_grid(config: MolecularLITConfig) -> np.ndarray:
@@ -3193,6 +3129,12 @@ def _lit_omega_grid(config: MolecularLITConfig) -> np.ndarray:
     if config.omega_points < 1:
         msg = "lit.omega_points must be positive."
         raise ValueError(msg)
+    if not np.isfinite(config.omega_min) or not np.isfinite(config.omega_max):
+        msg = "lit.omega_min and lit.omega_max must be finite."
+        raise ValueError(msg)
+    if config.omega_points > 1 and config.omega_max <= config.omega_min:
+        msg = "lit.omega_max must exceed lit.omega_min for a serial scan."
+        raise ValueError(msg)
     return np.linspace(
         config.omega_min,
         config.omega_max,
@@ -3200,198 +3142,59 @@ def _lit_omega_grid(config: MolecularLITConfig) -> np.ndarray:
     )
 
 
-def _visible_cuda_devices() -> tuple[str, ...]:
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible is not None:
-        devices = tuple(
-            item.strip()
-            for item in visible.split(",")
-            if item.strip() and item.strip() != "-1"
-        )
-        return devices
-    try:
-        return tuple(str(idx) for idx, _ in enumerate(jax.devices("gpu")))
-    except RuntimeError:
-        return ()
+def _continuation_min_step(
+    config: MolecularLITConfig,
+    spectrum_omega: np.ndarray,
+) -> float:
+    configured = config.nqs_continuation_min_step
+    if configured is not None:
+        return float(configured)
+    candidates = [float(config.nqs_continuation_step_fraction) * float(config.eta)]
+    spacings = np.diff(np.asarray(spectrum_omega, dtype=np.float64))
+    if spacings.size:
+        candidates.append(float(np.min(spacings)))
+    return max(np.finfo(np.float64).eps, min(candidates))
 
 
-def _split_omega_blocks(omega_points: int, worker_count: int) -> list[np.ndarray]:
-    indices = np.arange(int(omega_points), dtype=np.int64)
-    return [
-        block
-        for block in np.array_split(indices, max(1, int(worker_count)))
-        if block.size > 0
-    ]
+def _physics_continuation_step(stats, *, gap: float, fraction: float, min_step: float):
+    """Choose a homotopy step from the inherited LIT residual estimate.
+
+    Returns:
+        A positive step no larger than the remaining target gap.
+    """
+    lit = float(jax.device_get(stats.lit))
+    source_norm = float(jax.device_get(stats.source_norm))
+    if (
+        np.isfinite(lit)
+        and np.isfinite(source_norm)
+        and lit > 0.0
+        and source_norm > 0.0
+    ):
+        proposed = float(fraction) * np.sqrt(source_norm / lit)
+    else:
+        proposed = float(min_step)
+    return min(float(gap), max(float(min_step), proposed))
 
 
-def _local_parallel_slots(
-    device_ids: tuple[str, ...],
-    *,
-    procs_per_device: int,
-) -> tuple[_ParallelSlot, ...]:
-    if procs_per_device < 1:
-        msg = "procs_per_device must be positive."
-        raise ValueError(msg)
-    slots: list[_ParallelSlot] = []
-    for replica in range(int(procs_per_device)):
-        for device in device_ids:
-            label = str(device)
-            if procs_per_device > 1:
-                label = f"{label}/p{replica}"
-            slots.append(_ParallelSlot(device=str(device), label=label))
-    return tuple(slots)
-
-
-def _parallel_worker_slots(
-    slots: tuple[_ParallelSlot, ...],
-    worker_count: int,
-) -> tuple[_ParallelSlot, ...]:
-    if not slots:
-        msg = "At least one parallel worker slot is required."
-        raise ValueError(msg)
-    if worker_count > len(slots):
-        msg = (
-            f"worker_count={worker_count} exceeds available parallel slots "
-            f"{len(slots)}."
-        )
-        raise ValueError(msg)
-    return tuple(slots[:worker_count])
-
-
-def _parse_parallel_remote_hosts(
-    specs: tuple[str, ...],
-    *,
-    remote_root: str,
-    remote_python: str,
-    ssh_options: tuple[str, ...],
-    procs_per_device: int,
-) -> tuple[_ParallelSlot, ...]:
-    if procs_per_device < 1:
-        msg = "procs_per_device must be positive."
-        raise ValueError(msg)
-    slots: list[_ParallelSlot] = []
-    for spec in specs:
-        host, port, devices = _parse_parallel_remote_host(spec)
-        for replica in range(int(procs_per_device)):
-            for device in devices:
-                label = f"{host}:{device}"
-                if port is not None:
-                    label = f"{host}:{port}:{device}"
-                if procs_per_device > 1:
-                    label = f"{label}/p{replica}"
-                slots.append(
-                    _ParallelSlot(
-                        device=device,
-                        label=label,
-                        host=host,
-                        port=port,
-                        root=remote_root,
-                        python=remote_python,
-                        ssh_options=ssh_options,
-                    )
-                )
-    return tuple(slots)
-
-
-def _parse_parallel_remote_host(spec: str) -> tuple[str, int | None, tuple[str, ...]]:
-    raw_spec = str(spec).strip()
-    if not raw_spec:
-        msg = "Empty lit.scan_parallel_remote_hosts entry."
-        raise ValueError(msg)
-
-    port: int | None = None
-    host_and_devices = raw_spec
-    if "@" in raw_spec:
-        port_text, host_and_devices = raw_spec.split("@", 1)
-        try:
-            port = int(port_text)
-        except ValueError as exc:
-            msg = (
-                "Remote host specs with an explicit port must use "
-                f"'PORT@HOST:DEVICES', got {raw_spec!r}."
-            )
-            raise ValueError(msg) from exc
-
-    host, separator, devices_text = host_and_devices.rpartition(":")
-    if not separator or not host or not devices_text:
-        msg = (
-            "Remote host specs must use 'HOST:DEVICES' or "
-            f"'PORT@HOST:DEVICES', got {raw_spec!r}."
-        )
-        raise ValueError(msg)
-    return host, port, _parse_parallel_device_list(devices_text)
-
-
-def _parse_parallel_device_list(devices_text: str) -> tuple[str, ...]:
-    devices: list[str] = []
-    for item in devices_text.split(","):
-        token = item.strip()
-        if not token:
-            continue
-        start_text, dash, end_text = token.partition("-")
-        if dash and start_text.isdigit() and end_text.isdigit():
-            start = int(start_text)
-            end = int(end_text)
-            step = 1 if end >= start else -1
-            devices.extend(str(index) for index in range(start, end + step, step))
-        else:
-            devices.append(token)
-    if not devices:
-        msg = f"No CUDA devices parsed from {devices_text!r}."
-        raise ValueError(msg)
-    return tuple(devices)
-
-
-def _remote_parallel_shell_command(
-    *,
-    root: str,
-    command: list[str],
-    env: dict[str, str],
-    mkdirs: tuple[UPath, ...],
-) -> str:
-    mkdir_command = "mkdir -p " + " ".join(shlex.quote(str(path)) for path in mkdirs)
-    env_prefix = " ".join(
-        f"{key}={shlex.quote(str(value))}" for key, value in sorted(env.items())
+def _finite_valid_nqs_stats(stats) -> bool:
+    values = (
+        float(jax.device_get(stats.loss)),
+        float(jax.device_get(stats.fidelity)),
+        float(jax.device_get(stats.reverse_kl)),
+        float(jax.device_get(stats.invalid_sample_fraction)),
     )
-    worker_command = shlex.join(command)
-    if env_prefix:
-        worker_command = f"{env_prefix} {worker_command}"
-    return " && ".join(
-        (
-            f"cd {shlex.quote(root)}",
-            mkdir_command,
-            worker_command,
-        )
-    )
+    return bool(np.all(np.isfinite(values))) and values[-1] <= 0.0
 
 
-def _parallel_worker_env(
-    device_id: str,
-    *,
-    cache_dir: UPath | None = None,
-    autotune_cache_dir: UPath | None = None,
-    base_env: dict[str, str] | None = None,
-    create_dirs: bool = True,
-) -> dict[str, str]:
-    env = os.environ.copy() if base_env is None else dict(base_env)
-    env["CUDA_VISIBLE_DEVICES"] = str(device_id)
-    env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-    env.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
-    if cache_dir is not None:
-        if create_dirs:
-            cache_dir.mkdir(parents=True, exist_ok=True)
-        env.setdefault("JAX_ENABLE_COMPILATION_CACHE", "true")
-        env.setdefault("JAX_COMPILATION_CACHE_DIR", str(cache_dir))
-        env.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
-    if autotune_cache_dir is not None:
-        if create_dirs:
-            autotune_cache_dir.mkdir(parents=True, exist_ok=True)
-            (autotune_cache_dir / "tmp").mkdir(parents=True, exist_ok=True)
-        flag = f"--xla_gpu_per_fusion_autotune_cache_dir={autotune_cache_dir}"
-        xla_flags = env.get("XLA_FLAGS", "")
-        if "xla_gpu_per_fusion_autotune_cache_dir" not in xla_flags:
-            env["XLA_FLAGS"] = f"{xla_flags} {flag}".strip()
-    return env
+def _continuation_probe_is_acceptable(current, candidate, *, retention: float) -> bool:
+    if not _finite_valid_nqs_stats(candidate):
+        return False
+    current_fidelity = float(jax.device_get(current.fidelity))
+    candidate_fidelity = float(jax.device_get(candidate.fidelity))
+    if not np.isfinite(current_fidelity):
+        return False
+    required = max(0.0, float(retention) * current_fidelity)
+    return candidate_fidelity >= required
 
 
 def _optional_float(value: float | None) -> float:
@@ -3410,14 +3213,6 @@ def _save_npz(path: UPath, **payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as f_out:
         np.savez(f_out, **payload)  # type: ignore[arg-type]
-
-
-def _tail_text(path: UPath, lines: int = 80) -> str:
-    try:
-        text = path.read_text(encoding="utf8")
-    except OSError as exc:
-        return f"<failed to read {path}: {exc}>"
-    return "\n".join(text.splitlines()[-lines:])
 
 
 def _axis_indices(axes: str) -> tuple[int, ...]:
@@ -3540,7 +3335,51 @@ def _batched_data_chunks(pool: BatchedData, requested_size: int):
 
 
 def _add_source_sums(left, right):
-    return jax.tree.map(operator.add, left, right)
+    """Merge independently scaled source moments without overflowing.
+
+    Returns:
+        The combined source moments in units of the larger input scale.
+    """
+    scale = jnp.maximum(left.ratio_scale, right.ratio_scale)
+    tiny = jnp.asarray(jnp.finfo(scale.dtype).tiny, dtype=scale.dtype)
+    scale = jnp.maximum(scale, tiny)
+    left_factor = left.ratio_scale / scale
+    right_factor = right.ratio_scale / scale
+
+    def log_moment(moment, weight, factor):
+        factor_sq = factor**2
+        safe_factor = jnp.maximum(factor, tiny)
+        return factor_sq * (moment + 2.0 * jnp.log(safe_factor) * weight)
+
+    merged = jax.tree.map(operator.add, left, right)
+    return merged._replace(
+        ratio_scale=scale,
+        ratio_sum=left_factor * left.ratio_sum + right_factor * right.ratio_sum,
+        ratio_abs2_sum=(
+            left_factor**2 * left.ratio_abs2_sum
+            + right_factor**2 * right.ratio_abs2_sum
+        ),
+        psi_weight_sum=(
+            left_factor**2 * left.psi_weight_sum
+            + right_factor**2 * right.psi_weight_sum
+        ),
+        psi_weight_sq_sum=(
+            left_factor**4 * left.psi_weight_sq_sum
+            + right_factor**4 * right.psi_weight_sq_sum
+        ),
+        psi_log_ratio_abs2_sum=(
+            log_moment(
+                left.psi_log_ratio_abs2_sum,
+                left.psi_weight_sum,
+                left_factor,
+            )
+            + log_moment(
+                right.psi_log_ratio_abs2_sum,
+                right.psi_weight_sum,
+                right_factor,
+            )
+        ),
+    )
 
 
 def _solve_sr_direction_chunked(
@@ -3548,6 +3387,9 @@ def _solve_sr_direction_chunked(
     score_aug_chunk,
     grad_flat,
     damping,
+    *,
+    kernel_null_vectors=None,
+    kernel_projector_scale=1.0,
 ):
     """Solve the SR system from score chunks without materializing all scores.
 
@@ -3556,6 +3398,10 @@ def _solve_sr_direction_chunked(
         score_aug_chunk: Callable returning one real-augmented score chunk.
         grad_flat: Flattened objective gradient.
         damping: Positive SR damping added to the metric.
+        kernel_null_vectors: Known left-null vectors of the centered score
+            matrix, used to lift the Gram matrix null space.
+        kernel_projector_scale: Positive eigenvalue assigned to those lifted
+            null-space directions.
 
     Returns:
         Flattened preconditioned SR direction.
@@ -3568,41 +3414,87 @@ def _solve_sr_direction_chunked(
         raise ValueError(msg)
     parameter_count = grad_flat.shape[0]
     sample_count = sum(int(rows) for rows in chunk_rows)
-    if parameter_count <= sample_count:
-        metric = None
-        for index in range(len(chunk_rows)):
-            score_aug = score_aug_chunk(index)
-            local_metric = score_aug.T @ score_aug
-            metric = local_metric if metric is None else metric + local_metric
-        if metric is None:
-            msg = "At least one SR score chunk is required."
-            raise ValueError(msg)
-        metric = metric + damping * jnp.eye(parameter_count, dtype=metric.dtype)
-        return jnp.linalg.solve(metric, grad_flat)
-
-    row_blocks = []
-    for row_index in range(len(chunk_rows)):
-        row_score_aug = score_aug_chunk(row_index)
-        column_blocks = []
-        for column_index in range(len(chunk_rows)):
-            column_score_aug = score_aug_chunk(column_index)
-            column_blocks.append(row_score_aug @ column_score_aug.T)
-        row_blocks.append(jnp.concatenate(column_blocks, axis=1))
-    kernel = jnp.concatenate(row_blocks, axis=0)
-    kernel = kernel + damping * jnp.eye(sample_count, dtype=kernel.dtype)
-    rhs = jnp.concatenate(
-        [score_aug_chunk(index) @ grad_flat for index in range(len(chunk_rows))],
-        axis=0,
+    original_dtype = grad_flat.dtype
+    # Local x64 is deliberately enabled even when the rest of the workflow is
+    # float32.  The Gram solve is small compared with score construction, and
+    # this is the numerically sensitive part of SPRING.
+    with _enable_x64(True):
+        solve_dtype = jnp.float64
+        grad_solve = grad_flat.astype(solve_dtype)
+        damping_solve = jnp.asarray(damping, dtype=solve_dtype)
+        score_chunks = tuple(
+            score_aug_chunk(index).astype(solve_dtype)
+            for index in range(len(chunk_rows))
+        )
+        if parameter_count <= sample_count:
+            metric = jnp.zeros(
+                (parameter_count, parameter_count),
+                dtype=solve_dtype,
+            )
+            for score_aug in score_chunks:
+                metric = metric + score_aug.T @ score_aug
+            metric = (metric + metric.T) / 2.0
+            metric = metric + damping_solve * jnp.eye(
+                parameter_count,
+                dtype=solve_dtype,
+            )
+            chol = jsp.linalg.cho_factor(metric, lower=True)
+            direction = jsp.linalg.cho_solve(chol, grad_solve)
+        else:
+            row_blocks = []
+            for row_score_aug in score_chunks:
+                column_blocks = [
+                    row_score_aug @ column_score_aug.T
+                    for column_score_aug in score_chunks
+                ]
+                row_blocks.append(jnp.concatenate(column_blocks, axis=1))
+            kernel = jnp.concatenate(row_blocks, axis=0)
+            kernel = (kernel + kernel.T) / 2.0
+            if kernel_null_vectors is not None:
+                null_vectors = jnp.asarray(
+                    kernel_null_vectors,
+                    dtype=solve_dtype,
+                )
+                if null_vectors.ndim == 1:
+                    null_vectors = null_vectors[None, :]
+                null_norm = jnp.linalg.norm(null_vectors, axis=1, keepdims=True)
+                normalized_null = jnp.where(
+                    null_norm > 0.0,
+                    null_vectors
+                    / jnp.maximum(
+                        null_norm,
+                        jnp.asarray(jnp.finfo(solve_dtype).tiny, dtype=solve_dtype),
+                    ),
+                    jnp.asarray(0.0, dtype=solve_dtype),
+                )
+                kernel = kernel + jnp.asarray(
+                    kernel_projector_scale,
+                    dtype=solve_dtype,
+                ) * (normalized_null.T @ normalized_null)
+            kernel = (kernel + kernel.T) / 2.0
+            kernel = kernel + damping_solve * jnp.eye(
+                sample_count,
+                dtype=solve_dtype,
+            )
+            rhs = jnp.concatenate(
+                [score_aug @ grad_solve for score_aug in score_chunks],
+                axis=0,
+            )
+            chol = jsp.linalg.cho_factor(kernel, lower=True)
+            alpha = jsp.linalg.cho_solve(chol, rhs)
+            projected = jnp.zeros_like(grad_solve)
+            start = 0
+            for score_aug, rows in zip(score_chunks, chunk_rows, strict=True):
+                stop = start + int(rows)
+                projected = projected + score_aug.T @ alpha[start:stop]
+                start = stop
+            direction = (grad_solve - projected) / damping_solve
+        direction = direction.astype(original_dtype)
+    return jnp.where(
+        jnp.all(jnp.isfinite(direction)),
+        direction,
+        jnp.zeros_like(direction),
     )
-    alpha = jnp.linalg.solve(kernel, rhs)
-    projected = jnp.zeros_like(grad_flat)
-    start = 0
-    for index, rows in enumerate(chunk_rows):
-        score_aug = score_aug_chunk(index)
-        stop = start + int(rows)
-        projected = projected + score_aug.T @ alpha[start:stop]
-        start = stop
-    return (grad_flat - projected) / damping
 
 
 def _save_batched_pool(
@@ -3699,8 +3591,218 @@ def _apply_updates(params, updates):
     return jax.tree.map(operator.add, params, updates)
 
 
-def _fidelity_loss(fidelity, eps: float):
-    return -jnp.log(jnp.maximum(fidelity, jnp.asarray(eps, dtype=fidelity.dtype)))
+def _regularized_action_gradient(
+    score,
+    ratio,
+    source_weight,
+    *,
+    reverse_kl_weight: float | jnp.ndarray,
+    eps: float | jnp.ndarray,
+):
+    """Return the PRL fidelity-minus-reverse-KL action-state gradient.
+
+    ``ratio`` is ``barPsi / Phi`` and ``score`` is
+    ``d log(barPsi) / d theta``.  Rescaling all ratios by their largest
+    magnitude prevents overflow without changing the fidelity, reverse KL, or
+    either gradient.
+    """
+    real_dtype = ratio.real.dtype
+    eps_array = jnp.asarray(eps, dtype=real_dtype)
+    finite_score = jnp.all(
+        jnp.isfinite(jnp.real(score)) & jnp.isfinite(jnp.imag(score)),
+        axis=1,
+    )
+    finite_ratio = jnp.isfinite(jnp.real(ratio)) & jnp.isfinite(jnp.imag(ratio))
+    finite_weight = jnp.isfinite(source_weight) & (source_weight >= 0.0)
+    valid = finite_score & finite_ratio & finite_weight
+    score = jnp.where(valid[:, None], score, jnp.asarray(0.0, dtype=score.dtype))
+    ratio = jnp.where(valid, ratio, jnp.asarray(0.0, dtype=ratio.dtype))
+    source_weight = jnp.where(
+        valid,
+        source_weight,
+        jnp.asarray(0.0, dtype=source_weight.dtype),
+    )
+    safe_weight_sum = jnp.maximum(jnp.sum(source_weight), eps_array)
+    phi_weight = source_weight / safe_weight_sum
+    max_ratio_abs = jnp.max(jnp.where(phi_weight > 0.0, jnp.abs(ratio), 0.0))
+    ratio_scale = jnp.where(
+        max_ratio_abs > 0.0,
+        max_ratio_abs,
+        jnp.asarray(1.0, dtype=real_dtype),
+    )
+    scaled_ratio = ratio / jax.lax.stop_gradient(ratio_scale)
+    ratio_abs2 = jnp.abs(scaled_ratio) ** 2
+    ratio_norm = jnp.sum(phi_weight * ratio_abs2)
+    safe_ratio_norm = jnp.maximum(ratio_norm, eps_array)
+    has_action_mass = jnp.isfinite(ratio_norm) & (ratio_norm > 0.0)
+    psi_weight = phi_weight * ratio_abs2 / safe_ratio_norm
+
+    score_mean = jnp.sum(psi_weight[:, None] * score, axis=0, keepdims=True)
+    centered_score = score - score_mean
+    amplitude = jnp.sum(phi_weight * scaled_ratio)
+    score_covariance = jnp.sum(
+        phi_weight[:, None] * scaled_ratio[:, None] * centered_score,
+        axis=0,
+    )
+    fidelity_gradient = 2.0 * jnp.real(
+        jnp.conj(amplitude) * score_covariance / safe_ratio_norm
+    )
+
+    log_ratio_abs2 = 2.0 * jnp.log(jnp.maximum(jnp.abs(scaled_ratio), eps_array))
+    log_ratio_mean = jnp.sum(psi_weight * log_ratio_abs2)
+    centered_log_ratio = log_ratio_abs2 - log_ratio_mean
+    reverse_kl_gradient = 2.0 * jnp.real(
+        jnp.sum(
+            psi_weight[:, None] * centered_score * centered_log_ratio[:, None],
+            axis=0,
+        )
+    )
+    combined_gradient = (
+        fidelity_gradient
+        - jnp.asarray(
+            reverse_kl_weight,
+            dtype=real_dtype,
+        )
+        * reverse_kl_gradient
+    )
+    reverse_kl = jnp.where(
+        has_action_mass,
+        jnp.maximum(
+            log_ratio_mean - jnp.log(safe_ratio_norm),
+            jnp.asarray(0.0, dtype=real_dtype),
+        ),
+        jnp.asarray(0.0, dtype=real_dtype),
+    )
+    fidelity = jnp.where(
+        has_action_mass,
+        jnp.clip(jnp.abs(amplitude) ** 2 / safe_ratio_norm, 0.0, 1.0),
+        jnp.asarray(0.0, dtype=real_dtype),
+    )
+    return (
+        combined_gradient,
+        fidelity_gradient,
+        reverse_kl_gradient,
+        psi_weight,
+        centered_score,
+        fidelity,
+        reverse_kl,
+    )
+
+
+def _spring_direction_chunked(
+    chunk_rows: tuple[int, ...],
+    score_aug_chunk,
+    grad_flat,
+    state: _SpringState,
+    *,
+    epsilon_scale: float | jnp.ndarray,
+    damping_floor: float | jnp.ndarray,
+    decay: float | jnp.ndarray,
+    qfi_trace=None,
+    kernel_null_vectors=None,
+):
+    """Solve the scale-invariant SPRING system and retain unscaled history.
+
+    Returns:
+        Unscaled direction, updated SPRING state, and absolute damping.
+    """
+    if qfi_trace is None:
+        qfi_trace = jnp.asarray(0.0, dtype=grad_flat.dtype)
+        for index in range(len(chunk_rows)):
+            score_aug = score_aug_chunk(index)
+            qfi_trace = qfi_trace + jnp.sum(score_aug**2)
+    parameter_count = jnp.asarray(max(int(grad_flat.shape[0]), 1), grad_flat.dtype)
+    mean_metric_diagonal = qfi_trace / parameter_count
+    damping = jnp.maximum(
+        jnp.asarray(epsilon_scale, dtype=grad_flat.dtype) * mean_metric_diagonal,
+        jnp.asarray(damping_floor, dtype=grad_flat.dtype),
+    )
+    rhs = (
+        grad_flat
+        + damping
+        * jnp.asarray(
+            decay,
+            dtype=grad_flat.dtype,
+        )
+        * state.previous_direction
+    )
+    direction = _solve_sr_direction_chunked(
+        chunk_rows,
+        score_aug_chunk,
+        rhs,
+        damping,
+        kernel_null_vectors=kernel_null_vectors,
+    )
+    valid_system = (
+        jnp.isfinite(qfi_trace)
+        & (qfi_trace > 0.0)
+        & jnp.isfinite(damping)
+        & jnp.all(jnp.isfinite(grad_flat))
+        & jnp.all(jnp.isfinite(state.previous_direction))
+        & jnp.all(jnp.isfinite(direction))
+    )
+    direction = jnp.where(valid_system, direction, jnp.zeros_like(direction))
+    return (
+        direction,
+        _SpringState(previous_direction=jax.lax.stop_gradient(direction)),
+        damping,
+    )
+
+
+def _scaled_direction_updates(
+    params,
+    direction,
+    *,
+    learning_rate: float,
+    max_norm: float | None,
+):
+    _, unravel_fn = ravel_pytree(params)
+    scale = jnp.asarray(learning_rate, dtype=direction.dtype)
+    if max_norm is not None:
+        update_norm = jnp.linalg.norm(direction)
+        scale = jnp.minimum(
+            scale,
+            jnp.asarray(max_norm, dtype=direction.dtype)
+            / (update_norm + jnp.asarray(1e-12, dtype=direction.dtype)),
+        )
+    return unravel_fn(scale * direction)
+
+
+def _regularized_loss(stats, reverse_kl_weight: float):
+    return (
+        1.0
+        - stats.fidelity
+        + jnp.asarray(
+            reverse_kl_weight,
+            dtype=stats.fidelity.dtype,
+        )
+        * stats.reverse_kl
+    )
+
+
+def _is_better_nqs_checkpoint(candidate, incumbent) -> bool:
+    """Compare held-out checkpoints, rejecting non-finite/invalid estimates.
+
+    Returns:
+        Whether the candidate should replace the incumbent.
+    """
+
+    def score(stats):
+        loss = float(jax.device_get(stats.loss))
+        fidelity = float(jax.device_get(stats.fidelity))
+        reverse_kl = float(jax.device_get(stats.reverse_kl))
+        invalid = float(jax.device_get(stats.invalid_sample_fraction))
+        finite = bool(np.all(np.isfinite((loss, fidelity, reverse_kl, invalid))))
+        valid = finite and invalid <= 0.0
+        return valid, -loss, fidelity, -reverse_kl
+
+    candidate_score = score(candidate)
+    incumbent_score = score(incumbent)
+    if not candidate_score[0]:
+        return False
+    if not incumbent_score[0]:
+        return True
+    return candidate_score[1:] > incumbent_score[1:]
 
 
 def _phase_angle(phase, dtype) -> jnp.ndarray:

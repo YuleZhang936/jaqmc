@@ -6,10 +6,15 @@ import numpy as np
 from jax import numpy as jnp
 
 from jaqmc.app.molecule.data import MoleculeData
-from jaqmc.app.molecule.lit_workflow import MolecularLITConfig, MoleculeLITWorkflow
+from jaqmc.app.molecule.lit_workflow import (
+    MolecularLITConfig,
+    MoleculeLITWorkflow,
+    _add_source_sums,
+)
 from jaqmc.data import BatchedData
 from jaqmc.response.nqs_lit import (
     MolecularResponseFermiNet,
+    NQSLITSourceSums,
     local_action_ratio,
     nqs_lit_double_sampled_stats,
     nqs_lit_source_sampled_stats,
@@ -99,12 +104,16 @@ def test_full_response_source_sampled_hydrogen_stats_are_finite():
 
     assert np.isfinite(float(stats.loss))
     assert 0.0 <= float(stats.fidelity) <= 1.0
+    assert np.isfinite(float(stats.reverse_kl))
+    assert float(stats.reverse_kl) >= 0.0
+    assert np.isfinite(float(stats.signed_lit))
     assert np.isfinite(float(stats.lit))
     assert float(stats.reweight_ess) > 0.0
     assert 0.0 < float(stats.reweight_ess_fraction) <= 1.0
     assert np.isfinite(float(stats.error_d))
     assert np.isfinite(float(stats.equation_relative_residual))
     assert float(stats.equation_relative_residual) >= 0.0
+    np.testing.assert_allclose(float(stats.invalid_sample_fraction), 0.0)
     assert np.isnan(float(stats.direct_hloc_rmse))
     assert np.isnan(float(stats.direct_hloc_std))
     assert np.isnan(float(stats.direct_hloc_sem))
@@ -192,6 +201,7 @@ def test_double_sampled_hydrogen_stats_reports_direct_estimator():
 
     assert int(stats.estimator_mode) == 1
     assert 0.0 <= float(stats.fidelity) <= 1.0
+    assert np.isfinite(float(stats.reverse_kl))
     assert float(stats.action_norm) >= 0.0
     assert np.isfinite(float(stats.equation_relative_residual))
     assert np.isfinite(float(stats.direct_hloc_rmse))
@@ -200,6 +210,76 @@ def test_double_sampled_hydrogen_stats_reports_direct_estimator():
     assert float(stats.direct_hloc_rmse) >= 0.0
     assert float(stats.direct_hloc_std) >= 0.0
     assert float(stats.direct_hloc_sem) >= 0.0
+
+
+def test_zero_action_mass_is_finite_and_marked_invalid():
+    real = jnp.asarray(0.0, dtype=jnp.float32)
+    complex_zero = jnp.asarray(0.0 + 0.0j, dtype=jnp.complex64)
+    sums = NQSLITSourceSums(
+        sample_count=jnp.asarray(3.0, dtype=jnp.float32),
+        weight_sum=jnp.asarray(3.0, dtype=jnp.float32),
+        valid_sample_count=jnp.asarray(3.0, dtype=jnp.float32),
+        ratio_scale=jnp.asarray(1.0, dtype=jnp.float32),
+        ratio_sum=complex_zero,
+        ratio_abs2_sum=real,
+        psi_weight_sum=real,
+        psi_weight_sq_sum=real,
+        psi_log_ratio_abs2_sum=real,
+        response_conj_over_source_sum=complex_zero,
+        response_over_source_abs2_sum=real,
+        hbar_over_source_sum=complex_zero,
+        hbar_over_source_abs2_sum=real,
+        ground_energy_sum=real,
+    )
+
+    stats = nqs_lit_stats_from_source_sums(
+        sums,
+        source_norm=1.0,
+        omega=0.2,
+        eta=0.05,
+    )
+
+    assert np.isfinite(float(stats.fidelity))
+    assert np.isfinite(float(stats.reverse_kl))
+    np.testing.assert_allclose(float(stats.fidelity), 0.0)
+    np.testing.assert_allclose(float(stats.reverse_kl), 0.0)
+    np.testing.assert_allclose(float(stats.invalid_sample_fraction), 1.0)
+
+
+def test_scale_aware_source_moments_survive_float32_dynamic_range():
+    def one_sample(scale):
+        real_zero = jnp.asarray(0.0, dtype=jnp.float32)
+        complex_zero = jnp.asarray(0.0 + 0.0j, dtype=jnp.complex64)
+        return NQSLITSourceSums(
+            sample_count=jnp.asarray(1.0, dtype=jnp.float32),
+            weight_sum=jnp.asarray(1.0, dtype=jnp.float32),
+            valid_sample_count=jnp.asarray(1.0, dtype=jnp.float32),
+            ratio_scale=jnp.asarray(scale, dtype=jnp.float32),
+            ratio_sum=jnp.asarray(1.0 + 0.0j, dtype=jnp.complex64),
+            ratio_abs2_sum=jnp.asarray(1.0, dtype=jnp.float32),
+            psi_weight_sum=jnp.asarray(1.0, dtype=jnp.float32),
+            psi_weight_sq_sum=jnp.asarray(1.0, dtype=jnp.float32),
+            psi_log_ratio_abs2_sum=real_zero,
+            response_conj_over_source_sum=complex_zero,
+            response_over_source_abs2_sum=real_zero,
+            hbar_over_source_sum=complex_zero,
+            hbar_over_source_abs2_sum=real_zero,
+            ground_energy_sum=real_zero,
+        )
+
+    sums = _add_source_sums(one_sample(1e30), one_sample(1e-30))
+    stats = nqs_lit_stats_from_source_sums(
+        sums,
+        source_norm=1.0,
+        omega=0.2,
+        eta=0.05,
+    )
+
+    assert np.isfinite(float(stats.fidelity))
+    assert np.isfinite(float(stats.reverse_kl))
+    assert np.isfinite(float(stats.reweight_ess))
+    np.testing.assert_allclose(float(stats.fidelity), 0.5, rtol=2e-6)
+    np.testing.assert_allclose(float(stats.reverse_kl), np.log(2.0), rtol=2e-6)
 
 
 def test_molecular_response_ferminet_returns_complex_logpsi():

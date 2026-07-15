@@ -25,27 +25,39 @@ jaqmc molecule lit --yml molecule_lit.yml \
 ```
 
 The command writes `lit_spectrum.npz` under `workflow.save_path`. The file
-contains the scan grid, LIT values, fidelity diagnostics, reweighting effective
-sample-size diagnostics, and peak-picking output.
+contains the scan grid, LIT values, fidelity, reverse-KL and reweighting
+effective-sample-size diagnostics, warm-start/continuation diagnostics,
+selected checkpoint iterations, and peak-picking output.
 
-On a multi-GPU node, the reference LIT configuration below uses
-`lit.scan_parallel=auto`. JaQMC splits the frequency grid into local worker
-processes, using one process per visible GPU by default for this setting. For
-single-axis scans, JaQMC prepares the ground energy, source normalization, and
-source-state pools once in the parent process, then passes those shared values
-to the workers so the expensive source sampling is not repeated per frequency
-block. Each frequency point starts from the same axis warm-started response
-parameters, so peak positions are not path-dependent on neighboring frequencies
-or worker block boundaries.
+The frequency scan is intentionally serial. After a negative-frequency warm
+start, JaQMC optimizes frequencies in strictly increasing order. At each point,
+it evaluates candidates on the fixed held-out source pool and passes the best
+parameters—not necessarily the final iteration—to the next frequency. The
+SPRING history is reset at each new frequency because it belongs to the local
+optimization problem and may not match an earlier selected checkpoint.
 
-For a shared-filesystem cluster, set `lit.scan_parallel=distributed` and pass
-`lit.scan_parallel_remote_hosts` as entries of the form `PORT@HOST:DEVICES`,
-for example `10234@fdbd:dc03:16:340::210:0-7`. The final colon separates the
-GPU list, so IPv6 host addresses are supported. The coordinator still writes a
-single `parallel_scan` directory and the usual merged `lit_spectrum.npz`; it
-launches one worker process per remote GPU slot through SSH. Use
-`lit.scan_parallel_remote_root` and `lit.scan_parallel_remote_python` when the
-remote repository path or Python executable differ from the coordinator.
+The negative warm start is not allowed to jump directly to a distant positive
+window. JaQMC inserts an adaptive, unreported bridge before the first spectrum
+point. If a state solves the equation at `omega`, its inherited relative
+residual at `omega + delta` is approximately
+`|delta| * sqrt(L / source_norm)`. The default bounds this by `0.2`, matching
+the visible `delta_omega / Gamma = 2/10` grid ratio in the nuclear calculation,
+then checks inherited fidelity on the held-out pool and bisects a proposed step
+when needed. The nuclear article does not publish its hidden `-100` to `200 MeV`
+transfer grid; this adaptive rule makes that missing engineering choice explicit
+without pretending that one large jump is frequency continuation.
+
+Frequency blocks, local multi-GPU workers, and remote worker blocks are rejected:
+they break this predecessor chain at block boundaries. Use
+`lit.scan_parallel=off`. Source-pool evaluation can still be vectorized by JAX,
+but one global response-parameter chain is maintained.
+
+The published stabilization objective is
+`fidelity - lambda * KL(pi_action || pi_source)`. The defaults use
+`lambda=1`, scale-invariant SPRING damping
+`epsilon=1e-3 * mean(diag(S))`, and a configurable SPRING decay. The nuclear
+LIT article does not report the decay value; the default `0.99` comes from the
+general SPRING reference rather than from that LIT calculation.
 
 ## End-To-End H Atom Reference
 
@@ -179,11 +191,7 @@ lit:
   peak_min_height_fraction: 0.02
   preview_roots: 8
 
-  scan_parallel: auto
-  scan_parallel_workers: 0
-  scan_parallel_procs_per_device: 1
-  scan_parallel_min_points_per_worker: 2
-  scan_parallel_compile_gate_timeout: 1800.0
+  scan_parallel: "off"
 
   nqs_allow_untrained_ground: false
   nqs_ground_energy: null
@@ -203,29 +211,36 @@ lit:
   nqs_reuse_source_pool: true
   nqs_save_source_pool: true
 
-  # Fall back to direct pi_Psi sampling when source-pool reweighting ESS collapses.
-  # The large source pool is evaluated in chunks to keep device memory bounded.
-  # Once a frequency point triggers the fallback, optimization and final
-  # diagnostics stay on the direct estimator for that point.
-  nqs_reweight_ess_fraction_min: 0.05
+  # Zero selects the published source-pool importance-reweighting protocol.
+  # A positive threshold enables JaQMC's optional direct-action fallback.
+  nqs_reweight_ess_fraction_min: 0.0
   nqs_direct_psi_train: false
   nqs_direct_psi_burn_in: 5
   nqs_direct_psi_batches: 1
   nqs_direct_psi_train_batches: null
   nqs_direct_psi_eval_batches: null
   nqs_direct_psi_stride: 1
-  # Engineering controls only: the source-first ESS fallback decision is unchanged.
-  # Parallel workers share source data but isolate XLA autotune caches per worker.
+  # Engineering controls for the optional direct-action fallback.
   nqs_direct_psi_precompile: true
   nqs_direct_psi_persistent_sampler: true
 
   nqs_learning_rate: 0.005
-  nqs_sr_damping: 0.01
+  nqs_reverse_kl_weight: 1.0
+  nqs_spring_epsilon: 0.001
+  nqs_spring_decay: 0.99
+  nqs_spring_damping_floor: 1.0e-12
   nqs_sr_max_norm: 0.05
   nqs_sr_score_eps: 1.0e-10
   nqs_warm_start_omega: -3.674932217565499
   nqs_warm_start_iterations: 800
+  nqs_continuation_iterations: 800
+  nqs_continuation_step_fraction: 0.2
+  nqs_continuation_fidelity_retention: 0.95
+  # null uses min(0.2 * eta, the reported spectrum spacing).
+  nqs_continuation_min_step: null
+  nqs_continuation_max_points: 256
   nqs_iterations: 2000
+  nqs_selection_interval: 100
   nqs_log_interval: 100
 
   nqs_response_ndets: 8

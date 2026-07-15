@@ -38,10 +38,8 @@ lit:
   output_filename: lit_spectrum.npz
   peak_min_height_fraction: 0.02
   preview_roots: 12
-  scan_parallel: auto
-  scan_parallel_workers: 0
-  scan_parallel_procs_per_device: 1
-  scan_parallel_min_points_per_worker: 1
+  # The published transfer-learning protocol is one global predecessor chain.
+  scan_parallel: "off"
 
   nqs_allow_untrained_ground: false
   nqs_ground_energy: null
@@ -61,8 +59,9 @@ lit:
   nqs_source_pool_dir: ''
   nqs_reuse_source_pool: true
   nqs_save_source_pool: true
-  nqs_reweight_ess_fraction_min: 0.10
-  nqs_direct_psi_train: true
+  # The PRL uses pi_Phi samples with action-state importance reweighting.
+  nqs_reweight_ess_fraction_min: 0.0
+  nqs_direct_psi_train: false
   nqs_direct_psi_burn_in: 10
   nqs_direct_psi_batches: 1
   nqs_direct_psi_train_batches: 2
@@ -70,12 +69,26 @@ lit:
   nqs_direct_psi_stride: 2
 
   nqs_learning_rate: 0.002
-  nqs_sr_damping: 0.03
+  nqs_reverse_kl_weight: 1.0
+  nqs_spring_epsilon: 0.001
+  # The LIT PRL does not report mu; 0.99 is the general SPRING default.
+  nqs_spring_decay: 0.99
+  nqs_spring_damping_floor: 1.0e-12
   nqs_sr_max_norm: 0.02
   nqs_sr_score_eps: 1.0e-10
   nqs_warm_start_omega: -3.674932217565499
   nqs_warm_start_iterations: 1500
+  # The paper does not publish its hidden transfer grid.  Bridge adaptively
+  # using |delta omega| sqrt(L / ||Phi||^2) <= 0.2, then verify on held-out
+  # samples and bisect any step whose inherited fidelity drops too far.
+  nqs_continuation_iterations: 1500
+  nqs_continuation_step_fraction: 0.2
+  nqs_continuation_fidelity_retention: 0.95
+  # null -> min(0.2 * eta, the reported spectrum spacing) = 0.00025 Ha.
+  nqs_continuation_min_step: null
+  nqs_continuation_max_points: 256
   nqs_iterations: 6000
+  nqs_selection_interval: 100
   nqs_log_interval: 100
 
   nqs_response_ndets: 16
