@@ -20,6 +20,11 @@ from jaqmc.estimator.total_energy import TotalEnergy
 from jaqmc.optimizer.kfac import KFACOptimizer
 from jaqmc.optimizer.optax import adam
 from jaqmc.sampler.mcmc import MCMCSampler
+from jaqmc.sampler.symmetry import (
+    make_haar_orthogonal_proposal,
+    make_linear_haar_proposal,
+    make_symmetry_mixture_proposal,
+)
 from jaqmc.utils.atomic import (
     MolecularSCF,
     ResolvedPseudopotentialConfig,
@@ -34,6 +39,14 @@ from jaqmc.workflow.stage.evaluation import EvaluationWorkStage
 from jaqmc.workflow.stage.vmc import VMCWorkStage
 from jaqmc.workflow.vmc import VMCWorkflow
 
+from .ground_symmetry_training import (
+    GroundSymmetryConfig,
+    GroundSymmetryRuntime,
+    GroundSymmetryVMCWorkStage,
+    build_ground_symmetry_specification,
+    stage_settings,
+    validate_ground_symmetry_batching,
+)
 from .hamiltonian import potential_energy
 from .wavefunction import MoleculeWavefunction
 
@@ -67,6 +80,83 @@ class MoleculeTrainWorkflow(VMCWorkflow):
         self.scf = make_scf(system_config)
         self.data_init = partial(data_init, system_config)
         sampler = cfg.get("sampler", MCMCSampler)
+        ground_symmetry_config = cfg.get(
+            "ground_symmetry",
+            GroundSymmetryConfig,
+        )
+        ground_symmetry_runtime = None
+        if ground_symmetry_config.enabled:
+            atoms = np.asarray([atom.coords for atom in system_config.atoms])
+            charges = np.asarray([atom.charge for atom in system_config.atoms])
+            specification = build_ground_symmetry_specification(
+                atoms,
+                charges,
+                ground_symmetry_config,
+            )
+            if specification.is_trivial:
+                logger.info(
+                    "Ground symmetry enabled but geometry is C1; using the exact "
+                    "zero-overhead ordinary VMC path."
+                )
+            else:
+                validate_ground_symmetry_batching(
+                    ground_symmetry_config,
+                    self.config.batch_size,
+                )
+                ground_symmetry_runtime = GroundSymmetryRuntime(
+                    phase_logpsi=wf.phase_logpsi,
+                    specification=specification,
+                    config=ground_symmetry_config,
+                )
+                if ground_symmetry_config.global_mcmc_enabled and not isinstance(
+                    sampler, MCMCSampler
+                ):
+                    raise TypeError(
+                        "ground_symmetry requires MCMCSampler for symmetry-orbit "
+                        f"moves, got {type(sampler).__name__}."
+                    )
+                if ground_symmetry_config.global_mcmc_enabled:
+                    if specification.label.startswith("atom_"):
+                        sampler.global_sampling_proposal = (
+                            make_haar_orthogonal_proposal(
+                                specification.center,
+                                include_improper=True,
+                            )
+                        )
+                    elif specification.label.startswith("linear_"):
+                        centered_atoms = atoms - np.asarray(specification.center)
+                        _, _, right_singular_vectors = np.linalg.svd(
+                            centered_atoms,
+                            full_matrices=False,
+                        )
+                        sampler.global_sampling_proposal = make_linear_haar_proposal(
+                            right_singular_vectors[0],
+                            specification.center,
+                            allow_axis_reversal=specification.label.startswith(
+                                "linear_D"
+                            ),
+                        )
+                    else:
+                        sampler.global_sampling_proposal = (
+                            make_symmetry_mixture_proposal(
+                                specification.finite_group_operations,
+                                specification.center,
+                                1.0,
+                                tolerance=ground_symmetry_config.geometry_tolerance,
+                            )
+                        )
+                    sampler.global_proposal_interval = (
+                        ground_symmetry_config.mcmc_global_step_interval
+                    )
+                logger.info(
+                    "Ground symmetry sector=%s training_operations=%d "
+                    "finite_group_order=%d updates=%s global_mcmc=%s",
+                    specification.label,
+                    len(specification.operations),
+                    len(specification.finite_group_operations),
+                    ground_symmetry_config.updates_enabled,
+                    ground_symmetry_config.global_mcmc_enabled,
+                )
 
         pretrain_loss = make_pretrain_loss(
             orbitals_fn=wf.orbitals, scf=self.scf, nspins=nspins, full_det=wf.full_det
@@ -79,7 +169,17 @@ class MoleculeTrainWorkflow(VMCWorkflow):
         pretrain.configure_sample_plan(pretrain_f_log_amplitude, {"electrons": sampler})
         pretrain.configure_optimizer(default=adam, f_log_psi=wf.logpsi)
         pretrain.configure_estimators(grads=pretrain_loss)
-        self.pretrain_stage = pretrain.build()
+        pretrain_stage = pretrain.build()
+        if (
+            ground_symmetry_runtime is not None
+            and ground_symmetry_config.pretrain_enabled
+        ):
+            pretrain_stage = GroundSymmetryVMCWorkStage.from_stage(
+                pretrain_stage,
+                ground_symmetry_runtime,
+                stage_settings(ground_symmetry_config, pretrain=True),
+            )
+        self.pretrain_stage = pretrain_stage
 
         train = VMCWorkStage.builder(cfg.scoped("train"), wf)
         train.configure_sample_plan(wf.logpsi, {"electrons": sampler})
@@ -89,7 +189,14 @@ class MoleculeTrainWorkflow(VMCWorkflow):
         )
         train.configure_estimators(**estimators)
         train.configure_loss_grads(f_log_psi=wf.logpsi)
-        self.train_stage = train.build()
+        train_stage = train.build()
+        if ground_symmetry_runtime is not None:
+            train_stage = GroundSymmetryVMCWorkStage.from_stage(
+                train_stage,
+                ground_symmetry_runtime,
+                stage_settings(ground_symmetry_config, pretrain=False),
+            )
+        self.train_stage = train_stage
 
     def run(self) -> None:
         self.scf.run()
@@ -102,6 +209,9 @@ class MoleculeEvalWorkflow(EvaluationWorkflow):
     def __init__(self, cfg: ConfigManager) -> None:
         super().__init__(cfg)
         system_config, wf = configure_system(cfg)
+        # Training configs are commonly reused for evaluation.  Consume the
+        # training-only block so strict unused-key validation remains useful.
+        cfg.get("ground_symmetry", GroundSymmetryConfig)
 
         self.data_init = partial(data_init, system_config)
         scf = make_scf(system_config)

@@ -74,6 +74,8 @@ class MCMCSampler(SamplerLike[MCMCState]):
     adapt_frequency: int = 100
     pmove_range: tuple[float, float] = (0.5, 0.55)
     sampling_proposal: SamplingProposal = runtime_dep(default=gaussian_proposal)
+    global_sampling_proposal: SamplingProposal | None = runtime_dep(default=None)
+    global_proposal_interval: int = runtime_dep(default=1)
 
     def init(self, data, rngs):
         """Initialize adaptive Metropolis-Hastings sampler state.
@@ -101,6 +103,7 @@ class MCMCSampler(SamplerLike[MCMCState]):
         log_prob_1: jnp.ndarray,
         num_accepts: jnp.ndarray,
         stddev: float | jnp.ndarray = 0.02,
+        proposal: SamplingProposal | None = None,
     ) -> tuple[StateT, PRNGKey, jnp.ndarray, jnp.ndarray]:
         """Performs one Metropolis-Hastings step using an all-electron move.
 
@@ -111,6 +114,8 @@ class MCMCSampler(SamplerLike[MCMCState]):
             log_prob_1: Log probability of f evaluated at x1.
             num_accepts: Number of MH move proposals accepted.
             stddev: Width of Gaussian move proposal.
+            proposal: Optional proposal override. Defaults to the sampler's
+                ordinary local proposal.
 
         Returns:
             (x, rngs, log_prob, num_accepts), where:
@@ -123,7 +128,8 @@ class MCMCSampler(SamplerLike[MCMCState]):
             StateT: PyTree state/data type for the proposed and accepted samples.
         """
         rng_new, rng_sample, rng_cond = jax.random.split(rngs, 3)
-        x2 = self.sampling_proposal(rng_sample, x1, stddev)
+        proposal = self.sampling_proposal if proposal is None else proposal
+        x2 = proposal(rng_sample, x1, stddev)
         log_prob_2 = batch_log_prob(x2).real
         ratio = log_prob_2 - log_prob_1
 
@@ -167,7 +173,7 @@ class MCMCSampler(SamplerLike[MCMCState]):
                 f"log_amplitude should return a scalar, got shape {logprob.shape[1:]}."
             )
         num_accepts = parallel_jax.pvary(jnp.array(0.0))
-        data, _, _, num_accepts = lax.fori_loop(
+        data, remaining_rngs, logprob, num_accepts = lax.fori_loop(
             0,
             self.steps,
             lambda _, x: self._mh_update(batch_log_prob, *x, stddev=state.stddev),  # type: ignore
@@ -175,6 +181,49 @@ class MCMCSampler(SamplerLike[MCMCState]):
         )
         pmove = jnp.sum(num_accepts) / (self.steps * logprob.shape[0])
         pmove = parallel_jax.pmean(pmove)
+
+        symmetry_pmove = None
+        if self.global_sampling_proposal is not None:
+            if self.global_proposal_interval < 1:
+                raise ValueError("global_proposal_interval must be positive.")
+
+            def global_move(args):
+                current_data, current_rngs, current_logprob = args
+                # The accepted-condition sum below is varying by construction.
+                # Avoid an explicit pcast here: this branch is traced by
+                # ``lax.cond`` even in direct single-device unit tests, where no
+                # shard-map axis is bound yet.
+                initial_accepts = jnp.array(0.0)
+                moved, next_rngs, moved_logprob, accepts = self._mh_update(
+                    batch_log_prob,
+                    current_data,
+                    current_rngs,
+                    current_logprob,
+                    initial_accepts,
+                    stddev=state.stddev,
+                    proposal=self.global_sampling_proposal,
+                )
+                acceptance = parallel_jax.pmean(
+                    jnp.sum(accepts) / current_logprob.shape[0]
+                )
+                return moved, next_rngs, moved_logprob, acceptance
+
+            def skip_global_move(args):
+                current_data, current_rngs, current_logprob = args
+                return (
+                    current_data,
+                    current_rngs,
+                    current_logprob,
+                    jnp.asarray(0.0, dtype=logprob.dtype),
+                )
+
+            run_global = (state.counter + 1) % self.global_proposal_interval == 0
+            data, _, _, symmetry_pmove = lax.cond(
+                run_global,
+                global_move,
+                skip_global_move,
+                (data, remaining_rngs, logprob),
+            )
 
         # Adaptive MCMC move width
         stddev, pmoves, counter = state
@@ -191,4 +240,8 @@ class MCMCSampler(SamplerLike[MCMCState]):
             stddev,
         )
         new_state = MCMCState(counter=counter, pmoves=pmoves, stddev=stddev)
-        return data, {"pmove": pmove}, new_state
+        stats = {"pmove": pmove}
+        if symmetry_pmove is not None:
+            stats["symmetry_pmove"] = symmetry_pmove
+            stats["symmetry_move_active"] = run_global.astype(logprob.dtype)
+        return data, stats, new_state

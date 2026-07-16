@@ -68,6 +68,8 @@ class NQSLITStats(NamedTuple):
     direct_hloc_rmse: jnp.ndarray
     direct_hloc_std: jnp.ndarray
     direct_hloc_sem: jnp.ndarray
+    source_covariance_loss: jnp.ndarray
+    source_covariance_max_loss: jnp.ndarray
 
 
 class NQSLITSourceSums(NamedTuple):
@@ -141,6 +143,59 @@ class MolecularResponseFermiNet(nn.Module):
         return self.logdet_layer(orbitals)["logpsi"]
 
 
+class MolecularVectorResponseFermiNet(nn.Module):
+    """Three-component complex FermiNet response in Cartesian axis order.
+
+    The feature layer, FermiNet backbone, and envelope are evaluated once and
+    shared by the ``x``, ``y``, and ``z`` response components.  A single
+    vector-valued orbital projection supplies independent complex determinant
+    heads for the three components.
+    """
+
+    nspins: tuple[int, int]
+    ndets: int = 16
+    hidden_dims_single: tuple[int, ...] = (256, 256, 256, 256)
+    hidden_dims_double: tuple[int, ...] = (32, 32, 32, 32)
+    use_last_layer: bool = False
+    envelope: EnvelopeType = EnvelopeType.abs_isotropic
+    orbitals_spin_split: bool = True
+
+    def setup(self) -> None:
+        self.feature_layer = MoleculeFeatures()
+        hidden_dims = list(zip(self.hidden_dims_single, self.hidden_dims_double))
+        self.backbone_layer = FermiLayers(
+            self.nspins,
+            hidden_dims,
+            use_last_layer=self.use_last_layer,
+        )
+        self.orbital_layer = _ComplexVectorOrbitalProjection(
+            nspins=self.nspins,
+            ndets=self.ndets,
+            orbitals_spin_split=self.orbitals_spin_split,
+            use_bias=False,
+        )
+        self.envelope_layer = Envelope(
+            envelope_type=self.envelope,
+            ndets=self.ndets,
+            nspins=self.nspins,
+            orbitals_spin_split=self.orbitals_spin_split,
+        )
+
+    def __call__(self, data: MoleculeData) -> jnp.ndarray:
+        embedding = self.feature_layer(data.electrons, data.atoms)
+        h_one, _ = self.backbone_layer(
+            embedding["ae_features"],
+            embedding["ee_features"],
+        )
+        orbitals = self.orbital_layer(h_one)
+        envelope = self.envelope_layer(
+            embedding["ae_vec"],
+            embedding["r_ae"],
+        )
+        orbitals = orbitals * envelope[None, ...]
+        return _complex_logdet_sum(orbitals)
+
+
 class _ComplexOrbitalProjection(nn.Module):
     """Project FermiNet electron features to complex orbital matrices."""
 
@@ -160,6 +215,122 @@ class _ComplexOrbitalProjection(nn.Module):
             orbitals = nn.DenseGeneral(features, use_bias=self.use_bias)(h_one)
         orbitals = jnp.transpose(orbitals, (1, 0, 2, 3))
         return orbitals[..., 0] + 1j * orbitals[..., 1]
+
+
+class _ComplexVectorOrbitalProjection(nn.Module):
+    """Project electron features to three complex orbital-matrix heads."""
+
+    nspins: tuple[int, int]
+    ndets: int
+    orbitals_spin_split: bool = True
+    use_bias: bool = False
+
+    @nn.compact
+    def __call__(self, h_one: jnp.ndarray) -> jnp.ndarray:
+        n_electrons = sum(self.nspins)
+        features = [3, self.ndets, n_electrons, 2]
+        active_spins = [spin for spin in self.nspins if spin > 0]
+        if self.orbitals_spin_split and len(active_spins) > 1:
+            orbitals = SplitChannelDense(self.nspins, features, self.use_bias)(h_one)
+        else:
+            orbitals = nn.DenseGeneral(features, use_bias=self.use_bias)(h_one)
+        orbitals = jnp.transpose(orbitals, (1, 2, 0, 3, 4))
+        return orbitals[..., 0] + 1j * orbitals[..., 1]
+
+
+def _complex_logdet_sum(orbitals: jnp.ndarray) -> jnp.ndarray:
+    """Return one complex log determinant sum per leading component."""
+    signs, logdets = jnp.linalg.slogdet(orbitals)
+    logmax = jnp.max(logdets, axis=-1)
+    determinant_sum = jnp.sum(
+        signs * jnp.exp(logdets - logmax[..., None]),
+        axis=-1,
+    )
+    return jnp.log(determinant_sum) + logmax
+
+
+def source_aligned_vector_logpsi(
+    raw_logpsi: jnp.ndarray,
+    ground_logpsi: jnp.ndarray,
+    dipole: jnp.ndarray,
+    source_center: float | jnp.ndarray,
+    source_coefficient: complex | jnp.ndarray,
+    residual_log_scale: float | jnp.ndarray,
+) -> jnp.ndarray:
+    r"""Stably combine a dipole source with a vector neural residual.
+
+    This evaluates the three Cartesian components
+
+    .. math::
+
+        \Psi_a = c\,(D_a-D_{0,a})\,\Psi_0
+                 + \exp(\ell_s)\,\Psi_{\mathrm{raw},a}
+
+    directly in a common, component-wise log scale.  The returned value is a
+    complex logarithm with shape broadcast from ``raw_logpsi`` and ``dipole``.
+    A differentiable numerical floor keeps exact zeros finite; away from that
+    tiny floor the complex phase and amplitude reproduce the direct sum.
+    """
+    complex_dtype = jnp.result_type(
+        raw_logpsi,
+        ground_logpsi,
+        source_coefficient,
+        jnp.complex64,
+    )
+    raw_log = jnp.asarray(raw_logpsi, dtype=complex_dtype)
+    ground_log = jnp.asarray(ground_logpsi, dtype=complex_dtype)
+    coefficient = jnp.asarray(source_coefficient, dtype=complex_dtype)
+    residual_log = raw_log + jnp.asarray(residual_log_scale, dtype=complex_dtype)
+    real_dtype = jnp.real(raw_log).dtype
+    centered_dipole = jnp.asarray(dipole, dtype=real_dtype) - jnp.asarray(
+        source_center,
+        dtype=real_dtype,
+    )
+    source_factor = coefficient * centered_dipole
+
+    # The shared scale bounds the residual exponential and the source
+    # exponential multiplied by a smoothly floored source magnitude.  Keeping
+    # the source term itself branch-free at ``D-D0 == 0`` is essential:
+    # ``local_action_ratio`` differentiates this log amplitude twice, and a
+    # ``where`` that replaces the ground exponent at an exact source zero would
+    # silently discard the source derivative (and make its Hessian singular).
+    amplitude_floor = jnp.sqrt(jnp.asarray(jnp.finfo(real_dtype).tiny))
+    floor_sq = amplitude_floor**2
+    source_abs_sq = jnp.real(source_factor) ** 2 + jnp.imag(source_factor) ** 2
+    safe_source_abs_sq = source_abs_sq + floor_sq
+    source_log_magnitude = jnp.real(ground_log) + 0.5 * jnp.log(safe_source_abs_sq)
+    residual_log_magnitude = jnp.real(residual_log)
+    common_log_scale = jnp.maximum(source_log_magnitude, residual_log_magnitude)
+    common_log_scale = jnp.where(
+        jnp.isfinite(common_log_scale),
+        common_log_scale,
+        jnp.asarray(0.0, dtype=real_dtype),
+    )
+    # This scale is a pure numerical gauge: it cancels algebraically from the
+    # returned complex logarithm.  Stopping its derivative avoids undefined
+    # second-order AD from the max/log scale selection at an exact source zero
+    # without changing the derivative of the represented wavefunction.
+    common_log_scale = jax.lax.stop_gradient(common_log_scale)
+
+    source_exponent = (ground_log - common_log_scale).astype(complex_dtype)
+    source_scaled = source_factor * jnp.exp(source_exponent)
+    residual_scaled = jnp.exp(residual_log - common_log_scale)
+    combined_scaled = source_scaled + residual_scaled
+
+    combined_real = jnp.real(combined_scaled)
+    combined_imag = jnp.imag(combined_scaled)
+    combined_abs_sq = combined_real**2 + combined_imag**2
+    is_numerical_zero = combined_abs_sq <= floor_sq
+    safe_abs_sq = jnp.where(is_numerical_zero, floor_sq, combined_abs_sq)
+    safe_real = jnp.where(is_numerical_zero, amplitude_floor, combined_real)
+    safe_imag = jnp.where(
+        is_numerical_zero,
+        jnp.asarray(0.0, dtype=real_dtype),
+        combined_imag,
+    )
+    log_amplitude = common_log_scale + 0.5 * jnp.log(safe_abs_sq)
+    phase = jnp.arctan2(safe_imag, safe_real)
+    return log_amplitude + 1j * phase
 
 
 def molecular_electronic_dipole(data: MoleculeData, axis: int) -> jnp.ndarray:
@@ -549,6 +720,8 @@ def nqs_lit_stats_from_source_sums(
         direct_hloc_rmse=nan_real,
         direct_hloc_std=nan_real,
         direct_hloc_sem=nan_real,
+        source_covariance_loss=jnp.asarray(0.0, dtype=real_dtype),
+        source_covariance_max_loss=jnp.asarray(0.0, dtype=real_dtype),
     )
 
 

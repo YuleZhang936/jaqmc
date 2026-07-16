@@ -14,6 +14,7 @@ from jaqmc.app.molecule.lit_workflow import (
 from jaqmc.data import BatchedData
 from jaqmc.response.nqs_lit import (
     MolecularResponseFermiNet,
+    MolecularVectorResponseFermiNet,
     NQSLITSourceSums,
     local_action_ratio,
     nqs_lit_double_sampled_stats,
@@ -21,6 +22,7 @@ from jaqmc.response.nqs_lit import (
     nqs_lit_source_sampled_sums,
     nqs_lit_stats_from_source_sums,
     restore_params_from_checkpoint,
+    source_aligned_vector_logpsi,
 )
 from jaqmc.utils.checkpoint import NumPyCheckpointManager
 
@@ -301,6 +303,158 @@ def test_molecular_response_ferminet_returns_complex_logpsi():
     assert jnp.iscomplexobj(value)
     assert np.isfinite(float(jnp.real(value)))
     assert np.isfinite(float(jnp.imag(value)))
+
+
+def test_molecular_vector_response_ferminet_returns_three_complex_components():
+    batch = _h_batch()
+    data = MoleculeData(
+        electrons=batch.data.electrons[0],
+        atoms=batch.data.atoms,
+        charges=batch.data.charges,
+    )
+    response = MolecularVectorResponseFermiNet(
+        nspins=(1, 0),
+        ndets=2,
+        hidden_dims_single=(4,),
+        hidden_dims_double=(2,),
+    )
+    params = response.init(jax.random.PRNGKey(2), batch.unbatched_example())
+    value = response.apply(params, data)
+
+    assert value.shape == (3,)
+    assert jnp.iscomplexobj(value)
+    assert np.all(np.isfinite(np.asarray(value)))
+
+
+def test_source_aligned_vector_logpsi_is_source_dominated_at_initialization():
+    raw_logpsi = jnp.asarray(
+        [0.2 + 0.3j, -0.4 - 0.1j, 0.1 + 0.7j],
+        dtype=jnp.complex64,
+    )
+    ground_logpsi = jnp.asarray(-0.6 + 0.4j, dtype=jnp.complex64)
+    dipole = jnp.asarray([0.5, -0.3, 0.8], dtype=jnp.float32)
+    source_center = jnp.asarray([0.1, 0.05, -0.2], dtype=jnp.float32)
+    coefficient = jnp.asarray(1.2 - 0.35j, dtype=jnp.complex64)
+    residual_log_scale = jnp.asarray(-18.0, dtype=jnp.float32)
+
+    result = source_aligned_vector_logpsi(
+        raw_logpsi,
+        ground_logpsi,
+        dipole,
+        source_center,
+        coefficient,
+        residual_log_scale,
+    )
+    source = coefficient * (dipole - source_center) * jnp.exp(ground_logpsi)
+    expected = source + jnp.exp(raw_logpsi + residual_log_scale)
+
+    assert result.shape == (3,)
+    np.testing.assert_allclose(
+        np.asarray(jnp.exp(result)),
+        np.asarray(expected),
+        rtol=3e-6,
+        atol=3e-7,
+    )
+    np.testing.assert_allclose(
+        np.asarray(jnp.exp(result)),
+        np.asarray(source),
+        rtol=3e-6,
+        atol=3e-7,
+    )
+
+
+def test_source_aligned_vector_logpsi_exact_zero_is_finite():
+    result = source_aligned_vector_logpsi(
+        jnp.full((3,), -jnp.inf + 0.0j, dtype=jnp.complex64),
+        jnp.asarray(0.2 + 0.4j, dtype=jnp.complex64),
+        jnp.asarray([0.2, -0.1, 0.7], dtype=jnp.float32),
+        jnp.asarray([0.2, -0.1, 0.7], dtype=jnp.float32),
+        jnp.asarray(1.0 + 0.5j, dtype=jnp.complex64),
+        jnp.asarray(0.0, dtype=jnp.float32),
+    )
+
+    assert result.shape == (3,)
+    assert np.all(np.isfinite(np.asarray(result)))
+
+
+def test_source_aligned_vector_logpsi_keeps_source_hessian_at_source_zero():
+    """An exact dipole zero must not detach the source term from coordinate AD."""
+
+    def log_amplitude(coordinate):
+        result = source_aligned_vector_logpsi(
+            jnp.zeros(3, dtype=jnp.complex64),
+            jnp.asarray(2.0 + 0.0j, dtype=jnp.complex64),
+            jnp.asarray([coordinate, 0.3, -0.4], dtype=jnp.float32),
+            jnp.zeros(3, dtype=jnp.float32),
+            jnp.asarray(1.0 + 0.0j, dtype=jnp.complex64),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        return jnp.real(result[0])
+
+    coordinate = jnp.asarray(0.0, dtype=jnp.float32)
+    first = jax.grad(log_amplitude)(coordinate)
+    second = jax.grad(jax.grad(log_amplitude))(coordinate)
+
+    np.testing.assert_allclose(float(first), np.exp(2.0), rtol=2e-6)
+    np.testing.assert_allclose(float(second), -np.exp(4.0), rtol=2e-6)
+
+
+def test_source_aligned_vector_response_has_finite_derivatives():
+    batch = _h_batch()
+    data = MoleculeData(
+        electrons=jnp.asarray([[0.2, -0.1, 0.4]], dtype=jnp.float32),
+        atoms=batch.data.atoms,
+        charges=batch.data.charges,
+    )
+    response = MolecularVectorResponseFermiNet(
+        nspins=(1, 0),
+        ndets=1,
+        hidden_dims_single=(2,),
+        hidden_dims_double=(1,),
+    )
+    params = response.init(jax.random.PRNGKey(3), data)
+    direction = jax.tree.map(
+        lambda leaf: jnp.ones_like(leaf) / max(1, leaf.size),
+        params,
+    )
+    flat_electrons = jnp.ravel(data.electrons)
+
+    def scalar_response(parameter_step, electrons_flat):
+        local_params = jax.tree.map(
+            lambda leaf, tangent: leaf + parameter_step * tangent,
+            params,
+            direction,
+        )
+        electrons = jnp.reshape(electrons_flat, data.electrons.shape)
+        local_data = data.merge({"electrons": electrons})
+        raw_logpsi = response.apply(local_params, local_data)
+        ground_logpsi = -0.4 * jnp.sum(electrons**2) + 0.1j * jnp.sum(electrons)
+        dipole = -jnp.sum(electrons, axis=0)
+        aligned = source_aligned_vector_logpsi(
+            raw_logpsi,
+            ground_logpsi,
+            dipole,
+            jnp.zeros(3, dtype=electrons.dtype),
+            jnp.asarray(1.0 + 0.2j, dtype=jnp.complex64),
+            jnp.asarray(-8.0, dtype=electrons.dtype),
+        )
+        return jnp.sum(jnp.real(aligned)) + 0.2 * jnp.sum(jnp.imag(aligned))
+
+    def parameter_function(step):
+        return scalar_response(step, flat_electrons)
+
+    def coordinate_function(electrons):
+        return scalar_response(0.0, electrons)
+
+    parameter_first = jax.grad(parameter_function)(jnp.asarray(0.0))
+    parameter_second = jax.grad(jax.grad(parameter_function))(jnp.asarray(0.0))
+    coordinate_first = jax.grad(coordinate_function)(flat_electrons)
+    coordinate_second = jax.hessian(coordinate_function)(flat_electrons)
+
+    assert np.isfinite(float(parameter_first))
+    assert np.isfinite(float(parameter_second))
+    assert np.all(np.isfinite(np.asarray(coordinate_first)))
+    assert np.all(np.isfinite(np.asarray(coordinate_second)))
 
 
 def test_restore_params_from_stage_checkpoint(tmp_path):

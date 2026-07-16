@@ -14,11 +14,14 @@ from jaqmc.app.molecule.lit_workflow import (
     MolecularLITConfig,
     MoleculeLITWorkflow,
     _batched_data_chunks,
+    _continuation_probe_is_acceptable,
     _cyclic_batched_data_chunk,
     _is_better_nqs_checkpoint,
+    _is_eligible_nqs_checkpoint,
     _lit_omega_grid,
     _regularized_action_gradient,
     _solve_sr_direction_chunked,
+    _SourceCovarianceMetrics,
     _spring_direction_chunked,
     _SpringState,
 )
@@ -288,6 +291,10 @@ class _SelectionStats(NamedTuple):
     reverse_kl: jnp.ndarray
     invalid_sample_fraction: jnp.ndarray
     reweight_ess_fraction: jnp.ndarray
+    source_covariance_loss: jnp.ndarray
+    source_covariance_max_loss: jnp.ndarray
+    lit: jnp.ndarray
+    source_norm: jnp.ndarray
 
 
 def _selection_stats(fidelity):
@@ -297,6 +304,64 @@ def _selection_stats(fidelity):
         reverse_kl=jnp.asarray(0.0),
         invalid_sample_fraction=jnp.asarray(0.0),
         reweight_ess_fraction=jnp.asarray(1.0),
+        source_covariance_loss=jnp.asarray(0.0),
+        source_covariance_max_loss=jnp.asarray(0.0),
+        lit=jnp.asarray(1.0),
+        source_norm=jnp.asarray(1.0),
+    )
+
+
+def test_checkpoint_loss_includes_heldout_source_covariance():
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(nqs_source_symmetry_weight=0.5)
+    workflow._nqs_stats_chunked = lambda *_args, **_kwargs: _selection_stats(0.8)
+
+    stats = workflow._evaluate_nqs_checkpoint(
+        None,
+        jnp.asarray(2.0),
+        None,
+        None,
+        None,
+        axis=0,
+        source_center=0.0,
+        source_norm=1.0,
+        ground_energy=0.0,
+        omega=0.1,
+        source_covariance_evaluator=lambda params, _pool: params**2,
+    )
+
+    np.testing.assert_allclose(float(stats.source_covariance_loss), 4.0)
+    np.testing.assert_allclose(float(stats.source_covariance_max_loss), 4.0)
+    np.testing.assert_allclose(float(stats.loss), 2.2)
+
+
+def test_checkpoint_combined_loss_uses_mean_but_guard_uses_worst_operation():
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(nqs_source_symmetry_weight=0.5)
+    workflow._nqs_stats_chunked = lambda *_args, **_kwargs: _selection_stats(0.8)
+
+    stats = workflow._evaluate_nqs_checkpoint(
+        None,
+        jnp.asarray(2.0),
+        None,
+        None,
+        None,
+        axis=0,
+        source_center=0.0,
+        source_norm=1.0,
+        ground_energy=0.0,
+        omega=0.1,
+        source_covariance_evaluator=lambda _params, _pool: _SourceCovarianceMetrics(
+            mean_loss=jnp.asarray(6e-4),
+            max_loss=jnp.asarray(1.2e-3),
+            worst_operation_index=jnp.asarray(1),
+        ),
+    )
+
+    np.testing.assert_allclose(float(stats.loss), 0.2003, rtol=1e-6)
+    assert not _is_eligible_nqs_checkpoint(
+        stats,
+        max_source_covariance=1e-3,
     )
 
 
@@ -366,6 +431,99 @@ def test_invalid_checkpoint_is_never_selected():
     incumbent = _selection_stats(0.8)
 
     assert not _is_better_nqs_checkpoint(candidate, incumbent)
+
+
+def test_checkpoint_source_covariance_limit_controls_eligibility():
+    incumbent = _selection_stats(0.8)._replace(
+        source_covariance_loss=jnp.asarray(2e-4),
+        source_covariance_max_loss=jnp.asarray(3e-4),
+    )
+    lower_loss_but_leaky = _selection_stats(0.99)._replace(
+        source_covariance_loss=jnp.asarray(5e-4),
+        source_covariance_max_loss=jnp.asarray(2e-2),
+    )
+
+    assert not _is_better_nqs_checkpoint(
+        lower_loss_but_leaky,
+        incumbent,
+        max_source_covariance=1e-3,
+    )
+    assert _is_better_nqs_checkpoint(
+        incumbent,
+        lower_loss_but_leaky,
+        max_source_covariance=1e-3,
+    )
+
+    nonfinite = _selection_stats(0.999)._replace(
+        source_covariance_loss=jnp.asarray(jnp.nan),
+        source_covariance_max_loss=jnp.asarray(jnp.nan),
+    )
+    assert not _is_better_nqs_checkpoint(nonfinite, incumbent)
+
+
+def test_continuation_probe_rejects_worst_operation_above_limit():
+    current = _selection_stats(0.9)._replace(
+        source_covariance_loss=jnp.asarray(2e-4),
+        source_covariance_max_loss=jnp.asarray(3e-4),
+    )
+    candidate = _selection_stats(0.9)._replace(
+        source_covariance_loss=jnp.asarray(6e-4),
+        source_covariance_max_loss=jnp.asarray(1.2e-3),
+    )
+
+    assert not _continuation_probe_is_acceptable(
+        current,
+        candidate,
+        retention=0.95,
+        max_source_covariance=1e-3,
+    )
+
+
+def test_continuation_min_step_cannot_propagate_worst_operation_violation():
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(
+        nqs_warm_start_omega=0.0,
+        nqs_continuation_min_step=0.1,
+        nqs_source_symmetry_weight=1.0,
+        nqs_source_symmetry_max_covariance=1e-3,
+    )
+    workflow._nqs_stats_chunked = lambda *_args, **_kwargs: _selection_stats(0.9)
+    update_step = SimpleNamespace(
+        source_covariance_metrics=lambda _params, _pool: _SourceCovarianceMetrics(
+            mean_loss=jnp.asarray(6e-4),
+            max_loss=jnp.asarray(1.2e-3),
+            worst_operation_index=jnp.asarray(1),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match=r"maximum=0\.001"):
+        workflow._continue_nqs_to_spectrum(
+            update_step,
+            response_params=jnp.asarray(0.0),
+            current_stats=_selection_stats(0.9),
+            train_pool=None,
+            eval_pool=None,
+            fallback_data=None,
+            rng=jax.random.PRNGKey(0),
+            response_apply=None,
+            ground_logpsi=None,
+            ground_params=None,
+            axis=0,
+            source_center=0.0,
+            source_norm=1.0,
+            ground_energy=0.0,
+            target_omega=0.1,
+            spectrum_omega=np.asarray([0.1]),
+        )
+
+
+@pytest.mark.parametrize("maximum", [0.0, -1.0, np.nan, np.inf])
+def test_source_covariance_maximum_must_be_positive_or_null(maximum):
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(nqs_source_symmetry_max_covariance=maximum)
+
+    with pytest.raises(ValueError, match="max_covariance"):
+        workflow._validate_source_sector_config()
 
 
 def test_regularized_gradient_masks_nonfinite_ratios():

@@ -25,6 +25,7 @@ from jaqmc.data import BatchedData
 from jaqmc.response.lit import lit_error_bound
 from jaqmc.response.nqs_lit import (
     MolecularResponseFermiNet,
+    MolecularVectorResponseFermiNet,
     NQSLITSourceSums,
     ground_local_energy,
     local_action_ratio,
@@ -32,6 +33,12 @@ from jaqmc.response.nqs_lit import (
     nqs_lit_source_sampled_sums,
     nqs_lit_stats_from_source_sums,
     restore_params_from_checkpoint,
+    source_aligned_vector_logpsi,
+)
+from jaqmc.response.source_sector import (
+    SourceSector,
+    discover_source_sector,
+    source_sector_covariance_loss,
 )
 from jaqmc.response.spectrum import find_spectrum_peaks
 from jaqmc.sampler.base import SamplePlan
@@ -87,8 +94,8 @@ class MolecularLITConfig:
     nqs_allow_untrained_ground: bool = False
     nqs_ground_energy: float | None = None
     nqs_source_center_steps: int = 4
-    nqs_source_center_override: float | None = None
-    nqs_source_norm_override: float | None = None
+    nqs_source_center_override: float | tuple[float, float, float] | None = None
+    nqs_source_norm_override: float | tuple[float, float, float] | None = None
     nqs_source_burn_in: int = 20
     nqs_source_floor: float = 1e-4
     nqs_train_pool_batches: int = 32
@@ -136,6 +143,18 @@ class MolecularLITConfig:
     nqs_response_use_last_layer: bool = False
     nqs_response_envelope: EnvelopeType = EnvelopeType.abs_isotropic
     nqs_response_orbitals_spin_split: bool = True
+    nqs_source_aligned: bool = False
+    nqs_source_aligned_residual_scale: float = 1e-3
+    nqs_source_symmetry_mode: str = "off"
+    nqs_source_symmetry_weight: float = 0.0
+    nqs_source_symmetry_learning_rate: float = 1e-3
+    nqs_source_symmetry_max_norm: float | None = 1e-2
+    nqs_source_symmetry_eval_batch_size: int = 256
+    nqs_source_symmetry_tolerance: float = 1e-5
+    nqs_source_symmetry_max_operations: int = 16
+    # Hard guard on the worst batch-mean loss among the active non-identity
+    # operations.  Set null explicitly to disable the guard.
+    nqs_source_symmetry_max_covariance: float | None = 1e-3
     nqs_selection_interval: int = 50
     nqs_log_interval: int = 50
 
@@ -176,6 +195,19 @@ class _ContinuationRecord(NamedTuple):
     bisections: int
     probe_accepted: bool
     min_step_override: bool
+
+
+class _SourceCovarianceMetrics(NamedTuple):
+    """Held-out covariance summary across active symmetry operations.
+
+    Each operation loss is already averaged over the evaluation batch.  The
+    mean remains the soft objective, while the maximum is the hard admission
+    criterion for checkpoints and continuation.
+    """
+
+    mean_loss: jnp.ndarray
+    max_loss: jnp.ndarray
+    worst_operation_index: jnp.ndarray
 
 
 class MoleculeLITWorkflow(Workflow):
@@ -238,6 +270,8 @@ class MoleculeLITWorkflow(Workflow):
         reweight_ess = np.zeros_like(lit)
         reweight_ess_fraction = np.zeros_like(lit)
         invalid_sample_fraction = np.zeros_like(lit)
+        source_covariance_loss = np.zeros_like(lit)
+        source_covariance_max_loss = np.zeros_like(lit)
         direct_hloc_rmse = np.full_like(lit, np.nan)
         direct_hloc_std = np.full_like(lit, np.nan)
         direct_hloc_sem = np.full_like(lit, np.nan)
@@ -247,6 +281,13 @@ class MoleculeLITWorkflow(Workflow):
         correction_overlap = np.zeros_like(normalization)
         source_centers = np.zeros(len(axes), dtype=np.float64)
         axis_source_norm = np.zeros(len(axes), dtype=np.float64)
+        pure_source_covariance_loss = np.zeros(len(axes), dtype=np.float64)
+        pure_source_covariance_max_loss = np.zeros(len(axes), dtype=np.float64)
+        pure_source_covariance_worst_operation = np.full(
+            len(axes),
+            -1,
+            dtype=np.int64,
+        )
         warm_start_selected_iteration = np.zeros(len(axes), dtype=np.int64)
         continuation_axis: list[int] = []
         continuation_omega: list[float] = []
@@ -255,27 +296,49 @@ class MoleculeLITWorkflow(Workflow):
         continuation_fidelity: list[float] = []
         continuation_reverse_kl: list[float] = []
         continuation_invalid_sample_fraction: list[float] = []
+        continuation_source_covariance_loss: list[float] = []
+        continuation_source_covariance_max_loss: list[float] = []
         continuation_inherited_fidelity: list[float] = []
         continuation_step: list[float] = []
         continuation_bisections: list[int] = []
         continuation_probe_accepted: list[bool] = []
         continuation_min_step_override: list[bool] = []
 
+        source_sector = self._configured_source_sector(example)
+        logger.info(
+            "NQS-LIT source sector=%s order=%d active_operations=%d",
+            source_sector.label,
+            source_sector.order,
+            len(self._active_source_sector_operations(source_sector)),
+        )
+        source_sector_active_operations = np.asarray(
+            self._active_source_sector_operations(source_sector),
+            dtype=np.float64,
+        ).reshape((-1, 3, 3))
+
+        # Estimate all three dipole centers on one ground-state chain.  A
+        # symmetry-constrained response consumes the full Cartesian vector,
+        # while a C1 response uses only the requested component.  The sector is
+        # needed while estimating the centers: their affine, origin-dependent
+        # part must be projected before the centered source norms are finalized.
+        (
+            vector_source_centers,
+            vector_source_norms,
+            batched_data,
+            sampler_state,
+            rng,
+        ) = self._estimate_vector_source_stats(
+            ground_params,
+            batched_data,
+            sampler_state,
+            ground_sample_plan,
+            rng,
+            source_sector=source_sector,
+        )
+
         for axis_pos, axis in enumerate(axes):
-            (
-                source_center,
-                axis_phi_norm,
-                batched_data,
-                sampler_state,
-                rng,
-            ) = self._estimate_source_stats(
-                ground_params,
-                batched_data,
-                sampler_state,
-                ground_sample_plan,
-                rng,
-                axis=axis,
-            )
+            source_center = float(vector_source_centers[axis])
+            axis_phi_norm = float(vector_source_norms[axis])
             source_centers[axis_pos] = source_center
             axis_source_norm[axis_pos] = axis_phi_norm
             logger.info(
@@ -286,12 +349,30 @@ class MoleculeLITWorkflow(Workflow):
             )
 
             rng, response_rng = jax.random.split(rng)
-            response_apply, response_params = self._make_response_ansatz(
-                example,
-                response_rng,
-                ground_params,
-                axis=axis,
-                source_center=source_center,
+            response_apply, response_vector_apply, response_params = (
+                self._make_response_ansatz(
+                    example,
+                    response_rng,
+                    ground_params,
+                    axis=axis,
+                    source_center=source_center,
+                    source_centers=vector_source_centers,
+                    source_sector=source_sector,
+                    ground_logpsi=ground_logpsi,
+                    initialization_data=_cyclic_batched_data_chunk(
+                        batched_data,
+                        min(
+                            batched_data.batch_size,
+                            int(self.lit_config.nqs_source_symmetry_eval_batch_size),
+                        ),
+                        0,
+                    ),
+                    initial_omega=(
+                        float(self.lit_config.nqs_warm_start_omega)
+                        if self.lit_config.nqs_warm_start_omega is not None
+                        else float(omega[0])
+                    ),
+                )
             )
             loaded_pools = self._try_load_source_pools(
                 batched_data,
@@ -345,12 +426,29 @@ class MoleculeLITWorkflow(Workflow):
                 train_pool.batch_size,
                 eval_pool.batch_size,
             )
+            pure_source_metrics = self._validate_pure_source_covariance(
+                ground_logpsi,
+                ground_params,
+                eval_pool,
+                source_sector,
+                vector_source_centers,
+                axis=axis,
+            )
+            pure_source_covariance_loss[axis_pos] = float(pure_source_metrics.mean_loss)
+            pure_source_covariance_max_loss[axis_pos] = float(
+                pure_source_metrics.max_loss
+            )
+            pure_source_covariance_worst_operation[axis_pos] = int(
+                pure_source_metrics.worst_operation_index
+            )
 
             update_step = self._make_nqs_update_step(
                 response_apply,
                 ground_params,
                 ground_logpsi,
                 ground_energy,
+                response_vector_apply=response_vector_apply,
+                source_sector=source_sector,
                 axis=axis,
                 source_center=source_center,
                 source_norm=axis_phi_norm,
@@ -418,6 +516,12 @@ class MoleculeLITWorkflow(Workflow):
                 continuation_invalid_sample_fraction.append(
                     float(host_bridge_stats.invalid_sample_fraction)
                 )
+                continuation_source_covariance_loss.append(
+                    float(host_bridge_stats.source_covariance_loss)
+                )
+                continuation_source_covariance_max_loss.append(
+                    float(host_bridge_stats.source_covariance_max_loss)
+                )
                 continuation_inherited_fidelity.append(record.inherited_fidelity)
                 continuation_step.append(record.step)
                 continuation_bisections.append(record.bisections)
@@ -468,6 +572,29 @@ class MoleculeLITWorkflow(Workflow):
                     ground_energy=ground_energy,
                     omega=jnp.asarray(float(omega_value)),
                 )
+                covariance_metrics = _coerce_source_covariance_metrics(
+                    getattr(
+                        update_step,
+                        "source_covariance_metrics",
+                        update_step.source_covariance_loss,
+                    )(
+                        response_params,
+                        eval_pool,
+                    )
+                )
+                stats = stats._replace(
+                    loss=_regularized_loss(
+                        stats,
+                        self.lit_config.nqs_reverse_kl_weight,
+                    )
+                    + jnp.asarray(
+                        self.lit_config.nqs_source_symmetry_weight,
+                        dtype=stats.loss.dtype,
+                    )
+                    * covariance_metrics.mean_loss,
+                    source_covariance_loss=covariance_metrics.mean_loss,
+                    source_covariance_max_loss=covariance_metrics.max_loss,
+                )
                 host_stats = jax.device_get(stats)
                 signed_lit[axis_pos, omega_pos] = float(host_stats.signed_lit)
                 lit[axis_pos, omega_pos] = float(host_stats.lit)
@@ -494,6 +621,12 @@ class MoleculeLITWorkflow(Workflow):
                 )
                 invalid_sample_fraction[axis_pos, omega_pos] = float(
                     host_stats.invalid_sample_fraction
+                )
+                source_covariance_loss[axis_pos, omega_pos] = float(
+                    host_stats.source_covariance_loss
+                )
+                source_covariance_max_loss[axis_pos, omega_pos] = float(
+                    host_stats.source_covariance_max_loss
                 )
                 direct_hloc_rmse[axis_pos, omega_pos] = float(
                     host_stats.direct_hloc_rmse
@@ -535,6 +668,8 @@ class MoleculeLITWorkflow(Workflow):
             reweight_ess=reweight_ess,
             reweight_ess_fraction=reweight_ess_fraction,
             invalid_sample_fraction=invalid_sample_fraction,
+            source_covariance_loss=source_covariance_loss,
+            source_covariance_max_loss=source_covariance_max_loss,
             direct_hloc_rmse=direct_hloc_rmse,
             direct_hloc_std=direct_hloc_std,
             direct_hloc_sem=direct_hloc_sem,
@@ -554,6 +689,40 @@ class MoleculeLITWorkflow(Workflow):
             nqs_spring_epsilon=self.lit_config.nqs_spring_epsilon,
             nqs_spring_decay=self.lit_config.nqs_spring_decay,
             nqs_spring_damping_floor=self.lit_config.nqs_spring_damping_floor,
+            nqs_source_aligned=bool(self.lit_config.nqs_source_aligned),
+            nqs_source_aligned_residual_scale=(
+                self.lit_config.nqs_source_aligned_residual_scale
+            ),
+            nqs_source_symmetry_mode=self.lit_config.nqs_source_symmetry_mode,
+            nqs_source_symmetry_weight=self.lit_config.nqs_source_symmetry_weight,
+            nqs_source_symmetry_learning_rate=(
+                self.lit_config.nqs_source_symmetry_learning_rate
+            ),
+            nqs_source_symmetry_max_norm=_optional_float(
+                self.lit_config.nqs_source_symmetry_max_norm
+            ),
+            nqs_source_symmetry_eval_batch_size=(
+                self.lit_config.nqs_source_symmetry_eval_batch_size
+            ),
+            nqs_source_symmetry_tolerance=(
+                self.lit_config.nqs_source_symmetry_tolerance
+            ),
+            nqs_source_symmetry_max_operations=(
+                self.lit_config.nqs_source_symmetry_max_operations
+            ),
+            nqs_source_symmetry_max_covariance=_optional_float(
+                self.lit_config.nqs_source_symmetry_max_covariance
+            ),
+            source_sector_label=source_sector.label,
+            source_sector_order=source_sector.order,
+            source_sector_active_operations=source_sector_active_operations,
+            vector_source_centers=vector_source_centers,
+            vector_source_norms=vector_source_norms,
+            pure_source_covariance_loss=pure_source_covariance_loss,
+            pure_source_covariance_max_loss=pure_source_covariance_max_loss,
+            pure_source_covariance_worst_active_operation=(
+                pure_source_covariance_worst_operation
+            ),
             nqs_selection_interval=self.lit_config.nqs_selection_interval,
             nqs_direct_psi_train=bool(self.lit_config.nqs_direct_psi_train),
             nqs_direct_psi_burn_in=self.lit_config.nqs_direct_psi_burn_in,
@@ -588,6 +757,14 @@ class MoleculeLITWorkflow(Workflow):
             ),
             continuation_invalid_sample_fraction=np.asarray(
                 continuation_invalid_sample_fraction,
+                dtype=np.float64,
+            ),
+            continuation_source_covariance_loss=np.asarray(
+                continuation_source_covariance_loss,
+                dtype=np.float64,
+            ),
+            continuation_source_covariance_max_loss=np.asarray(
+                continuation_source_covariance_max_loss,
                 dtype=np.float64,
             ),
             continuation_inherited_fidelity=np.asarray(
@@ -644,6 +821,7 @@ class MoleculeLITWorkflow(Workflow):
             raise ValueError(msg)
         self._validate_direct_psi_config()
         self._validate_nqs_stabilizer_config()
+        self._validate_source_sector_config()
         self._validate_nqs_iteration_config()
         self._validate_continuation_config()
 
@@ -744,6 +922,69 @@ class MoleculeLITWorkflow(Workflow):
             msg = "lit.nqs_iterations must be positive."
             raise ValueError(msg)
 
+    def _validate_source_sector_config(self) -> None:
+        _three_component_override(
+            self.lit_config.nqs_source_center_override,
+            name="lit.nqs_source_center_override",
+        )
+        _three_component_override(
+            self.lit_config.nqs_source_norm_override,
+            name="lit.nqs_source_norm_override",
+            positive=True,
+        )
+        residual_scale = self.lit_config.nqs_source_aligned_residual_scale
+        if not np.isfinite(residual_scale) or residual_scale <= 0.0:
+            msg = "lit.nqs_source_aligned_residual_scale must be positive."
+            raise ValueError(msg)
+        mode = str(self.lit_config.nqs_source_symmetry_mode).lower()
+        valid_modes = {
+            "off",
+            "none",
+            "identity",
+            "c1",
+            "auto",
+            "on",
+            "general",
+            "inversion",
+        }
+        if mode not in valid_modes:
+            msg = (
+                "lit.nqs_source_symmetry_mode must be one of "
+                f"{sorted(valid_modes)}, got "
+                f"{self.lit_config.nqs_source_symmetry_mode!r}."
+            )
+            raise ValueError(msg)
+        weight = self.lit_config.nqs_source_symmetry_weight
+        if not np.isfinite(weight) or weight < 0.0:
+            msg = "lit.nqs_source_symmetry_weight must be finite and nonnegative."
+            raise ValueError(msg)
+        learning_rate = self.lit_config.nqs_source_symmetry_learning_rate
+        if not np.isfinite(learning_rate) or learning_rate <= 0.0:
+            msg = "lit.nqs_source_symmetry_learning_rate must be positive."
+            raise ValueError(msg)
+        max_norm = self.lit_config.nqs_source_symmetry_max_norm
+        if max_norm is not None and (
+            not np.isfinite(max_norm) or float(max_norm) <= 0.0
+        ):
+            msg = "lit.nqs_source_symmetry_max_norm must be positive or null."
+            raise ValueError(msg)
+        if self.lit_config.nqs_source_symmetry_eval_batch_size < 1:
+            msg = "lit.nqs_source_symmetry_eval_batch_size must be positive."
+            raise ValueError(msg)
+        tolerance = self.lit_config.nqs_source_symmetry_tolerance
+        if not np.isfinite(tolerance) or tolerance <= 0.0:
+            msg = "lit.nqs_source_symmetry_tolerance must be positive."
+            raise ValueError(msg)
+        if self.lit_config.nqs_source_symmetry_max_operations < 1:
+            msg = "lit.nqs_source_symmetry_max_operations must be positive."
+            raise ValueError(msg)
+        max_covariance = self.lit_config.nqs_source_symmetry_max_covariance
+        if max_covariance is not None and (
+            not np.isfinite(max_covariance) or float(max_covariance) <= 0.0
+        ):
+            msg = "lit.nqs_source_symmetry_max_covariance must be positive or null."
+            raise ValueError(msg)
+
     def _validate_continuation_config(self) -> None:
         if self.lit_config.nqs_continuation_iterations < 1:
             msg = "lit.nqs_continuation_iterations must be positive."
@@ -797,7 +1038,209 @@ class MoleculeLITWorkflow(Workflow):
             msg = "lit.nqs_eval_batch_size must be nonnegative."
             raise ValueError(msg)
 
-    def _make_response_ansatz(
+    def _configured_source_sector(self, example) -> SourceSector:
+        """Discover and cap the molecular operations used during training.
+
+        Returns:
+            The configured finite source sector with identity first.
+
+        Raises:
+            ValueError: If explicit inversion is requested for a geometry that
+                does not possess inversion symmetry.
+        """
+        mode = str(self.lit_config.nqs_source_symmetry_mode).lower()
+        identity = (
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+        )
+        center_array = np.mean(np.asarray(example.atoms), axis=0)
+        center = (
+            float(center_array[0]),
+            float(center_array[1]),
+            float(center_array[2]),
+        )
+        if mode in {"off", "none", "identity", "c1"}:
+            return SourceSector(center=center, operations=(identity,), label="C1")
+
+        sector = discover_source_sector(
+            example.atoms,
+            example.charges,
+            tolerance=float(self.lit_config.nqs_source_symmetry_tolerance),
+        )
+        operations = list(sector.operations)
+        if mode == "inversion":
+            inversion = -np.eye(3)
+            operations = [
+                operation
+                for operation in operations
+                if _is_identity_operation(operation)
+                or np.allclose(
+                    np.asarray(operation),
+                    inversion,
+                    rtol=0.0,
+                    atol=self.lit_config.nqs_source_symmetry_tolerance,
+                )
+            ]
+            if len(operations) < 2:
+                msg = (
+                    "lit.nqs_source_symmetry_mode='inversion' requires a "
+                    "centrosymmetric nuclear geometry."
+                )
+                raise ValueError(msg)
+            sector = replace(sector, operations=tuple(operations), label="inversion")
+
+        # Preserve identity and prioritize inversion before taking a deterministic
+        # subset.  Inversion is the exact low-cost odd-sector constraint for atoms.
+        identity_operation = next(
+            operation
+            for operation in sector.operations
+            if _is_identity_operation(operation)
+        )
+        nonidentity = [
+            operation
+            for operation in sector.operations
+            if not _is_identity_operation(operation)
+        ]
+        nonidentity.sort(
+            key=lambda operation: (
+                0
+                if np.allclose(
+                    np.asarray(operation),
+                    -np.eye(3),
+                    rtol=0.0,
+                    atol=self.lit_config.nqs_source_symmetry_tolerance,
+                )
+                else 1,
+            )
+        )
+        max_operations = int(self.lit_config.nqs_source_symmetry_max_operations)
+        selected = (identity_operation, *nonidentity[: max_operations - 1])
+        return replace(sector, operations=selected)
+
+    def _active_source_sector_operations(
+        self,
+        sector: SourceSector,
+    ) -> tuple[jnp.ndarray, ...]:
+        if self.lit_config.nqs_source_symmetry_weight <= 0.0:
+            return ()
+        return tuple(
+            jnp.asarray(operation)
+            for operation in sector.operations
+            if not _is_identity_operation(operation)
+        )
+
+    def _validate_pure_source_covariance(
+        self,
+        ground_logpsi,
+        ground_params,
+        eval_pool: BatchedData,
+        source_sector: SourceSector,
+        source_centers,
+        *,
+        axis: int,
+    ) -> _SourceCovarianceMetrics:
+        """Check that the sampled dipole source belongs to its target sector.
+
+        A response regularizer cannot repair covariance already violated by
+        ``(D-D0) Psi0``.  Evaluate that pure source once on the fixed held-out
+        pool before optimizing a response, using every configured operation.
+
+        Returns:
+            Mean, maximum, and worst-operation index for the held-out source
+            covariance over active non-identity operations.
+
+        Raises:
+            ValueError: If ``source_centers`` is not a Cartesian vector.
+            RuntimeError: If the covariance is non-finite or exceeds the
+                configured maximum.
+        """
+        active_operations = self._active_source_sector_operations(source_sector)
+        maximum = self.lit_config.nqs_source_symmetry_max_covariance
+        if not active_operations or maximum is None:
+            return _SourceCovarianceMetrics(
+                mean_loss=jnp.asarray(0.0),
+                max_loss=jnp.asarray(0.0),
+                worst_operation_index=jnp.asarray(-1, dtype=jnp.int32),
+            )
+
+        evaluation_batch = _cyclic_batched_data_chunk(
+            eval_pool,
+            min(
+                eval_pool.batch_size,
+                int(self.lit_config.nqs_source_symmetry_eval_batch_size),
+            ),
+            0,
+        )
+        centers = jnp.asarray(
+            source_centers,
+            dtype=evaluation_batch.data.electrons.dtype,
+        )
+        if centers.shape != (3,):
+            msg = f"source_centers must have shape (3,), got {centers.shape}."
+            raise ValueError(msg)
+        operations = jnp.stack(active_operations)
+
+        def pure_source_vector_apply(local_ground_params, data):
+            ground_log_amplitude = ground_logpsi(local_ground_params, data)
+            complex_dtype = jnp.result_type(ground_log_amplitude, jnp.complex64)
+            centered_dipole = -jnp.sum(data.electrons, axis=0) - centers
+            source_log_amplitude = jnp.log(jnp.abs(centered_dipole)) + 1j * jnp.where(
+                centered_dipole < 0.0,
+                jnp.asarray(jnp.pi, dtype=centered_dipole.dtype),
+                jnp.asarray(0.0, dtype=centered_dipole.dtype),
+            )
+            return jnp.asarray(
+                ground_log_amplitude,
+                dtype=complex_dtype,
+            ) + source_log_amplitude.astype(complex_dtype)
+
+        @jax.jit
+        def evaluate_covariance(local_ground_params, local_evaluation_batch):
+            losses = jax.lax.map(
+                lambda operation: _vector_covariance_penalty_loss(
+                    pure_source_vector_apply,
+                    local_ground_params,
+                    local_evaluation_batch,
+                    source_sector,
+                    operation,
+                ),
+                operations,
+            )
+            return _summarize_source_covariance_losses(losses)
+
+        metrics = jax.device_get(evaluate_covariance(ground_params, evaluation_batch))
+        mean_loss = float(metrics.mean_loss)
+        max_loss = float(metrics.max_loss)
+        worst_operation_index = int(metrics.worst_operation_index)
+        logger.info(
+            "axis=%s pure_source_heldout_covariance_mean=%.6e "
+            "pure_source_heldout_covariance_max=%.6e "
+            "worst_active_operation=%d maximum=%s",
+            _AXIS_NAMES[axis],
+            mean_loss,
+            max_loss,
+            worst_operation_index,
+            f"{float(maximum):.6e}",
+        )
+        if (
+            not np.isfinite(mean_loss)
+            or not np.isfinite(max_loss)
+            or max_loss > float(maximum)
+        ):
+            msg = (
+                f"axis={_AXIS_NAMES[axis]} pure-source held-out worst-operation "
+                f"covariance {max_loss:.6e} (operation "
+                f"{worst_operation_index}, mean {mean_loss:.6e}) exceeds "
+                f"lit.nqs_source_symmetry_max_covariance={maximum!r}. "
+                "The sampled (D-D0)Psi0 source is outside the configured "
+                "sector; check ground-state symmetry, source centers, and "
+                "source-pool equilibration before response optimization."
+            )
+            raise RuntimeError(msg)
+        return metrics
+
+    def _make_response_ansatz(  # noqa: C901
         self,
         example,
         response_rng,
@@ -805,9 +1248,21 @@ class MoleculeLITWorkflow(Workflow):
         *,
         axis: int,
         source_center: float,
+        source_centers=None,
+        source_sector: SourceSector | None = None,
+        ground_logpsi=None,
+        initialization_data: BatchedData | None = None,
+        initial_omega: float | None = None,
     ):
-        del axis, source_center
-        response = MolecularResponseFermiNet(
+        if source_sector is None:
+            source_sector = self._configured_source_sector(example)
+        use_vector_response = bool(self._active_source_sector_operations(source_sector))
+        response_type = (
+            MolecularVectorResponseFermiNet
+            if use_vector_response
+            else MolecularResponseFermiNet
+        )
+        response = response_type(
             nspins=_two_spin_tuple(self.system_config.electron_spins),
             ndets=int(self.lit_config.nqs_response_ndets),
             hidden_dims_single=tuple(self.lit_config.nqs_response_hidden_dims_single),
@@ -816,9 +1271,128 @@ class MoleculeLITWorkflow(Workflow):
             envelope=self.lit_config.nqs_response_envelope,
             orbitals_spin_split=bool(self.lit_config.nqs_response_orbitals_spin_split),
         )
-        response_params = response.init(response_rng, example)
-        response_params = _copy_matching_parameters(response_params, ground_params)
-        return response.apply, response_params
+        raw_params = response.init(response_rng, example)
+        raw_params = _copy_matching_parameters(raw_params, ground_params)
+
+        if not self.lit_config.nqs_source_aligned:
+            if not use_vector_response:
+                return response.apply, None, raw_params
+
+            def vector_apply(params, data):
+                return response.apply(params, data)
+
+            def unwrapped_scalar_apply(params, data):
+                return vector_apply(params, data)[int(axis)]
+
+            return unwrapped_scalar_apply, vector_apply, raw_params
+
+        if ground_logpsi is None:
+            msg = "A ground log wavefunction is required for source-aligned response."
+            raise ValueError(msg)
+        if use_vector_response:
+            if source_centers is None:
+                source_centers = np.zeros(3, dtype=np.float64)
+                source_centers[int(axis)] = float(source_center)
+            centers = jnp.asarray(source_centers, dtype=example.electrons.dtype)
+            if centers.shape != (3,):
+                msg = f"source_centers must have shape (3,), got {centers.shape}."
+                raise ValueError(msg)
+        else:
+            centers = jnp.asarray(source_center, dtype=example.electrons.dtype)
+        if initial_omega is None:
+            initial_omega = self.lit_config.nqs_warm_start_omega
+        if initial_omega is None:
+            initial_omega = float(self.lit_config.omega_min)
+        coefficient = 1.0 / complex(-float(initial_omega), -self.lit_config.eta)
+        real_dtype = example.electrons.dtype
+        if initialization_data is None:
+            raw_initial_logpsi = response.apply(raw_params, example)
+            ground_initial_logpsi = ground_logpsi(ground_params, example)
+            initial_dipole = (
+                -jnp.sum(example.electrons, axis=0)
+                if use_vector_response
+                else molecular_electronic_dipole(example, axis)
+            )
+        else:
+            raw_initial_logpsi = jax.vmap(
+                lambda one: response.apply(raw_params, one),
+                in_axes=(initialization_data.vmap_axis,),
+            )(initialization_data.data)
+            ground_initial_logpsi = jax.vmap(
+                lambda one: ground_logpsi(ground_params, one),
+                in_axes=(initialization_data.vmap_axis,),
+            )(initialization_data.data)
+            initial_dipole = jax.vmap(
+                (
+                    (lambda one: -jnp.sum(one.electrons, axis=0))
+                    if use_vector_response
+                    else (lambda one: molecular_electronic_dipole(one, axis))
+                ),
+                in_axes=(initialization_data.vmap_axis,),
+            )(initialization_data.data)
+        calibration_raw_logpsi = raw_initial_logpsi
+        calibration_dipole = initial_dipole
+        calibration_centers = centers
+        if not use_vector_response:
+            # The calibration routine computes a norm over its final component
+            # axis.  Preserve the walker axis by representing a scalar response
+            # as a one-component vector only for this initialization statistic.
+            calibration_raw_logpsi = jnp.asarray(raw_initial_logpsi)[..., None]
+            calibration_dipole = initial_dipole[..., None]
+            calibration_centers = centers[None]
+        residual_log_scale = _calibrated_residual_log_scale(
+            calibration_raw_logpsi,
+            ground_initial_logpsi,
+            calibration_dipole,
+            calibration_centers,
+            coefficient,
+            target_ratio=self.lit_config.nqs_source_aligned_residual_scale,
+        )
+        logger.info(
+            "Initialized source-aligned residual at relative scale %.3e "
+            "(log_scale=%.6f)",
+            self.lit_config.nqs_source_aligned_residual_scale,
+            residual_log_scale,
+        )
+        response_params = freeze(
+            {
+                "raw": raw_params,
+                "source_coefficient": jnp.asarray(
+                    [coefficient.real, coefficient.imag],
+                    dtype=real_dtype,
+                ),
+                "residual_log_scale": jnp.asarray(
+                    residual_log_scale,
+                    dtype=real_dtype,
+                ),
+            }
+        )
+
+        def aligned_apply(params, data):
+            coefficient_parts = params["source_coefficient"]
+            source_coefficient = coefficient_parts[0] + 1j * coefficient_parts[1]
+            raw_logpsi = response.apply(params["raw"], data)
+            dipole = (
+                -jnp.sum(data.electrons, axis=0)
+                if use_vector_response
+                else molecular_electronic_dipole(data, axis)
+            )
+            return source_aligned_vector_logpsi(
+                raw_logpsi,
+                ground_logpsi(ground_params, data),
+                dipole,
+                centers,
+                source_coefficient,
+                params["residual_log_scale"],
+            )
+
+        if not use_vector_response:
+            return aligned_apply, None, response_params
+
+        def aligned_scalar_apply(params, data):
+            return aligned_apply(params, data)[int(axis)]
+
+        return aligned_scalar_apply, aligned_apply, response_params
 
     def _prepare_source_sampler(
         self,
@@ -1019,6 +1593,7 @@ class MoleculeLITWorkflow(Workflow):
         source_norm: float,
         ground_energy: float,
         omega: float,
+        source_covariance_evaluator=None,
     ):
         stats = self._nqs_stats_chunked(
             response_apply,
@@ -1032,11 +1607,24 @@ class MoleculeLITWorkflow(Workflow):
             ground_energy=ground_energy,
             omega=jnp.asarray(float(omega)),
         )
+        physical_loss = _regularized_loss(
+            stats,
+            self.lit_config.nqs_reverse_kl_weight,
+        )
+        if source_covariance_evaluator is None:
+            return stats._replace(loss=physical_loss)
+        covariance_metrics = _coerce_source_covariance_metrics(
+            source_covariance_evaluator(response_params, eval_pool)
+        )
         return stats._replace(
-            loss=_regularized_loss(
-                stats,
-                self.lit_config.nqs_reverse_kl_weight,
+            loss=physical_loss
+            + jnp.asarray(
+                self.lit_config.nqs_source_symmetry_weight,
+                dtype=physical_loss.dtype,
             )
+            * covariance_metrics.mean_loss,
+            source_covariance_loss=covariance_metrics.mean_loss,
+            source_covariance_max_loss=covariance_metrics.max_loss,
         )
 
     def _optimize_nqs_frequency(
@@ -1064,6 +1652,10 @@ class MoleculeLITWorkflow(Workflow):
         Returns:
             Best parameters, their held-out statistics, selected iteration,
             and the next random key.
+
+        Raises:
+            RuntimeError: If no held-out checkpoint satisfies the configured
+                numerical and source-covariance validity requirements.
         """
 
         def evaluate(params):
@@ -1078,6 +1670,11 @@ class MoleculeLITWorkflow(Workflow):
                 source_norm=source_norm,
                 ground_energy=ground_energy,
                 omega=float(omega),
+                source_covariance_evaluator=getattr(
+                    update_step,
+                    "source_covariance_metrics",
+                    getattr(update_step, "source_covariance_loss", None),
+                ),
             )
 
         response_params = initial_params
@@ -1101,7 +1698,13 @@ class MoleculeLITWorkflow(Workflow):
             )
             if should_select:
                 candidate_stats = evaluate(response_params)
-                if _is_better_nqs_checkpoint(candidate_stats, best_stats):
+                if _is_better_nqs_checkpoint(
+                    candidate_stats,
+                    best_stats,
+                    max_source_covariance=(
+                        self.lit_config.nqs_source_symmetry_max_covariance
+                    ),
+                ):
                     best_params = response_params
                     best_stats = candidate_stats
                     best_iteration = completed
@@ -1112,7 +1715,9 @@ class MoleculeLITWorkflow(Workflow):
                 logger.info(
                     "axis=%s stage=%s omega=%.6f iter=%d train_loss=%.6e "
                     "train_fidelity=%.6f train_reverse_kl=%.6e "
-                    "best_iter=%d best_fidelity=%.6f best_reverse_kl=%.6e",
+                    "train_covariance_operation=%.6e best_iter=%d "
+                    "best_fidelity=%.6f best_reverse_kl=%.6e "
+                    "best_covariance_mean=%.6e best_covariance_max=%.6e",
                     _AXIS_NAMES[axis],
                     stage,
                     float(omega),
@@ -1120,14 +1725,39 @@ class MoleculeLITWorkflow(Workflow):
                     float(last_train_stats.loss),
                     float(last_train_stats.fidelity),
                     float(last_train_stats.reverse_kl),
+                    float(getattr(last_train_stats, "source_covariance_loss", 0.0)),
                     best_iteration,
                     float(best_stats.fidelity),
                     float(best_stats.reverse_kl),
+                    float(getattr(best_stats, "source_covariance_loss", 0.0)),
+                    float(
+                        getattr(
+                            best_stats,
+                            "source_covariance_max_loss",
+                            getattr(best_stats, "source_covariance_loss", 0.0),
+                        )
+                    ),
                 )
+        maximum_covariance = self.lit_config.nqs_source_symmetry_max_covariance
+        best_covariance_mean, best_covariance_max = _source_covariance_host_values(
+            best_stats
+        )
+        if not _is_eligible_nqs_checkpoint(
+            best_stats,
+            max_source_covariance=maximum_covariance,
+        ):
+            msg = (
+                f"axis={_AXIS_NAMES[axis]} stage={stage} omega={float(omega):.6f} "
+                "produced no eligible held-out checkpoint; best covariance "
+                f"mean={best_covariance_mean:.6e}, max={best_covariance_max:.6e}, "
+                f"maximum={maximum_covariance!r}."
+            )
+            raise RuntimeError(msg)
         rng = update_carry.direct.rng
         logger.info(
             "axis=%s stage=%s omega=%.6f selected_iter=%d/%d "
-            "heldout_loss=%.6e fidelity=%.6f reverse_kl=%.6e ess=%.3f",
+            "heldout_loss=%.6e fidelity=%.6f reverse_kl=%.6e "
+            "covariance_mean=%.6e covariance_max=%.6e ess=%.3f",
             _AXIS_NAMES[axis],
             stage,
             float(omega),
@@ -1136,6 +1766,14 @@ class MoleculeLITWorkflow(Workflow):
             float(best_stats.loss),
             float(best_stats.fidelity),
             float(best_stats.reverse_kl),
+            float(getattr(best_stats, "source_covariance_loss", 0.0)),
+            float(
+                getattr(
+                    best_stats,
+                    "source_covariance_max_loss",
+                    getattr(best_stats, "source_covariance_loss", 0.0),
+                )
+            ),
             float(best_stats.reweight_ess_fraction),
         )
         return best_params, best_stats, best_iteration, rng
@@ -1190,14 +1828,29 @@ class MoleculeLITWorkflow(Workflow):
             source_norm=source_norm,
             ground_energy=ground_energy,
         )
+        source_covariance_evaluator = getattr(
+            update_step,
+            "source_covariance_metrics",
+            getattr(update_step, "source_covariance_loss", None),
+        )
         current_omega = float(start_omega)
         if current_stats is None:
             current_stats = self._evaluate_nqs_checkpoint(
                 response_params=response_params,
                 eval_pool=eval_pool,
                 omega=current_omega,
+                source_covariance_evaluator=source_covariance_evaluator,
                 **common,
             )
+        maximum_covariance = self.lit_config.nqs_source_symmetry_max_covariance
+        _require_eligible_nqs_checkpoint(
+            current_stats,
+            max_source_covariance=maximum_covariance,
+            context=(
+                "Frequency continuation received an ineligible starting "
+                f"checkpoint at omega={current_omega:.8g}"
+            ),
+        )
         min_step = _continuation_min_step(self.lit_config, spectrum_omega)
         records = []
         tolerance = np.finfo(np.float64).eps * max(1.0, abs(target_omega)) * 8.0
@@ -1217,12 +1870,14 @@ class MoleculeLITWorkflow(Workflow):
                     response_params=response_params,
                     eval_pool=eval_pool,
                     omega=candidate_omega,
+                    source_covariance_evaluator=source_covariance_evaluator,
                     **common,
                 )
                 probe_ok = _continuation_probe_is_acceptable(
                     current_stats,
                     probe_stats,
                     retention=self.lit_config.nqs_continuation_fidelity_retention,
+                    max_source_covariance=maximum_covariance,
                 )
                 candidate_gap = candidate_omega - current_omega
                 if probe_ok or candidate_gap <= min_step * (1.0 + 1e-12):
@@ -1231,13 +1886,15 @@ class MoleculeLITWorkflow(Workflow):
                 candidate_omega = min(target_omega, current_omega + candidate_gap)
                 bisections += 1
 
-            if not _finite_valid_nqs_stats(probe_stats):
-                msg = (
+            _require_eligible_nqs_checkpoint(
+                probe_stats,
+                max_source_covariance=maximum_covariance,
+                context=(
                     "Frequency continuation produced non-finite/invalid held-out "
                     f"statistics at omega={candidate_omega:.8g}; refusing to "
-                    "propagate a corrupted checkpoint."
-                )
-                raise RuntimeError(msg)
+                    "propagate a corrupted checkpoint"
+                ),
+            )
             actual_step = float(candidate_omega - current_omega)
             min_step_override = not probe_ok and actual_step <= min_step * (1.0 + 1e-12)
             if target_omega - candidate_omega <= tolerance:
@@ -1256,10 +1913,19 @@ class MoleculeLITWorkflow(Workflow):
                 )
                 logger.info(
                     "axis=%s continuation_probe target=%.6f inherited_fidelity=%.6f "
-                    "step=%.6e bisections=%d accepted=%s min_step_override=%s",
+                    "covariance_mean=%.6e covariance_max=%.6e step=%.6e "
+                    "bisections=%d accepted=%s min_step_override=%s",
                     _AXIS_NAMES[axis],
                     target_omega,
                     float(probe_stats.fidelity),
+                    float(getattr(probe_stats, "source_covariance_loss", 0.0)),
+                    float(
+                        getattr(
+                            probe_stats,
+                            "source_covariance_max_loss",
+                            getattr(probe_stats, "source_covariance_loss", 0.0),
+                        )
+                    ),
                     actual_step,
                     bisections,
                     probe_ok,
@@ -1290,12 +1956,14 @@ class MoleculeLITWorkflow(Workflow):
                     **common,
                 )
             )
-            if not _finite_valid_nqs_stats(current_stats):
-                msg = (
+            _require_eligible_nqs_checkpoint(
+                current_stats,
+                max_source_covariance=maximum_covariance,
+                context=(
                     "Frequency continuation failed to obtain a finite held-out "
-                    f"checkpoint at omega={candidate_omega:.8g}."
-                )
-                raise RuntimeError(msg)
+                    f"checkpoint at omega={candidate_omega:.8g}"
+                ),
+            )
             records.append(
                 _ContinuationRecord(
                     omega=float(candidate_omega),
@@ -1311,12 +1979,21 @@ class MoleculeLITWorkflow(Workflow):
             )
             logger.info(
                 "axis=%s continuation_step omega=%.6f inherited_fidelity=%.6f "
-                "selected_fidelity=%.6f step=%.6e bisections=%d accepted=%s "
+                "selected_fidelity=%.6f covariance_mean=%.6e "
+                "covariance_max=%.6e step=%.6e bisections=%d accepted=%s "
                 "min_step_override=%s",
                 _AXIS_NAMES[axis],
                 candidate_omega,
                 inherited_fidelity,
                 float(current_stats.fidelity),
+                float(getattr(current_stats, "source_covariance_loss", 0.0)),
+                float(
+                    getattr(
+                        current_stats,
+                        "source_covariance_max_loss",
+                        getattr(current_stats, "source_covariance_loss", 0.0),
+                    )
+                ),
                 actual_step,
                 bisections,
                 probe_ok,
@@ -1356,13 +2033,22 @@ class MoleculeLITWorkflow(Workflow):
         if result[1] is not None:
             logger.info(
                 "axis=%s warm_start omega=%.6f iterations=%d "
-                "selected_iter=%d fidelity=%.6f reverse_kl=%.6e",
+                "selected_iter=%d fidelity=%.6f reverse_kl=%.6e "
+                "covariance_mean=%.6e covariance_max=%.6e",
                 _AXIS_NAMES[kwargs["axis"]],
                 float(self.lit_config.nqs_warm_start_omega),
                 self.lit_config.nqs_warm_start_iterations,
                 result[2],
                 float(result[1].fidelity),
                 float(result[1].reverse_kl),
+                float(getattr(result[1], "source_covariance_loss", 0.0)),
+                float(
+                    getattr(
+                        result[1],
+                        "source_covariance_max_loss",
+                        getattr(result[1], "source_covariance_loss", 0.0),
+                    )
+                ),
             )
         return result
 
@@ -1427,7 +2113,7 @@ class MoleculeLITWorkflow(Workflow):
             energy_values.append(float(jnp.mean(local)))
         return float(np.mean(energy_values)), batched_data, sampler_state, rng
 
-    def _estimate_source_stats(
+    def _estimate_vector_source_stats(
         self,
         ground_params,
         batched_data,
@@ -1435,15 +2121,33 @@ class MoleculeLITWorkflow(Workflow):
         sample_plan: SamplePlan,
         rng,
         *,
-        axis: int,
+        source_sector: SourceSector | None = None,
     ):
-        if (
-            self.lit_config.nqs_source_center_override is not None
-            and self.lit_config.nqs_source_norm_override is not None
-        ):
+        center_override = _three_component_override(
+            self.lit_config.nqs_source_center_override,
+            name="lit.nqs_source_center_override",
+        )
+        norm_override = _three_component_override(
+            self.lit_config.nqs_source_norm_override,
+            name="lit.nqs_source_norm_override",
+            positive=True,
+        )
+        electron_count = int(batched_data.data.electrons.shape[-2])
+        if center_override is not None and norm_override is not None:
+            center = _project_source_center_to_invariant_subspace(
+                center_override,
+                source_sector,
+                electron_count=electron_count,
+                tolerance=float(self.lit_config.nqs_source_symmetry_tolerance),
+            )
+            _log_source_center_projection(
+                center_override,
+                center,
+                source_sector,
+            )
             return (
-                float(self.lit_config.nqs_source_center_override),
-                float(self.lit_config.nqs_source_norm_override),
+                center,
+                norm_override,
                 batched_data,
                 sampler_state,
                 rng,
@@ -1459,20 +2163,70 @@ class MoleculeLITWorkflow(Workflow):
                 sample_rng,
             )
             dipole = jax.vmap(
-                lambda one: molecular_electronic_dipole(one, axis),
+                lambda one: -jnp.sum(one.electrons, axis=0),
                 in_axes=(batched_data.vmap_axis,),
             )(batched_data.data)
-            mean_values.append(float(jnp.mean(dipole)))
-            mean_square_values.append(float(jnp.mean(dipole**2)))
-        mean = float(np.mean(mean_values))
-        center = mean
-        if self.lit_config.nqs_source_center_override is not None:
-            center = float(self.lit_config.nqs_source_center_override)
-        variance = float(np.mean(mean_square_values)) - 2.0 * center * mean + center**2
-        norm = float(max(variance, 1e-12))
-        if self.lit_config.nqs_source_norm_override is not None:
-            norm = float(self.lit_config.nqs_source_norm_override)
+            mean_values.append(np.asarray(jnp.mean(dipole, axis=0)))
+            mean_square_values.append(np.asarray(jnp.mean(dipole**2, axis=0)))
+        mean = np.mean(mean_values, axis=0, dtype=np.float64)
+        center = np.array(mean, copy=True)
+        if center_override is not None:
+            center = center_override
+        unprojected_center = np.array(center, copy=True)
+        center = _project_source_center_to_invariant_subspace(
+            center,
+            source_sector,
+            electron_count=electron_count,
+            tolerance=float(self.lit_config.nqs_source_symmetry_tolerance),
+        )
+        _log_source_center_projection(
+            unprojected_center,
+            center,
+            source_sector,
+        )
+        variance = (
+            np.mean(mean_square_values, axis=0, dtype=np.float64)
+            - 2.0 * center * mean
+            + center**2
+        )
+        norm = np.maximum(variance, 1e-12)
+        if norm_override is not None:
+            norm = norm_override
         return center, norm, batched_data, sampler_state, rng
+
+    def _estimate_source_stats(
+        self,
+        ground_params,
+        batched_data,
+        sampler_state,
+        sample_plan: SamplePlan,
+        rng,
+        *,
+        axis: int,
+        source_sector: SourceSector | None = None,
+    ):
+        """Return one component while preserving the previous private API.
+
+        Returns:
+            The selected center and norm, updated sampler data/state, and RNG.
+        """
+        centers, norms, batched_data, sampler_state, rng = (
+            self._estimate_vector_source_stats(
+                ground_params,
+                batched_data,
+                sampler_state,
+                sample_plan,
+                rng,
+                source_sector=source_sector,
+            )
+        )
+        return (
+            float(centers[int(axis)]),
+            float(norms[int(axis)]),
+            batched_data,
+            sampler_state,
+            rng,
+        )
 
     def _make_source_log_amplitude(
         self,
@@ -1497,33 +2251,109 @@ class MoleculeLITWorkflow(Workflow):
         ground_logpsi,
         ground_energy: float,
         *,
+        response_vector_apply=None,
+        source_sector: SourceSector | None = None,
         axis: int,
         source_center: float,
         source_norm: float,
     ):
-        @jax.jit
-        def source_update(response_params, batched_data, spring_previous, omega):
-            stats, updates, spring_state, damping = self._source_sr_stats_and_updates(
-                response_apply,
+        active_operations = (
+            self._active_source_sector_operations(source_sector)
+            if source_sector is not None and response_vector_apply is not None
+            else ()
+        )
+        identity_operation = jnp.eye(3)
+
+        if active_operations:
+            evaluation_operations = jnp.stack(active_operations)
+
+            @jax.jit
+            def evaluate_covariance_batch(response_params, evaluation_batch):
+                losses = jax.lax.map(
+                    lambda operation: _vector_covariance_penalty_loss(
+                        response_vector_apply,
+                        response_params,
+                        evaluation_batch,
+                        source_sector,
+                        operation,
+                    ),
+                    evaluation_operations,
+                )
+                return _summarize_source_covariance_losses(losses)
+
+            def evaluate_source_covariance_metrics(response_params, evaluation_pool):
+                evaluation_batch = _cyclic_batched_data_chunk(
+                    evaluation_pool,
+                    min(
+                        evaluation_pool.batch_size,
+                        int(self.lit_config.nqs_source_symmetry_eval_batch_size),
+                    ),
+                    0,
+                )
+                return evaluate_covariance_batch(response_params, evaluation_batch)
+
+        else:
+
+            def evaluate_source_covariance_metrics(response_params, evaluation_pool):
+                del evaluation_pool
+                first_leaf = jax.tree_util.tree_leaves(response_params)[0]
+                zero = jnp.asarray(0.0, dtype=first_leaf.dtype)
+                return _SourceCovarianceMetrics(
+                    mean_loss=zero,
+                    max_loss=zero,
+                    worst_operation_index=jnp.asarray(-1, dtype=jnp.int32),
+                )
+
+        def evaluate_source_covariance(response_params, evaluation_pool):
+            return evaluate_source_covariance_metrics(
                 response_params,
-                ground_logpsi,
-                ground_params,
-                batched_data,
-                spring_state=_SpringState(spring_previous),
-                axis=axis,
-                source_center=source_center,
-                source_norm=source_norm,
-                ground_energy=ground_energy,
-                omega=omega,
+                evaluation_pool,
+            ).mean_loss
+
+        @jax.jit
+        def source_update(
+            response_params,
+            batched_data,
+            spring_previous,
+            omega,
+            source_operation,
+        ):
+            stats, updates, spring_state, damping, covariance_loss = (
+                self._source_sr_stats_and_updates(
+                    response_apply,
+                    response_params,
+                    ground_logpsi,
+                    ground_params,
+                    batched_data,
+                    response_vector_apply=response_vector_apply,
+                    source_sector=source_sector,
+                    source_operation=(source_operation if active_operations else None),
+                    spring_state=_SpringState(spring_previous),
+                    axis=axis,
+                    source_center=source_center,
+                    source_norm=source_norm,
+                    ground_energy=ground_energy,
+                    omega=omega,
+                )
             )
             response_params = _apply_updates(response_params, updates)
-            loss = _regularized_loss(
-                stats,
-                self.lit_config.nqs_reverse_kl_weight,
+            loss = (
+                _regularized_loss(
+                    stats,
+                    self.lit_config.nqs_reverse_kl_weight,
+                )
+                + jnp.asarray(
+                    self.lit_config.nqs_source_symmetry_weight,
+                    dtype=stats.loss.dtype,
+                )
+                * covariance_loss
             )
             return (
                 response_params,
-                stats._replace(loss=loss),
+                stats._replace(
+                    loss=loss,
+                    source_covariance_loss=covariance_loss,
+                ),
                 spring_state.previous_direction,
                 damping,
             )
@@ -1560,6 +2390,7 @@ class MoleculeLITWorkflow(Workflow):
             direct_active,
             spring_previous,
             omega,
+            source_operation,
         ):
             source_sums = nqs_lit_source_sampled_sums(
                 response_apply,
@@ -1598,24 +2429,39 @@ class MoleculeLITWorkflow(Workflow):
             )
 
             def source_branch(_):
-                source_updates, next_spring_state, spring_damping = (
-                    self._weighted_sr_updates(
-                        response_apply,
-                        response_params,
-                        ground_logpsi,
-                        ground_params,
-                        source_batched_data,
-                        spring_state=_SpringState(spring_previous),
-                        axis=axis,
-                        source_center=source_center,
-                        ground_energy=ground_energy,
-                        omega=omega,
-                    )
+                (
+                    source_updates,
+                    next_spring_state,
+                    spring_damping,
+                    covariance_loss,
+                ) = self._weighted_sr_updates(
+                    response_apply,
+                    response_params,
+                    ground_logpsi,
+                    ground_params,
+                    source_batched_data,
+                    spring_state=_SpringState(spring_previous),
+                    axis=axis,
+                    source_center=source_center,
+                    ground_energy=ground_energy,
+                    omega=omega,
+                    response_vector_apply=response_vector_apply,
+                    source_sector=source_sector,
+                    source_operation=(source_operation if active_operations else None),
                 )
                 source_response_params = _apply_updates(response_params, source_updates)
+                regularized_source_stats = source_stats._replace(
+                    loss=source_stats.loss
+                    + jnp.asarray(
+                        self.lit_config.nqs_source_symmetry_weight,
+                        dtype=source_stats.loss.dtype,
+                    )
+                    * covariance_loss,
+                    source_covariance_loss=covariance_loss,
+                )
                 return (
                     source_response_params,
-                    source_stats,
+                    regularized_source_stats,
                     direct_batched_data,
                     direct_sampler_state,
                     direct_rng,
@@ -1668,9 +2514,31 @@ class MoleculeLITWorkflow(Workflow):
                         omega=omega,
                     )
                 )
-                direct_loss = _regularized_loss(
-                    direct_stats,
-                    self.lit_config.nqs_reverse_kl_weight,
+                covariance_loss, covariance_updates = (
+                    self._source_sector_penalty_updates(
+                        response_vector_apply,
+                        response_params,
+                        source_batched_data,
+                        source_sector,
+                        source_operation if active_operations else None,
+                    )
+                )
+                if covariance_updates is not None:
+                    direct_updates = jax.tree.map(
+                        operator.add,
+                        direct_updates,
+                        covariance_updates,
+                    )
+                direct_loss = (
+                    _regularized_loss(
+                        direct_stats,
+                        self.lit_config.nqs_reverse_kl_weight,
+                    )
+                    + jnp.asarray(
+                        self.lit_config.nqs_source_symmetry_weight,
+                        dtype=direct_stats.loss.dtype,
+                    )
+                    * covariance_loss
                 )
                 direct_response_params = _apply_updates(
                     response_params,
@@ -1678,7 +2546,10 @@ class MoleculeLITWorkflow(Workflow):
                 )
                 return (
                     direct_response_params,
-                    direct_stats._replace(loss=direct_loss),
+                    direct_stats._replace(
+                        loss=direct_loss,
+                        source_covariance_loss=covariance_loss,
+                    ),
                     next_batched_data,
                     next_sampler_state,
                     next_rng,
@@ -1719,17 +2590,28 @@ class MoleculeLITWorkflow(Workflow):
                 batch_index,
             )
             if not direct_enabled:
+                source_operation = (
+                    active_operations[int(batch_index) % len(active_operations)]
+                    if active_operations
+                    else identity_operation
+                )
                 response_params, stats, spring_previous, _ = source_update(
                     response_params,
                     update_batch,
                     update_carry.spring.previous_direction,
                     omega,
+                    source_operation,
                 )
                 return (
                     response_params,
                     stats,
                     update_carry._replace(spring=_SpringState(spring_previous)),
                 )
+            source_operation = (
+                active_operations[int(batch_index) % len(active_operations)]
+                if active_operations
+                else identity_operation
+            )
             (
                 response_params,
                 stats,
@@ -1750,6 +2632,7 @@ class MoleculeLITWorkflow(Workflow):
                 update_carry.direct.use_direct,
                 update_carry.spring.previous_direction,
                 omega,
+                source_operation,
             )
             return (
                 response_params,
@@ -1775,10 +2658,19 @@ class MoleculeLITWorkflow(Workflow):
                 omega,
                 axis=axis,
                 fallback_update=fallback_update,
+                source_operation=(
+                    active_operations[0] if active_operations else identity_operation
+                ),
             )
 
         update.init_carry = self._init_nqs_update_carry  # type: ignore[attr-defined]
         update.precompile_direct = precompile_direct  # type: ignore[attr-defined]
+        update.source_covariance_loss = (  # type: ignore[attr-defined]
+            evaluate_source_covariance
+        )
+        update.source_covariance_metrics = (  # type: ignore[attr-defined]
+            evaluate_source_covariance_metrics
+        )
         return update
 
     def _precompile_direct_fallback_kernels(
@@ -1791,6 +2683,7 @@ class MoleculeLITWorkflow(Workflow):
         *,
         axis: int,
         fallback_update,
+        source_operation,
     ):
         if not (
             self.lit_config.nqs_direct_psi_train
@@ -1818,12 +2711,59 @@ class MoleculeLITWorkflow(Workflow):
             update_carry.direct.use_direct,
             update_carry.spring.previous_direction,
             omega,
+            source_operation,
         ).compile()
         logger.info(
             "Precompiled fused direct pi_Psi fallback step for axis=%s",
             _AXIS_NAMES[axis],
         )
         return rng
+
+    def _source_sector_penalty_updates(
+        self,
+        response_vector_apply,
+        response_params,
+        batched_data,
+        source_sector: SourceSector | None,
+        source_operation,
+    ):
+        """Return a covariance loss and an independently clipped SGD update.
+
+        The physical SPRING metric is built from only the selected Cartesian
+        response component.  The other vector heads therefore lie in its exact
+        null space.  Applying their covariance gradients through that metric
+        would amplify them by the tiny damping and consume the global SR norm
+        clip, so symmetry uses its own Euclidean step.
+        """
+        if (
+            response_vector_apply is None
+            or source_sector is None
+            or source_operation is None
+            or self.lit_config.nqs_source_symmetry_weight <= 0.0
+        ):
+            first_leaf = jax.tree_util.tree_leaves(response_params)[0]
+            return jnp.asarray(0.0, dtype=first_leaf.dtype), None
+        loss, flat_gradient = _vector_covariance_penalty_gradient(
+            response_vector_apply,
+            response_params,
+            batched_data,
+            source_sector,
+            source_operation,
+        )
+        finite_penalty = jnp.isfinite(loss) & jnp.all(jnp.isfinite(flat_gradient))
+        flat_gradient = jnp.where(
+            finite_penalty,
+            flat_gradient,
+            jnp.zeros_like(flat_gradient),
+        )
+        updates = _symmetry_gradient_updates(
+            response_params,
+            flat_gradient,
+            weight=self.lit_config.nqs_source_symmetry_weight,
+            learning_rate=self.lit_config.nqs_source_symmetry_learning_rate,
+            max_norm=self.lit_config.nqs_source_symmetry_max_norm,
+        )
+        return loss, updates
 
     def _source_sr_stats_and_updates(
         self,
@@ -1833,6 +2773,9 @@ class MoleculeLITWorkflow(Workflow):
         ground_params,
         batched_data,
         *,
+        response_vector_apply=None,
+        source_sector: SourceSector | None = None,
+        source_operation=None,
         spring_state: _SpringState,
         axis: int,
         source_center: float,
@@ -1859,6 +2802,13 @@ class MoleculeLITWorkflow(Workflow):
             omega=omega,
             eta=self.lit_config.eta,
         )
+        covariance_loss, covariance_updates = self._source_sector_penalty_updates(
+            response_vector_apply,
+            response_params,
+            batched_data,
+            source_sector,
+            source_operation,
+        )
         updates, spring_state, damping = self._weighted_sr_updates_from_scores(
             response_params,
             score,
@@ -1866,7 +2816,9 @@ class MoleculeLITWorkflow(Workflow):
             source_weight,
             spring_state,
         )
-        return stats, updates, spring_state, damping
+        if covariance_updates is not None:
+            updates = jax.tree.map(operator.add, updates, covariance_updates)
+        return stats, updates, spring_state, damping, covariance_loss
 
     def _weighted_sr_updates_from_scores(
         self,
@@ -1927,6 +2879,9 @@ class MoleculeLITWorkflow(Workflow):
         ground_params,
         batched_data,
         *,
+        response_vector_apply=None,
+        source_sector: SourceSector | None = None,
+        source_operation=None,
         spring_state: _SpringState,
         axis: int,
         source_center: float,
@@ -1944,13 +2899,23 @@ class MoleculeLITWorkflow(Workflow):
             ground_energy=ground_energy,
             omega=omega,
         )
-        return self._weighted_sr_updates_from_scores(
+        covariance_loss, covariance_updates = self._source_sector_penalty_updates(
+            response_vector_apply,
+            response_params,
+            batched_data,
+            source_sector,
+            source_operation,
+        )
+        updates, spring_state, damping = self._weighted_sr_updates_from_scores(
             response_params,
             score,
             ratio,
             source_weight,
             spring_state,
         )
+        if covariance_updates is not None:
+            updates = jax.tree.map(operator.add, updates, covariance_updates)
+        return updates, spring_state, damping, covariance_loss
 
     def _direct_sr_stats_and_updates_from_source_sums(
         self,
@@ -3176,18 +4141,28 @@ def _physics_continuation_step(stats, *, gap: float, fraction: float, min_step: 
     return min(float(gap), max(float(min_step), proposed))
 
 
-def _finite_valid_nqs_stats(stats) -> bool:
-    values = (
-        float(jax.device_get(stats.loss)),
-        float(jax.device_get(stats.fidelity)),
-        float(jax.device_get(stats.reverse_kl)),
-        float(jax.device_get(stats.invalid_sample_fraction)),
+def _finite_valid_nqs_stats(
+    stats,
+    *,
+    max_source_covariance: float | None = None,
+) -> bool:
+    return _is_eligible_nqs_checkpoint(
+        stats,
+        max_source_covariance=max_source_covariance,
     )
-    return bool(np.all(np.isfinite(values))) and values[-1] <= 0.0
 
 
-def _continuation_probe_is_acceptable(current, candidate, *, retention: float) -> bool:
-    if not _finite_valid_nqs_stats(candidate):
+def _continuation_probe_is_acceptable(
+    current,
+    candidate,
+    *,
+    retention: float,
+    max_source_covariance: float | None = None,
+) -> bool:
+    if not _finite_valid_nqs_stats(
+        candidate,
+        max_source_covariance=max_source_covariance,
+    ):
         return False
     current_fidelity = float(jax.device_get(current.fidelity))
     candidate_fidelity = float(jax.device_get(candidate.fidelity))
@@ -3195,6 +4170,99 @@ def _continuation_probe_is_acceptable(current, candidate, *, retention: float) -
         return False
     required = max(0.0, float(retention) * current_fidelity)
     return candidate_fidelity >= required
+
+
+def _three_component_override(
+    value: float | tuple[float, float, float] | None,
+    *,
+    name: str,
+    positive: bool = False,
+) -> np.ndarray | None:
+    """Normalize a scalar or Cartesian override to a length-three host array.
+
+    Returns:
+        ``None`` when unset, otherwise a finite float64 array of shape ``(3,)``.
+
+    Raises:
+        ValueError: If the override has the wrong shape or invalid values.
+    """
+    if value is None:
+        return None
+    array = np.asarray(value, dtype=np.float64)
+    if array.ndim == 0:
+        array = np.full(3, float(array), dtype=np.float64)
+    elif array.shape == (3,):
+        array = np.array(array, dtype=np.float64, copy=True)
+    else:
+        msg = f"{name} must be a scalar or length-three Cartesian vector."
+        raise ValueError(msg)
+    if not np.all(np.isfinite(array)):
+        msg = f"{name} must contain only finite values."
+        raise ValueError(msg)
+    if positive and np.any(array <= 0.0):
+        msg = f"{name} must contain only positive values."
+        raise ValueError(msg)
+    return array
+
+
+def _calibrated_residual_log_scale(
+    raw_logpsi,
+    ground_logpsi,
+    dipole,
+    source_center,
+    source_coefficient,
+    *,
+    target_ratio: float,
+) -> float:
+    """Calibrate the raw residual to a typical source-vector norm.
+
+    FermiNet determinant heads have an arbitrary absolute scale, so multiplying
+    the raw response by a nominal ``1e-4`` does not imply a ``1e-4`` residual.
+    The median log-norm ratio on a small ground-state batch fixes that gauge.
+
+    Returns:
+        The additive raw-response log scale that realizes ``target_ratio``.
+
+    Raises:
+        ValueError: If no finite, nonzero source/raw norm pair is available.
+    """
+    raw_logs = np.asarray(jax.device_get(raw_logpsi))
+    ground_logs = np.asarray(jax.device_get(ground_logpsi))
+    dipoles = np.asarray(jax.device_get(dipole))
+    centers = np.asarray(jax.device_get(source_center))
+    coefficient = complex(np.asarray(jax.device_get(source_coefficient)))
+
+    def vector_log_norm(component_log_magnitudes: np.ndarray) -> np.ndarray:
+        finite = np.isfinite(component_log_magnitudes)
+        invalid = ~(finite | np.isneginf(component_log_magnitudes))
+        masked = np.where(finite, component_log_magnitudes, -np.inf)
+        maximum = np.max(masked, axis=-1)
+        safe_maximum = np.where(np.isfinite(maximum), maximum, 0.0)
+        scaled_norm_sq = np.sum(
+            np.where(
+                finite,
+                np.exp(2.0 * (masked - safe_maximum[..., None])),
+                0.0,
+            ),
+            axis=-1,
+        )
+        result = safe_maximum + 0.5 * np.log(scaled_norm_sq)
+        return np.where(np.any(invalid, axis=-1), np.nan, result)
+
+    source_factor = np.abs(coefficient * (dipoles - centers))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        source_component_logs = np.real(ground_logs)[..., None] + np.log(source_factor)
+        source_log_norm = vector_log_norm(source_component_logs)
+        raw_log_norm = vector_log_norm(np.real(raw_logs))
+        offsets = source_log_norm - raw_log_norm
+    finite_offsets = offsets[np.isfinite(offsets)]
+    if finite_offsets.size == 0:
+        msg = (
+            "Cannot calibrate the source-aligned residual because no finite, "
+            "nonzero source/raw vector norm pair was found."
+        )
+        raise ValueError(msg)
+    return float(np.log(float(target_ratio)) + np.median(finite_offsets))
 
 
 def _optional_float(value: float | None) -> float:
@@ -3227,6 +4295,188 @@ def _axis_indices(axes: str) -> tuple[int, ...]:
         msg = "At least one dipole axis is required."
         raise ValueError(msg)
     return tuple(result)
+
+
+def _is_identity_operation(operation, *, tolerance: float = 1e-10) -> bool:
+    return bool(
+        np.allclose(
+            np.asarray(operation),
+            np.eye(3),
+            rtol=0.0,
+            atol=tolerance,
+        )
+    )
+
+
+def _project_source_center_to_invariant_subspace(
+    source_center,
+    source_sector: SourceSector | None,
+    *,
+    electron_count: int,
+    tolerance: float = 1e-10,
+) -> np.ndarray:
+    r"""Project an affine dipole center into the sector's invariant subspace.
+
+    For a spatial operation about ``c``, the electronic dipole transforms as
+    ``D(gX) = g (D(X) + N_e c) - N_e c``.  Consequently ``D-D0`` is a
+    Cartesian vector precisely when ``q = D0 + N_e c`` is fixed by every
+    configured operation.  The joint nullspace of the stacked ``g-I``
+    constraints gives the closest symmetry-consistent center.
+
+    Returns:
+        A float64 Cartesian center.  A missing or trivial sector is returned
+        unchanged so callers of the previous private estimator API retain C1
+        behavior.
+
+    Raises:
+        ValueError: If ``source_center`` is not a Cartesian vector.
+    """
+    center = np.asarray(source_center, dtype=np.float64)
+    if center.shape != (3,):
+        msg = f"source_center must have shape (3,), got {center.shape}."
+        raise ValueError(msg)
+    if source_sector is None or source_sector.is_trivial:
+        return np.array(center, copy=True)
+
+    symmetry_center = np.asarray(source_sector.center, dtype=np.float64)
+    q = center + int(electron_count) * symmetry_center
+    constraints = np.concatenate(
+        [
+            np.asarray(operation, dtype=np.float64) - np.eye(3)
+            for operation in source_sector.operations
+            if not _is_identity_operation(operation)
+        ],
+        axis=0,
+    )
+    _, singular_values, right_vectors = np.linalg.svd(
+        constraints,
+        full_matrices=True,
+    )
+    largest = float(singular_values[0]) if singular_values.size else 0.0
+    numerical_cutoff = (
+        64.0 * max(constraints.shape) * np.finfo(np.float64).eps * max(1.0, largest)
+    )
+    cutoff = max(numerical_cutoff, float(tolerance) * max(1.0, largest))
+    rank = int(np.sum(singular_values > cutoff))
+    null_basis = right_vectors[rank:].T
+    if null_basis.shape[1] == 0:
+        projected_q = np.zeros(3, dtype=np.float64)
+    else:
+        projected_q = null_basis @ (null_basis.T @ q)
+    return projected_q - int(electron_count) * symmetry_center
+
+
+def _log_source_center_projection(
+    unprojected_center,
+    projected_center,
+    source_sector: SourceSector | None,
+) -> None:
+    """Log the Cartesian correction made by a nontrivial source sector."""
+    if source_sector is None or source_sector.is_trivial:
+        return
+    correction = np.asarray(projected_center) - np.asarray(unprojected_center)
+    logger.info(
+        "NQS-LIT source-center projection sector=%s correction="
+        "(%.8e, %.8e, %.8e) correction_norm=%.8e",
+        source_sector.label,
+        float(correction[0]),
+        float(correction[1]),
+        float(correction[2]),
+        float(np.linalg.norm(correction)),
+    )
+
+
+def _vector_covariance_penalty_gradient(
+    response_vector_apply,
+    response_params,
+    batched_data: BatchedData,
+    source_sector: SourceSector,
+    source_operation,
+):
+    """Differentiate one source-sector covariance operation on one MC batch.
+
+    Returns:
+        The scalar covariance loss and its flattened real-parameter gradient.
+    """
+    loss, gradient = jax.value_and_grad(
+        lambda local_params: _vector_covariance_penalty_loss(
+            response_vector_apply,
+            local_params,
+            batched_data,
+            source_sector,
+            source_operation,
+        )
+    )(response_params)
+    flat_gradient, _ = ravel_pytree(gradient)
+    return loss, flat_gradient
+
+
+def _vector_covariance_penalty_loss(
+    response_vector_apply,
+    response_params,
+    batched_data: BatchedData,
+    source_sector: SourceSector,
+    source_operation,
+):
+    """Evaluate one source-sector covariance operation on one MC batch.
+
+    Returns:
+        Mean scale-invariant vector covariance residual.
+    """
+    per_sample = jax.vmap(
+        lambda one: source_sector_covariance_loss(
+            lambda transformed: response_vector_apply(
+                response_params,
+                transformed,
+            ),
+            one,
+            source_sector,
+            source_operation,
+        ),
+        in_axes=(batched_data.vmap_axis,),
+    )(batched_data.data)
+    return jnp.mean(per_sample)
+
+
+def _summarize_source_covariance_losses(losses) -> _SourceCovarianceMetrics:
+    """Summarize batch-mean losses across active symmetry operations.
+
+    A non-finite operation is mapped to an infinite hard-guard value so a
+    single broken operation cannot be hidden by the operation mean.
+
+    Returns:
+        The mean, guarded maximum, and worst active-operation index.
+    """
+    losses = jnp.asarray(losses)
+    if losses.shape[0] == 0:
+        return _SourceCovarianceMetrics(
+            mean_loss=jnp.asarray(0.0, dtype=losses.dtype),
+            max_loss=jnp.asarray(0.0, dtype=losses.dtype),
+            worst_operation_index=jnp.asarray(-1, dtype=jnp.int32),
+        )
+    guarded_losses = jnp.where(jnp.isfinite(losses), losses, jnp.inf)
+    return _SourceCovarianceMetrics(
+        mean_loss=jnp.mean(losses),
+        max_loss=jnp.max(guarded_losses),
+        worst_operation_index=jnp.argmax(guarded_losses).astype(jnp.int32),
+    )
+
+
+def _coerce_source_covariance_metrics(value) -> _SourceCovarianceMetrics:
+    """Accept the legacy scalar covariance-evaluator result as one operation.
+
+    Returns:
+        A full covariance metric tuple, with a scalar interpreted as both the
+        mean and maximum of a one-operation evaluator.
+    """
+    if isinstance(value, _SourceCovarianceMetrics):
+        return value
+    scalar = jnp.asarray(value)
+    return _SourceCovarianceMetrics(
+        mean_loss=scalar,
+        max_loss=scalar,
+        worst_operation_index=jnp.asarray(0, dtype=jnp.int32),
+    )
 
 
 def _flatten_batched_tree(tree, batch_size: int) -> jnp.ndarray:
@@ -3768,6 +5018,31 @@ def _scaled_direction_updates(
     return unravel_fn(scale * direction)
 
 
+def _symmetry_gradient_updates(
+    params,
+    flat_gradient,
+    *,
+    weight: float | jnp.ndarray,
+    learning_rate: float,
+    max_norm: float | None,
+):
+    """Take a separately scaled descent step for source covariance.
+
+    This deliberately does not use the selected-axis SPRING metric; parameters
+    exclusive to the two auxiliary vector heads have zero score in that metric.
+
+    Returns:
+        A parameter-shaped tree of independently clipped covariance updates.
+    """
+    direction = -jnp.asarray(weight, dtype=flat_gradient.dtype) * flat_gradient
+    return _scaled_direction_updates(
+        params,
+        direction,
+        learning_rate=learning_rate,
+        max_norm=max_norm,
+    )
+
+
 def _regularized_loss(stats, reverse_kl_weight: float):
     return (
         1.0
@@ -3780,7 +5055,81 @@ def _regularized_loss(stats, reverse_kl_weight: float):
     )
 
 
-def _is_better_nqs_checkpoint(candidate, incumbent) -> bool:
+def _source_covariance_host_values(stats) -> tuple[float, float]:
+    """Read mean and worst-operation covariance diagnostics on the host.
+
+    Returns:
+        The operation-mean and worst-operation covariance losses.  Legacy
+        statistics without the maximum field use their scalar mean for both.
+    """
+    mean_loss = float(jax.device_get(getattr(stats, "source_covariance_loss", 0.0)))
+    max_loss = float(
+        jax.device_get(getattr(stats, "source_covariance_max_loss", mean_loss))
+    )
+    return mean_loss, max_loss
+
+
+def _require_eligible_nqs_checkpoint(
+    stats,
+    *,
+    max_source_covariance: float | None,
+    context: str,
+) -> None:
+    """Raise when a checkpoint is invalid or violates its worst-op guard.
+
+    Raises:
+        RuntimeError: If the checkpoint is not eligible for propagation.
+    """
+    if _is_eligible_nqs_checkpoint(
+        stats,
+        max_source_covariance=max_source_covariance,
+    ):
+        return
+    covariance_mean, covariance_max = _source_covariance_host_values(stats)
+    msg = (
+        f"{context}; covariance mean={covariance_mean:.6e}, "
+        f"max={covariance_max:.6e}, maximum={max_source_covariance!r}."
+    )
+    raise RuntimeError(msg)
+
+
+def _is_eligible_nqs_checkpoint(
+    stats,
+    *,
+    max_source_covariance: float | None = None,
+) -> bool:
+    """Return whether one held-out checkpoint is numerically admissible."""
+    loss = float(jax.device_get(stats.loss))
+    fidelity = float(jax.device_get(stats.fidelity))
+    reverse_kl = float(jax.device_get(stats.reverse_kl))
+    invalid = float(jax.device_get(stats.invalid_sample_fraction))
+    covariance_mean, covariance_max = _source_covariance_host_values(stats)
+    finite = bool(
+        np.all(
+            np.isfinite(
+                (
+                    loss,
+                    fidelity,
+                    reverse_kl,
+                    invalid,
+                    covariance_mean,
+                    covariance_max,
+                )
+            )
+        )
+    )
+    within_covariance = max_source_covariance is None or covariance_max <= float(
+        max_source_covariance
+    )
+    return finite and invalid <= 0.0 and within_covariance
+
+
+def _is_better_nqs_checkpoint(
+    candidate,
+    incumbent,
+    *,
+    max_source_covariance: float | None = None,
+) -> bool:
     """Compare held-out checkpoints, rejecting non-finite/invalid estimates.
 
     Returns:
@@ -3791,9 +5140,10 @@ def _is_better_nqs_checkpoint(candidate, incumbent) -> bool:
         loss = float(jax.device_get(stats.loss))
         fidelity = float(jax.device_get(stats.fidelity))
         reverse_kl = float(jax.device_get(stats.reverse_kl))
-        invalid = float(jax.device_get(stats.invalid_sample_fraction))
-        finite = bool(np.all(np.isfinite((loss, fidelity, reverse_kl, invalid))))
-        valid = finite and invalid <= 0.0
+        valid = _is_eligible_nqs_checkpoint(
+            stats,
+            max_source_covariance=max_source_covariance,
+        )
         return valid, -loss, fidelity, -reverse_kl
 
     candidate_score = score(candidate)
