@@ -109,20 +109,14 @@ lit:
   nqs_response_use_last_layer: false
   nqs_response_envelope: abs_isotropic
   nqs_response_orbitals_spin_split: true
-  # Initialize the vector response at the large-negative-frequency source
-  # solution, then regularize one automatically discovered molecular operation
-  # per SPRING step.  For He this includes exact inversion covariance.
+  # Initialize at the large-negative-frequency source solution.  The runtime
+  # now supports only a hard odd-parity scalar response for an even-parity
+  # one-center atomic ground state and an unconstrained scalar response for a
+  # genuinely C1 molecule.
   nqs_source_aligned: true
-  nqs_source_aligned_residual_scale: 1.0e-4
-  nqs_source_symmetry_mode: auto
-  nqs_source_symmetry_weight: 1.0
-  # Optimize covariance in a separately clipped Euclidean step.  Feeding its
-  # y/z-head gradients through the x-response SPRING metric is singular.
-  nqs_source_symmetry_learning_rate: 0.001
-  nqs_source_symmetry_max_norm: 0.002
-  nqs_source_symmetry_eval_batch_size: 256
-  nqs_source_symmetry_tolerance: 1.0e-5
-  nqs_source_symmetry_max_operations: 16
-  # Refuse to optimize if the held-out pure source or every candidate response
-  # violates the target vector sector.  The equilibrated formal pool is ~1e-6.
+  nqs_source_aligned_residual_scale: 1.0e-2
+  nqs_source_symmetry_mode: atom_c1
+  nqs_source_symmetry_weight: 0.0
+  # This is now only a diagnostic inversion guard on the sampled atomic source;
+  # the response parity itself is exact by construction and has no soft loss.
   nqs_source_symmetry_max_covariance: 1.0e-3

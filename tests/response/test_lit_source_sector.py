@@ -22,7 +22,7 @@ from jaqmc.app.molecule.lit_workflow import (
     _vector_covariance_penalty_gradient,
 )
 from jaqmc.data import BatchedData
-from jaqmc.response.nqs_lit import nqs_lit_stats_from_source_sums
+from jaqmc.response.nqs_lit import local_action_ratio, nqs_lit_stats_from_source_sums
 from jaqmc.response.source_sector import SourceSector
 
 
@@ -54,7 +54,7 @@ def test_source_aligned_residual_scale_is_relative_to_raw_head_gauge():
     np.testing.assert_allclose(log_scale, np.log(1e-5), rtol=2e-6)
 
 
-def test_workflow_source_aligned_vector_initialization_uses_warm_coefficient():
+def test_workflow_source_aligned_atom_is_scalar_and_hard_odd_about_nucleus():
     workflow = object.__new__(MoleculeLITWorkflow)
     workflow.system_config = SimpleNamespace(electron_spins=(1, 0))
     workflow.lit_config = MolecularLITConfig(
@@ -67,25 +67,25 @@ def test_workflow_source_aligned_vector_initialization_uses_warm_coefficient():
         nqs_source_symmetry_mode="inversion",
         nqs_source_symmetry_weight=1.0,
     )
-    data = _one_electron_data([[0.3, -0.2, 0.4]])
-    identity = tuple(tuple(float(value) for value in row) for row in np.eye(3))
-    inversion = tuple(tuple(float(value) for value in row) for row in -np.eye(3))
-    sector = SourceSector(
-        center=(0.0, 0.0, 0.0),
-        operations=(identity, inversion),
-        label="inversion",
+    atom_center = jnp.asarray([0.4, -0.3, 0.2], dtype=jnp.float32)
+    data = MoleculeData(
+        electrons=jnp.asarray([[0.7, -0.1, 0.5]], dtype=jnp.float32),
+        atoms=atom_center[None, :],
+        charges=jnp.asarray([1.0], dtype=jnp.float32),
     )
+    sector = workflow._configured_source_sector(data)
+    assert sector.label == "atom_odd_hard"
+    np.testing.assert_allclose(sector.center, atom_center, atol=1e-7)
 
     def ground_logpsi(_params, point):
-        return -jnp.linalg.norm(point.electrons[0])
+        return -jnp.linalg.norm(point.electrons[0] - atom_center)
 
     scalar_apply, vector_apply, params = workflow._make_response_ansatz(
         data,
         jax.random.PRNGKey(7),
         {},
         axis=0,
-        source_center=0.0,
-        source_centers=jnp.zeros(3),
+        source_center=-float(atom_center[0]),
         source_sector=sector,
         ground_logpsi=ground_logpsi,
         initial_omega=-4.0,
@@ -99,21 +99,33 @@ def test_workflow_source_aligned_vector_initialization_uses_warm_coefficient():
         rtol=2e-6,
     )
     assert all(not jnp.iscomplexobj(leaf) for leaf in jax.tree_util.tree_leaves(params))
+    assert vector_apply is None
 
-    vector_logpsi = vector_apply(params, data)
-    coefficient = coefficient_parts[0] + 1j * coefficient_parts[1]
-    source = (
-        coefficient
-        * (-jnp.sum(data.electrons, axis=0))
-        * jnp.exp(ground_logpsi({}, data))
-    )
+    inverted = data.merge({"electrons": 2.0 * atom_center[None, :] - data.electrons})
+    amplitude = jnp.exp(scalar_apply(params, data))
+    inverted_amplitude = jnp.exp(scalar_apply(params, inverted))
     np.testing.assert_allclose(
-        np.asarray(jnp.exp(vector_logpsi)),
-        np.asarray(source),
-        rtol=2e-5,
+        np.asarray(inverted_amplitude),
+        np.asarray(-amplitude),
+        rtol=2e-6,
         atol=2e-7,
     )
-    np.testing.assert_allclose(scalar_apply(params, data), vector_logpsi[0])
+
+    action, response_ratio, local_energy = local_action_ratio(
+        scalar_apply,
+        params,
+        ground_logpsi,
+        {},
+        data,
+        ground_energy=-0.5,
+        omega=0.3,
+        eta=0.02,
+    )
+    assert np.all(
+        np.isfinite(
+            np.asarray([action, response_ratio, local_energy], dtype=np.complex64)
+        )
+    )
 
 
 def test_workflow_source_aligned_c1_uses_scalar_response_and_batch_calibration():
@@ -170,6 +182,7 @@ def test_workflow_source_aligned_c1_uses_scalar_response_and_batch_calibration()
         axis=0,
         source_center=source_center,
         source_centers=jnp.asarray([9.0, 8.0, 7.0]),
+        source_sector=sector,
         ground_logpsi=ground_logpsi,
         initialization_data=initialization_data,
         initial_omega=-4.0,
@@ -317,7 +330,7 @@ def test_invalid_covariance_loss_cannot_write_nonfinite_parameter_updates():
     np.testing.assert_array_equal(np.asarray(updates["value"]), 0.0)
 
 
-def test_workflow_source_sector_c1_and_inversion_configuration():
+def test_workflow_source_sector_c1_and_atom_hard_odd_configuration():
     workflow = object.__new__(MoleculeLITWorkflow)
     workflow.lit_config = MolecularLITConfig(
         nqs_source_symmetry_mode="auto",
@@ -353,19 +366,18 @@ def test_workflow_source_sector_c1_and_inversion_configuration():
         charges=jnp.asarray([2.0], dtype=jnp.float32),
     )
 
-    inversion_sector = workflow._configured_source_sector(helium)
-    active = workflow._active_source_sector_operations(inversion_sector)
-    assert inversion_sector.order == 2
-    assert len(active) == 1
-    np.testing.assert_allclose(np.asarray(active[0]), -np.eye(3), atol=1e-7)
+    atom_sector = workflow._configured_source_sector(helium)
+    active = workflow._active_source_sector_operations(atom_sector)
+    guard = workflow._source_guard_operations(atom_sector)
+    assert atom_sector.label == "atom_odd_hard"
+    assert atom_sector.order == 2
+    assert active == ()
+    assert len(guard) == 1
+    np.testing.assert_allclose(np.asarray(guard[0]), -np.eye(3), atol=1e-7)
 
 
 def test_serial_scan_discovers_source_sector_from_physical_geometry(monkeypatch):
-    """Fixed atoms/charges must not come from the shape-only example."""
-
-    class ReachedSourceSector(Exception):
-        pass
-
+    """Unsupported physical symmetry must fail before ground-state restore."""
     atoms = jnp.asarray(
         [[0.2, -0.1, -0.7], [0.2, -0.1, 0.9]],
         dtype=jnp.float32,
@@ -392,57 +404,43 @@ def test_serial_scan_discovers_source_sector_from_physical_geometry(monkeypatch)
         nqs_source_symmetry_max_operations=16,
     )
 
-    class FakeSamplePlan:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def init(self, _data, _rng):
-            return "sampler-state"
-
     monkeypatch.setattr(lit_workflow_module, "data_init", lambda *_args: batch)
-    monkeypatch.setattr(lit_workflow_module, "SamplePlan", FakeSamplePlan)
+
+    ground_restore_called = False
+
+    def ground_restore_must_not_run(*_args):
+        nonlocal ground_restore_called
+        ground_restore_called = True
+        raise AssertionError("ground-state restore ran before symmetry admission")
+
     monkeypatch.setattr(
         workflow,
         "_resolve_nqs_ground_state",
-        lambda *_args: (0, {}, lambda *_inner_args: jnp.asarray(0.0)),
-    )
-    monkeypatch.setattr(
-        workflow,
-        "_resolve_ground_energy",
-        lambda _logpsi, _params, data, state, _plan, rng: (
-            -1.0,
-            data,
-            state,
-            rng,
-        ),
+        ground_restore_must_not_run,
     )
 
-    def verify_source_sector(
-        _params,
-        _data,
-        _state,
-        _plan,
-        _rng,
-        *,
-        source_sector,
-    ):
-        assert source_sector.label == "linear_C4v"
-        assert source_sector.order == 8
-        np.testing.assert_allclose(
-            source_sector.center,
-            [0.2, -0.1, 0.1],
-            atol=1e-7,
-        )
-        raise ReachedSourceSector
-
-    monkeypatch.setattr(
-        workflow,
-        "_estimate_vector_source_stats",
-        verify_source_sector,
-    )
-
-    with pytest.raises(ReachedSourceSector):
+    with pytest.raises(NotImplementedError, match="linear_C4v"):
         workflow._run_serial_scan()
+    assert not ground_restore_called
+
+
+def test_multicenter_finite_non_c1_is_rejected_even_when_legacy_mode_is_off():
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(
+        nqs_source_symmetry_mode="off",
+        nqs_source_symmetry_weight=0.0,
+    )
+    water = MoleculeData(
+        electrons=jnp.zeros((10, 3), dtype=jnp.float32),
+        atoms=jnp.asarray(
+            [[0.0, 0.0, 0.0], [0.8, 0.6, 0.0], [-0.8, 0.6, 0.0]],
+            dtype=jnp.float32,
+        ),
+        charges=jnp.asarray([8.0, 1.0, 1.0], dtype=jnp.float32),
+    )
+
+    with pytest.raises(NotImplementedError, match="finite_O3_4"):
+        workflow._configured_source_sector(water)
 
 
 def test_pure_source_covariance_guard_accepts_symmetric_ground_and_rejects_leakage():

@@ -249,6 +249,59 @@ def _complex_logdet_sum(orbitals: jnp.ndarray) -> jnp.ndarray:
     return jnp.log(determinant_sum) + logmax
 
 
+def odd_parity_project_log_amplitude(
+    log_psi: jnp.ndarray,
+    inverted_log_psi: jnp.ndarray,
+) -> jnp.ndarray:
+    r"""Return the exact odd projection of two complex log amplitudes.
+
+    This stably represents
+
+    .. math::
+
+        \log\left[\frac{\psi(X)-\psi(IX)}{2}\right]
+
+    using a complex ``expm1`` difference about the larger amplitude.  This
+    preserves a small odd component when the two unprojected amplitudes nearly
+    cancel.  No nonzero amplitude floor is introduced: an exact parity node
+    remains an exact zero encoded by a ``-inf`` real log amplitude.  This is
+    required for the projected function to obey
+    :math:`P_-\psi(IX)=-P_-\psi(X)` exactly.
+    """
+    log_psi_array = jnp.asarray(log_psi)
+    inverted_array = jnp.asarray(inverted_log_psi)
+    if log_psi_array.shape != inverted_array.shape:
+        msg = (
+            "log_psi and inverted_log_psi must have identical shapes, got "
+            f"{log_psi_array.shape} and {inverted_array.shape}."
+        )
+        raise ValueError(msg)
+    complex_dtype = jnp.result_type(
+        log_psi_array.dtype,
+        inverted_array.dtype,
+        jnp.complex64,
+    )
+    log_psi_array = log_psi_array.astype(complex_dtype)
+    inverted_array = inverted_array.astype(complex_dtype)
+    use_first_as_base = jnp.real(log_psi_array) >= jnp.real(inverted_array)
+    base = jnp.where(use_first_as_base, log_psi_array, inverted_array)
+    other = jnp.where(use_first_as_base, inverted_array, log_psi_array)
+    orientation = jnp.where(use_first_as_base, -1.0, 1.0).astype(complex_dtype)
+    projected_log = (
+        base
+        + jnp.log(orientation * jnp.expm1(other - base))
+        - jnp.asarray(jnp.log(2.0), dtype=complex_dtype)
+    )
+    both_encoded_zero = (
+        jnp.isneginf(jnp.real(log_psi_array))
+        & jnp.isfinite(jnp.imag(log_psi_array))
+        & jnp.isneginf(jnp.real(inverted_array))
+        & jnp.isfinite(jnp.imag(inverted_array))
+    )
+    encoded_zero = jnp.asarray(-jnp.inf + 0.0j, dtype=complex_dtype)
+    return jnp.where(both_encoded_zero, encoded_zero, projected_log)
+
+
 def source_aligned_vector_logpsi(
     raw_logpsi: jnp.ndarray,
     ground_logpsi: jnp.ndarray,

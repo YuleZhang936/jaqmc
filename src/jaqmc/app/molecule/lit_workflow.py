@@ -26,13 +26,13 @@ from jaqmc.data import BatchedData
 from jaqmc.response.lit import lit_error_bound
 from jaqmc.response.nqs_lit import (
     MolecularResponseFermiNet,
-    MolecularVectorResponseFermiNet,
     NQSLITSourceSums,
     ground_local_energy,
     local_action_ratio,
     molecular_electronic_dipole,
     nqs_lit_source_sampled_sums,
     nqs_lit_stats_from_source_sums,
+    odd_parity_project_log_amplitude,
     restore_params_from_checkpoint,
     source_aligned_vector_logpsi,
 )
@@ -40,6 +40,7 @@ from jaqmc.response.source_sector import (
     SourceSector,
     discover_source_sector,
     source_sector_covariance_loss,
+    transform_molecule_data,
 )
 from jaqmc.response.spectrum import find_spectrum_peaks
 from jaqmc.sampler.base import SamplePlan
@@ -56,6 +57,8 @@ except ImportError:
 logger = logging.LoggerAdapter(
     logging.getLogger(__name__), extra={"category": "response"}
 )
+
+_ATOM_HARD_ODD_SECTOR_LABEL = "atom_odd_hard"
 
 
 @configurable_dataclass
@@ -150,7 +153,11 @@ class MolecularLITConfig:
     nqs_response_orbitals_spin_split: bool = True
     nqs_source_aligned: bool = False
     nqs_source_aligned_residual_scale: float = 1e-3
-    nqs_source_symmetry_mode: str = "off"
+    # Runtime support is deliberately restricted to a hard odd-parity response
+    # for an even-parity atomic ground state, or a symmetry-free multi-center
+    # C1 response.  Legacy values are still accepted so older YAML files
+    # deserialize, but no longer enable vector-head soft-covariance training.
+    nqs_source_symmetry_mode: str = "atom_c1"
     nqs_source_symmetry_weight: float = 0.0
     nqs_source_symmetry_learning_rate: float = 1e-3
     nqs_source_symmetry_max_norm: float | None = 1e-2
@@ -261,6 +268,11 @@ class MoleculeLITWorkflow(Workflow):
         rng = jax.random.PRNGKey(seed)
         rng, data_rng, ground_rng, response_rng, sample_rng = jax.random.split(rng, 5)
         batched_data = data_init(self.system_config, self.config.batch_size, data_rng)
+        # Resolve the deliberately narrow atom/C1 policy from physical fixed
+        # fields before checkpoint loading, sampling, or compilation.  The
+        # shape-only example replaces fixed values and must never classify the
+        # geometry.
+        source_sector = self._configured_source_sector(batched_data.data)
         shape_example = batched_data.unbatched_example()
 
         checkpoint_step, ground_params, ground_logpsi = self._resolve_nqs_ground_state(
@@ -335,28 +347,29 @@ class MoleculeLITWorkflow(Workflow):
         continuation_probe_accepted: list[bool] = []
         continuation_min_step_override: list[bool] = []
 
-        # ``unbatched_example`` is deliberately shape-only and replaces fixed
-        # atoms/charges with ones.  Symmetry discovery must use the physical
-        # fixed fields, otherwise an atom at the origin is spuriously moved to
-        # (1, 1, 1) and its dipole center is projected into the wrong affine
-        # sector.
-        source_sector = self._configured_source_sector(batched_data.data)
+        source_guard_operations = self._source_guard_operations(source_sector)
         logger.info(
-            "NQS-LIT source sector=%s order=%d active_operations=%d",
+            "NQS-LIT response_policy=%s source_sector=%s order=%d "
+            "soft_operations=%d source_guard_operations=%d",
+            _response_symmetry_policy(source_sector),
             source_sector.label,
             source_sector.order,
             len(self._active_source_sector_operations(source_sector)),
+            len(source_guard_operations),
         )
         source_sector_active_operations = np.asarray(
             self._active_source_sector_operations(source_sector),
             dtype=np.float64,
         ).reshape((-1, 3, 3))
+        source_guard_operations_array = np.asarray(
+            source_guard_operations,
+            dtype=np.float64,
+        ).reshape((-1, 3, 3))
 
-        # Estimate all three dipole centers on one ground-state chain.  A
-        # symmetry-constrained response consumes the full Cartesian vector,
-        # while a C1 response uses only the requested component.  The sector is
-        # needed while estimating the centers: their affine, origin-dependent
-        # part must be projected before the centered source norms are finalized.
+        # Estimate all three dipole centers on one ground-state chain.  The
+        # atomic inversion sector is retained only to project the affine,
+        # origin-dependent center before norms are finalized; both supported
+        # response policies themselves use one scalar axis at a time.
         (
             vector_source_centers,
             vector_source_norms,
@@ -752,6 +765,15 @@ class MoleculeLITWorkflow(Workflow):
             source_sector_label=source_sector.label,
             source_sector_order=source_sector.order,
             source_sector_active_operations=source_sector_active_operations,
+            source_guard_operations=source_guard_operations_array,
+            response_symmetry_policy=_response_symmetry_policy(source_sector),
+            response_hard_parity=bool(_is_atom_hard_odd_sector(source_sector)),
+            response_symmetry_center=np.asarray(
+                source_sector.center,
+                dtype=np.float64,
+            ),
+            response_soft_symmetry_enabled=False,
+            nqs_source_symmetry_legacy_training_ignored=True,
             vector_source_centers=vector_source_centers,
             vector_source_norms=vector_source_norms,
             pure_source_covariance_loss=pure_source_covariance_loss,
@@ -982,6 +1004,7 @@ class MoleculeLITWorkflow(Workflow):
             raise ValueError(msg)
         mode = str(self.lit_config.nqs_source_symmetry_mode).lower()
         valid_modes = {
+            "atom_c1",
             "off",
             "none",
             "identity",
@@ -1098,91 +1121,95 @@ class MoleculeLITWorkflow(Workflow):
             raise ValueError(msg)
 
     def _configured_source_sector(self, geometry_data) -> SourceSector:
-        """Discover and cap the molecular operations used during training.
+        """Resolve the restricted atomic-hard-parity or molecular-C1 policy.
 
         Returns:
-            The configured finite source sector with identity first.
+            ``atom_odd_hard`` with identity and inversion for exactly one
+            nucleus, or the identity-only ``C1`` sector for a multi-nuclear
+            geometry with no discovered nontrivial operation.  The atomic
+            source guard later verifies the required even ground-state parity.
 
         Raises:
-            ValueError: If explicit inversion is requested for a geometry that
-                does not possess inversion symmetry.
+            NotImplementedError: If a multi-nuclear geometry is not C1.
+            RuntimeError: If atomic geometry discovery omits inversion.
         """
         mode = str(self.lit_config.nqs_source_symmetry_mode).lower()
-        identity = (
-            (1.0, 0.0, 0.0),
-            (0.0, 1.0, 0.0),
-            (0.0, 0.0, 1.0),
-        )
-        center_array = np.mean(np.asarray(geometry_data.atoms), axis=0)
-        center = (
-            float(center_array[0]),
-            float(center_array[1]),
-            float(center_array[2]),
-        )
-        if mode in {"off", "none", "identity", "c1"}:
-            return SourceSector(center=center, operations=(identity,), label="C1")
-
         sector = discover_source_sector(
             geometry_data.atoms,
             geometry_data.charges,
             tolerance=float(self.lit_config.nqs_source_symmetry_tolerance),
         )
-        operations = list(sector.operations)
-        if mode == "inversion":
-            inversion = -np.eye(3)
-            operations = [
+        atom_count = int(np.asarray(geometry_data.atoms).shape[0])
+        if atom_count == 1:
+            identity = next(
                 operation
-                for operation in operations
+                for operation in sector.operations
                 if _is_identity_operation(operation)
-                or np.allclose(
-                    np.asarray(operation),
-                    inversion,
-                    rtol=0.0,
-                    atol=self.lit_config.nqs_source_symmetry_tolerance,
-                )
-            ]
-            if len(operations) < 2:
-                msg = (
-                    "lit.nqs_source_symmetry_mode='inversion' requires a "
-                    "centrosymmetric nuclear geometry."
-                )
-                raise ValueError(msg)
-            sector = replace(sector, operations=tuple(operations), label="inversion")
-
-        # Preserve identity and prioritize inversion before taking a deterministic
-        # subset.  Inversion is the exact low-cost odd-sector constraint for atoms.
-        identity_operation = next(
-            operation
-            for operation in sector.operations
-            if _is_identity_operation(operation)
-        )
-        nonidentity = [
-            operation
-            for operation in sector.operations
-            if not _is_identity_operation(operation)
-        ]
-        nonidentity.sort(
-            key=lambda operation: (
-                0
-                if np.allclose(
-                    np.asarray(operation),
-                    -np.eye(3),
-                    rtol=0.0,
-                    atol=self.lit_config.nqs_source_symmetry_tolerance,
-                )
-                else 1,
             )
-        )
-        max_operations = int(self.lit_config.nqs_source_symmetry_max_operations)
-        selected = (identity_operation, *nonidentity[: max_operations - 1])
-        return replace(sector, operations=selected)
+            inversion = next(
+                (
+                    operation
+                    for operation in sector.operations
+                    if np.allclose(
+                        np.asarray(operation),
+                        -np.eye(3),
+                        rtol=0.0,
+                        atol=self.lit_config.nqs_source_symmetry_tolerance,
+                    )
+                ),
+                None,
+            )
+            if inversion is None:
+                msg = "Atomic source-sector discovery did not contain inversion."
+                raise RuntimeError(msg)
+            resolved = replace(
+                sector,
+                operations=(identity, inversion),
+                label=_ATOM_HARD_ODD_SECTOR_LABEL,
+            )
+        elif sector.is_trivial:
+            resolved = replace(sector, label="C1")
+        else:
+            msg = (
+                "NQS-LIT currently supports only even-ground-parity one-center "
+                "atoms with a hard odd-parity response and multi-center C1 "
+                "molecules without "
+                f"spatial symmetry; discovered n_atoms={atom_count}, "
+                f"sector={sector.label!r}, order={sector.order}."
+            )
+            raise NotImplementedError(msg)
+
+        if mode != "atom_c1" or self.lit_config.nqs_source_symmetry_weight > 0.0:
+            logger.warning(
+                "Legacy lit.nqs_source_symmetry_mode and soft-training weight "
+                "are ignored by the restricted atom/C1 runtime (mode=%s, "
+                "weight=%.6g); source-guard thresholds remain active; resolved "
+                "policy=%s.",
+                mode,
+                self.lit_config.nqs_source_symmetry_weight,
+                _response_symmetry_policy(resolved),
+            )
+        return resolved
 
     def _active_source_sector_operations(
         self,
         sector: SourceSector,
     ) -> tuple[jnp.ndarray, ...]:
+        if _is_atom_hard_odd_sector(sector):
+            return ()
         if self.lit_config.nqs_source_symmetry_weight <= 0.0:
             return ()
+        return tuple(
+            jnp.asarray(operation)
+            for operation in sector.operations
+            if not _is_identity_operation(operation)
+        )
+
+    def _source_guard_operations(
+        self,
+        sector: SourceSector,
+    ) -> tuple[jnp.ndarray, ...]:
+        """Return diagnostic source operations, independent of soft training."""
         return tuple(
             jnp.asarray(operation)
             for operation in sector.operations
@@ -1214,7 +1241,7 @@ class MoleculeLITWorkflow(Workflow):
             RuntimeError: If the covariance is non-finite or exceeds the
                 configured maximum.
         """
-        active_operations = self._active_source_sector_operations(source_sector)
+        active_operations = self._source_guard_operations(source_sector)
         maximum = self.lit_config.nqs_source_symmetry_max_covariance
         if not active_operations or maximum is None:
             return _SourceCovarianceMetrics(
@@ -1314,14 +1341,14 @@ class MoleculeLITWorkflow(Workflow):
         initial_omega: float | None = None,
     ):
         if source_sector is None:
-            source_sector = self._configured_source_sector(example)
-        use_vector_response = bool(self._active_source_sector_operations(source_sector))
-        response_type = (
-            MolecularVectorResponseFermiNet
-            if use_vector_response
-            else MolecularResponseFermiNet
-        )
-        response = response_type(
+            msg = (
+                "A response symmetry policy resolved from the physical fixed "
+                "geometry is required."
+            )
+            raise ValueError(msg)
+        del source_centers
+        hard_odd_parity = _is_atom_hard_odd_sector(source_sector)
+        response = MolecularResponseFermiNet(
             nspins=_two_spin_tuple(self.system_config.electron_spins),
             ndets=int(self.lit_config.nqs_response_ndets),
             hidden_dims_single=tuple(self.lit_config.nqs_response_hidden_dims_single),
@@ -1333,48 +1360,72 @@ class MoleculeLITWorkflow(Workflow):
         raw_params = response.init(response_rng, example)
         raw_params = _copy_matching_parameters(raw_params, ground_params)
 
+        inversion = jnp.asarray(-np.eye(3), dtype=example.electrons.dtype)
+        symmetry_center = jnp.asarray(
+            source_sector.center,
+            dtype=example.electrons.dtype,
+        )
+
+        def inverted_data(data):
+            return transform_molecule_data(data, inversion, symmetry_center)
+
+        def raw_apply(params, data):
+            return response.apply(params, data)
+
+        def projected_raw_apply(params, data):
+            raw_logpsi = raw_apply(params, data)
+            if not hard_odd_parity:
+                return raw_logpsi
+            return odd_parity_project_log_amplitude(
+                raw_logpsi,
+                raw_apply(params, inverted_data(data)),
+            )
+
         if not self.lit_config.nqs_source_aligned:
-            if not use_vector_response:
-                return response.apply, None, raw_params
-
-            def vector_apply(params, data):
-                return response.apply(params, data)
-
-            def unwrapped_scalar_apply(params, data):
-                return vector_apply(params, data)[int(axis)]
-
-            return unwrapped_scalar_apply, vector_apply, raw_params
+            return projected_raw_apply, None, raw_params
 
         if ground_logpsi is None:
             msg = "A ground log wavefunction is required for source-aligned response."
             raise ValueError(msg)
-        if use_vector_response:
-            if source_centers is None:
-                source_centers = np.zeros(3, dtype=np.float64)
-                source_centers[int(axis)] = float(source_center)
-            centers = jnp.asarray(source_centers, dtype=example.electrons.dtype)
-            if centers.shape != (3,):
-                msg = f"source_centers must have shape (3,), got {centers.shape}."
-                raise ValueError(msg)
-        else:
-            centers = jnp.asarray(source_center, dtype=example.electrons.dtype)
+        center = jnp.asarray(source_center, dtype=example.electrons.dtype)
         if initial_omega is None:
             initial_omega = self.lit_config.nqs_warm_start_omega
         if initial_omega is None:
             initial_omega = float(self.lit_config.omega_min)
         coefficient = 1.0 / complex(-float(initial_omega), -self.lit_config.eta)
         real_dtype = example.electrons.dtype
-        if initialization_data is None:
-            raw_initial_logpsi = response.apply(raw_params, example)
-            ground_initial_logpsi = ground_logpsi(ground_params, example)
-            initial_dipole = (
-                -jnp.sum(example.electrons, axis=0)
-                if use_vector_response
-                else molecular_electronic_dipole(example, axis)
+
+        def source_logpsi(data):
+            ground_log_amplitude = ground_logpsi(ground_params, data)
+            complex_dtype = jnp.result_type(
+                ground_log_amplitude,
+                jnp.complex64,
             )
+            source_factor = jnp.asarray(coefficient, dtype=complex_dtype) * (
+                molecular_electronic_dipole(data, axis) - center
+            )
+            return jnp.asarray(
+                ground_log_amplitude,
+                dtype=complex_dtype,
+            ) + jnp.log(source_factor)
+
+        def projected_source_logpsi(data):
+            source_log_amplitude = source_logpsi(data)
+            if not hard_odd_parity:
+                return source_log_amplitude
+            return odd_parity_project_log_amplitude(
+                source_log_amplitude,
+                source_logpsi(inverted_data(data)),
+            )
+
+        if initialization_data is None:
+            raw_initial_logpsi = projected_raw_apply(raw_params, example)
+            ground_initial_logpsi = ground_logpsi(ground_params, example)
+            initial_dipole = molecular_electronic_dipole(example, axis)
+            projected_source_initial_logpsi = projected_source_logpsi(example)
         else:
             raw_initial_logpsi = jax.vmap(
-                lambda one: response.apply(raw_params, one),
+                lambda one: projected_raw_apply(raw_params, one),
                 in_axes=(initialization_data.vmap_axis,),
             )(initialization_data.data)
             ground_initial_logpsi = jax.vmap(
@@ -1382,31 +1433,28 @@ class MoleculeLITWorkflow(Workflow):
                 in_axes=(initialization_data.vmap_axis,),
             )(initialization_data.data)
             initial_dipole = jax.vmap(
-                (
-                    (lambda one: -jnp.sum(one.electrons, axis=0))
-                    if use_vector_response
-                    else (lambda one: molecular_electronic_dipole(one, axis))
-                ),
+                lambda one: molecular_electronic_dipole(one, axis),
                 in_axes=(initialization_data.vmap_axis,),
             )(initialization_data.data)
-        calibration_raw_logpsi = raw_initial_logpsi
-        calibration_dipole = initial_dipole
-        calibration_centers = centers
-        if not use_vector_response:
-            # The calibration routine computes a norm over its final component
-            # axis.  Preserve the walker axis by representing a scalar response
-            # as a one-component vector only for this initialization statistic.
-            calibration_raw_logpsi = jnp.asarray(raw_initial_logpsi)[..., None]
-            calibration_dipole = initial_dipole[..., None]
-            calibration_centers = centers[None]
-        residual_log_scale = _calibrated_residual_log_scale(
-            calibration_raw_logpsi,
-            ground_initial_logpsi,
-            calibration_dipole,
-            calibration_centers,
-            coefficient,
-            target_ratio=self.lit_config.nqs_source_aligned_residual_scale,
-        )
+            projected_source_initial_logpsi = jax.vmap(
+                projected_source_logpsi,
+                in_axes=(initialization_data.vmap_axis,),
+            )(initialization_data.data)
+        if hard_odd_parity:
+            residual_log_scale = _calibrated_residual_log_scale_from_logs(
+                jnp.asarray(raw_initial_logpsi)[..., None],
+                jnp.asarray(projected_source_initial_logpsi)[..., None],
+                target_ratio=self.lit_config.nqs_source_aligned_residual_scale,
+            )
+        else:
+            residual_log_scale = _calibrated_residual_log_scale(
+                jnp.asarray(raw_initial_logpsi)[..., None],
+                ground_initial_logpsi,
+                initial_dipole[..., None],
+                center[None],
+                coefficient,
+                target_ratio=self.lit_config.nqs_source_aligned_residual_scale,
+            )
         logger.info(
             "Initialized source-aligned residual at relative scale %.3e "
             "(log_scale=%.6f)",
@@ -1427,31 +1475,30 @@ class MoleculeLITWorkflow(Workflow):
             }
         )
 
-        def aligned_apply(params, data):
+        def unprojected_aligned_apply(params, data):
             coefficient_parts = params["source_coefficient"]
             source_coefficient = coefficient_parts[0] + 1j * coefficient_parts[1]
-            raw_logpsi = response.apply(params["raw"], data)
-            dipole = (
-                -jnp.sum(data.electrons, axis=0)
-                if use_vector_response
-                else molecular_electronic_dipole(data, axis)
-            )
+            raw_logpsi = raw_apply(params["raw"], data)
+            dipole = molecular_electronic_dipole(data, axis)
             return source_aligned_vector_logpsi(
                 raw_logpsi,
                 ground_logpsi(ground_params, data),
                 dipole,
-                centers,
+                center,
                 source_coefficient,
                 params["residual_log_scale"],
             )
 
-        if not use_vector_response:
-            return aligned_apply, None, response_params
+        def aligned_apply(params, data):
+            aligned_logpsi = unprojected_aligned_apply(params, data)
+            if not hard_odd_parity:
+                return aligned_logpsi
+            return odd_parity_project_log_amplitude(
+                aligned_logpsi,
+                unprojected_aligned_apply(params, inverted_data(data)),
+            )
 
-        def aligned_scalar_apply(params, data):
-            return aligned_apply(params, data)[int(axis)]
-
-        return aligned_scalar_apply, aligned_apply, response_params
+        return aligned_apply, None, response_params
 
     def _prepare_source_sampler(
         self,
@@ -4602,16 +4649,13 @@ def _three_component_override(
     return array
 
 
-def _calibrated_residual_log_scale(
+def _calibrated_residual_log_scale_from_logs(
     raw_logpsi,
-    ground_logpsi,
-    dipole,
-    source_center,
-    source_coefficient,
+    source_logpsi,
     *,
     target_ratio: float,
 ) -> float:
-    """Calibrate the raw residual to a typical source-vector norm.
+    """Calibrate a raw residual from componentwise source/raw log amplitudes.
 
     FermiNet determinant heads have an arbitrary absolute scale, so multiplying
     the raw response by a nominal ``1e-4`` does not imply a ``1e-4`` residual.
@@ -4624,10 +4668,13 @@ def _calibrated_residual_log_scale(
         ValueError: If no finite, nonzero source/raw norm pair is available.
     """
     raw_logs = np.asarray(jax.device_get(raw_logpsi))
-    ground_logs = np.asarray(jax.device_get(ground_logpsi))
-    dipoles = np.asarray(jax.device_get(dipole))
-    centers = np.asarray(jax.device_get(source_center))
-    coefficient = complex(np.asarray(jax.device_get(source_coefficient)))
+    source_logs = np.asarray(jax.device_get(source_logpsi))
+    if raw_logs.shape != source_logs.shape or raw_logs.ndim < 1:
+        msg = (
+            "raw_logpsi and source_logpsi must have the same componentwise "
+            f"shape, got {raw_logs.shape} and {source_logs.shape}."
+        )
+        raise ValueError(msg)
 
     def vector_log_norm(component_log_magnitudes: np.ndarray) -> np.ndarray:
         finite = np.isfinite(component_log_magnitudes)
@@ -4646,10 +4693,8 @@ def _calibrated_residual_log_scale(
         result = safe_maximum + 0.5 * np.log(scaled_norm_sq)
         return np.where(np.any(invalid, axis=-1), np.nan, result)
 
-    source_factor = np.abs(coefficient * (dipoles - centers))
     with np.errstate(divide="ignore", invalid="ignore"):
-        source_component_logs = np.real(ground_logs)[..., None] + np.log(source_factor)
-        source_log_norm = vector_log_norm(source_component_logs)
+        source_log_norm = vector_log_norm(np.real(source_logs))
         raw_log_norm = vector_log_norm(np.real(raw_logs))
         offsets = source_log_norm - raw_log_norm
     finite_offsets = offsets[np.isfinite(offsets)]
@@ -4660,6 +4705,34 @@ def _calibrated_residual_log_scale(
         )
         raise ValueError(msg)
     return float(np.log(float(target_ratio)) + np.median(finite_offsets))
+
+
+def _calibrated_residual_log_scale(
+    raw_logpsi,
+    ground_logpsi,
+    dipole,
+    source_center,
+    source_coefficient,
+    *,
+    target_ratio: float,
+) -> float:
+    """Calibrate a raw residual against an unprojected dipole source.
+
+    Returns:
+        The additive raw-response log scale that realizes ``target_ratio``.
+    """
+    ground_logs = np.asarray(jax.device_get(ground_logpsi))
+    dipoles = np.asarray(jax.device_get(dipole))
+    centers = np.asarray(jax.device_get(source_center))
+    coefficient = complex(np.asarray(jax.device_get(source_coefficient)))
+    source_factor = coefficient * (dipoles - centers)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        source_logs = np.asarray(ground_logs)[..., None] + np.log(source_factor)
+    return _calibrated_residual_log_scale_from_logs(
+        raw_logpsi,
+        source_logs,
+        target_ratio=target_ratio,
+    )
 
 
 def _optional_float(value: float | None) -> float:
@@ -4703,6 +4776,26 @@ def _is_identity_operation(operation, *, tolerance: float = 1e-10) -> bool:
             atol=tolerance,
         )
     )
+
+
+def _is_atom_hard_odd_sector(sector: SourceSector) -> bool:
+    """Return whether a resolved sector denotes the hard atomic odd policy."""
+    if sector.label != _ATOM_HARD_ODD_SECTOR_LABEL or sector.order != 2:
+        return False
+    return any(
+        np.allclose(
+            np.asarray(operation),
+            -np.eye(3),
+            rtol=0.0,
+            atol=1e-10,
+        )
+        for operation in sector.operations
+    )
+
+
+def _response_symmetry_policy(sector: SourceSector) -> str:
+    """Return the persisted runtime policy name for one resolved geometry."""
+    return "atom_hard_odd" if _is_atom_hard_odd_sector(sector) else "molecule_c1"
 
 
 def _project_source_center_to_invariant_subspace(
