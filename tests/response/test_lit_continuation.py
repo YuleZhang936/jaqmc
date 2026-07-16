@@ -13,6 +13,7 @@ from jaqmc.app.molecule.lit_workflow import (
     MolecularLITConfig,
     MoleculeLITWorkflow,
     _continuation_min_step,
+    _continuation_probe_is_acceptable,
     _physics_continuation_step,
 )
 
@@ -27,13 +28,21 @@ class _BridgeStats(NamedTuple):
     source_norm: jax.Array
 
 
-def _bridge_stats(fidelity, *, invalid=0.0, lit=1.0, source_norm=1.0):
+def _bridge_stats(
+    fidelity,
+    *,
+    invalid=0.0,
+    ess=1.0,
+    lit=1.0,
+    reverse_kl=0.0,
+    source_norm=1.0,
+):
     return _BridgeStats(
         loss=jnp.asarray(1.0 - fidelity),
         fidelity=jnp.asarray(fidelity),
-        reverse_kl=jnp.asarray(0.0),
+        reverse_kl=jnp.asarray(reverse_kl),
         invalid_sample_fraction=jnp.asarray(invalid),
-        reweight_ess_fraction=jnp.asarray(1.0),
+        reweight_ess_fraction=jnp.asarray(ess),
         lit=jnp.asarray(lit),
         source_norm=jnp.asarray(source_norm),
     )
@@ -180,3 +189,267 @@ def test_adaptive_continuation_rejects_invalid_probe_at_min_step():
 
     with pytest.raises(RuntimeError, match="non-finite/invalid"):
         _run_bridge(workflow, update, target=0.4)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("nqs_stage_fidelity_min", -1e-6),
+        ("nqs_stage_fidelity_min", 1.0 + 1e-6),
+        ("nqs_stage_fidelity_min", np.nan),
+        ("nqs_stage_reweight_ess_fraction_min", -1e-6),
+        ("nqs_stage_reweight_ess_fraction_min", 1.0 + 1e-6),
+        ("nqs_stage_reweight_ess_fraction_min", np.nan),
+        ("nqs_stage_fidelity_gain_min", -1e-6),
+        ("nqs_stage_fidelity_gain_min", 1.0 + 1e-6),
+        ("nqs_stage_fidelity_gain_min", np.nan),
+    ],
+)
+def test_stage_gate_config_rejects_values_outside_unit_interval(
+    field_name,
+    value,
+):
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(**{field_name: value})
+
+    with pytest.raises(ValueError, match=field_name):
+        workflow._validate_continuation_config()
+
+
+@pytest.mark.parametrize("value", [0.0, 1.0])
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "nqs_stage_fidelity_min",
+        "nqs_stage_reweight_ess_fraction_min",
+        "nqs_stage_fidelity_gain_min",
+    ],
+)
+def test_stage_gate_config_accepts_unit_interval_boundaries(field_name, value):
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(**{field_name: value})
+
+    workflow._validate_continuation_config()
+
+
+def test_continuation_probe_requires_absolute_fidelity_floor():
+    current = _bridge_stats(0.999, ess=0.8)
+    candidate = _bridge_stats(0.98, ess=0.8)
+
+    # The candidate retains far more than 95% of the current fidelity, but it
+    # is still scientifically inadmissible under the absolute stage floor.
+    assert candidate.fidelity >= 0.95 * current.fidelity
+    assert not _continuation_probe_is_acceptable(
+        current,
+        candidate,
+        retention=0.95,
+        min_fidelity=0.99,
+        min_reweight_ess_fraction=0.05,
+    )
+
+
+def test_continuation_probe_requires_absolute_ess_floor():
+    current = _bridge_stats(0.999, ess=0.8)
+    low_ess = _bridge_stats(0.995, ess=0.049)
+    boundary = _bridge_stats(0.995, ess=0.05)
+
+    assert not _continuation_probe_is_acceptable(
+        current,
+        low_ess,
+        retention=0.95,
+        min_fidelity=0.99,
+        min_reweight_ess_fraction=0.05,
+    )
+    assert _continuation_probe_is_acceptable(
+        current,
+        boundary,
+        retention=0.95,
+        min_fidelity=0.99,
+        min_reweight_ess_fraction=0.05,
+    )
+
+
+def test_min_step_probe_failure_raises_before_optimizer_when_override_disabled():
+    config = MolecularLITConfig(
+        nqs_warm_start_omega=0.0,
+        nqs_continuation_iterations=1,
+        nqs_continuation_step_fraction=0.1,
+        nqs_continuation_fidelity_retention=0.99,
+        nqs_stage_fidelity_min=0.99,
+        nqs_continuation_allow_min_step_override=False,
+        nqs_continuation_min_step=0.1,
+        nqs_continuation_max_points=10,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    workflow, update, starts, optimized, _ = _mock_bridge_workflow(config)
+
+    with pytest.raises(RuntimeError, match="minimum step"):
+        _run_bridge(workflow, update, target=0.2)
+
+    assert starts == []
+    assert optimized == []
+
+
+def test_default_min_step_override_preserves_legacy_propagation():
+    config = MolecularLITConfig(
+        nqs_warm_start_omega=0.0,
+        nqs_continuation_iterations=1,
+        nqs_continuation_step_fraction=0.1,
+        nqs_continuation_fidelity_retention=0.99,
+        nqs_stage_fidelity_min=0.99,
+        nqs_continuation_min_step=0.1,
+        nqs_continuation_max_points=10,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    workflow, update, starts, optimized, _ = _mock_bridge_workflow(config)
+
+    _, _, records, _ = _run_bridge(workflow, update, target=0.2)
+
+    assert config.nqs_continuation_allow_min_step_override is True
+    assert starts == pytest.approx([0.0])
+    assert optimized == pytest.approx([0.1])
+    assert records[0].optimized
+    assert not records[0].probe_accepted
+    assert records[0].min_step_override
+    assert not records[-1].optimized
+    assert not records[-1].probe_accepted
+    assert records[-1].min_step_override
+
+
+def _mock_stage_optimizer(config, candidate_fidelity):
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = config
+
+    def evaluate(_response_apply, params, *_args, **_kwargs):
+        fidelity = 0.8 if float(params) < 0.5 else candidate_fidelity
+        return _bridge_stats(fidelity, ess=0.5)
+
+    workflow._nqs_stats_chunked = evaluate
+
+    def init_carry(_data, rng, _params):
+        return SimpleNamespace(direct=SimpleNamespace(rng=rng))
+
+    def update(params, _pool, _omega, carry, _iteration):
+        return params + 1.0, _bridge_stats(candidate_fidelity, ess=0.5), carry
+
+    update.init_carry = init_carry
+    return workflow, update
+
+
+def _run_stage_optimizer(workflow, update):
+    return workflow._optimize_nqs_frequency(
+        update,
+        initial_params=jnp.asarray(0.0),
+        train_pool=None,
+        eval_pool=None,
+        fallback_data=None,
+        rng=jax.random.PRNGKey(0),
+        response_apply=None,
+        ground_logpsi=None,
+        ground_params=None,
+        axis=0,
+        source_center=0.0,
+        source_norm=1.0,
+        ground_energy=0.0,
+        omega=-1.0,
+        iterations=1,
+        stage="test",
+    )
+
+
+def test_stage_optimizer_rejects_best_checkpoint_below_required_fidelity():
+    config = MolecularLITConfig(
+        nqs_stage_fidelity_min=0.85,
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_stage_fidelity_gain_min=0.1,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    workflow, update = _mock_stage_optimizer(config, candidate_fidelity=0.87)
+
+    # Initial F=0.8 is below the floor, so the recovery requirement is
+    # max(0.85, 0.8 + 0.1) = 0.9.  Merely crossing the floor is insufficient.
+    with pytest.raises(RuntimeError, match=r"quality gate.*required=0\.900000"):
+        _run_stage_optimizer(workflow, update)
+
+
+def test_stage_optimizer_accepts_checkpoint_reaching_required_fidelity():
+    config = MolecularLITConfig(
+        nqs_stage_fidelity_min=0.85,
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_stage_fidelity_gain_min=0.1,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    workflow, update = _mock_stage_optimizer(config, candidate_fidelity=0.91)
+
+    params, stats, selected_iteration, _ = _run_stage_optimizer(workflow, update)
+
+    assert float(params) == pytest.approx(1.0)
+    assert float(stats.fidelity) == pytest.approx(0.91)
+    assert selected_iteration == 1
+
+
+def _mock_stage_optimizer_with_stats(config, initial_stats, candidate_stats):
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = config
+
+    def evaluate(_response_apply, params, *_args, **_kwargs):
+        return initial_stats if float(params) < 0.5 else candidate_stats
+
+    workflow._nqs_stats_chunked = evaluate
+
+    def init_carry(_data, rng, _params):
+        return SimpleNamespace(direct=SimpleNamespace(rng=rng))
+
+    def update(params, _pool, _omega, carry, _iteration):
+        return params + 1.0, candidate_stats, carry
+
+    update.init_carry = init_carry
+    return workflow, update
+
+
+def test_gate_eligible_initial_is_not_displaced_by_lower_loss_ineligible_candidate():
+    config = MolecularLITConfig(
+        nqs_reverse_kl_weight=1.0,
+        nqs_stage_fidelity_min=0.99,
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_stage_fidelity_gain_min=0.001,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    initial = _bridge_stats(0.995, ess=0.5, reverse_kl=0.2)
+    candidate = _bridge_stats(0.98, ess=0.5, reverse_kl=0.0)
+    workflow, update = _mock_stage_optimizer_with_stats(config, initial, candidate)
+
+    # The candidate has the lower regularized loss (0.02 versus 0.205), but it
+    # must not displace an iteration-zero checkpoint that passes every gate.
+    params, stats, selected_iteration, _ = _run_stage_optimizer(workflow, update)
+
+    assert float(params) == pytest.approx(0.0)
+    assert float(stats.fidelity) == pytest.approx(0.995)
+    assert selected_iteration == 0
+
+
+def test_gate_eligible_candidate_is_saved_despite_worse_regularized_loss():
+    config = MolecularLITConfig(
+        nqs_reverse_kl_weight=1.0,
+        nqs_stage_fidelity_min=0.99,
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_stage_fidelity_gain_min=0.001,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    initial = _bridge_stats(0.8, ess=0.5, reverse_kl=0.0)
+    candidate = _bridge_stats(0.995, ess=0.5, reverse_kl=0.5)
+    workflow, update = _mock_stage_optimizer_with_stats(config, initial, candidate)
+
+    # The candidate has the worse regularized loss (0.505 versus 0.2), but it
+    # is the only gate-eligible checkpoint and therefore must be propagated.
+    params, stats, selected_iteration, _ = _run_stage_optimizer(workflow, update)
+
+    assert float(params) == pytest.approx(1.0)
+    assert float(stats.fidelity) == pytest.approx(0.995)
+    assert selected_iteration == 1

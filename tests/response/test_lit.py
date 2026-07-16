@@ -8,6 +8,7 @@ import jax
 import numpy as np
 import pytest
 from jax import numpy as jnp
+from jax.flatten_util import ravel_pytree
 
 from jaqmc.app.molecule.data import MoleculeData
 from jaqmc.app.molecule.lit_workflow import (
@@ -20,9 +21,11 @@ from jaqmc.app.molecule.lit_workflow import (
     _is_eligible_nqs_checkpoint,
     _lit_omega_grid,
     _regularized_action_gradient,
+    _scaled_direction_updates,
     _solve_sr_direction_chunked,
     _SourceCovarianceMetrics,
     _spring_direction_chunked,
+    _spring_optimizer_diagnostics,
     _SpringState,
 )
 from jaqmc.data import BatchedData
@@ -231,6 +234,143 @@ def test_reverse_kl_weights_are_finite_at_extreme_dynamic_range():
     )
 
     assert all(np.all(np.isfinite(np.asarray(value))) for value in result)
+
+
+def test_spring_optimizer_diagnostics_report_clipping_and_parameter_groups():
+    params = {
+        "raw": {"weights": jnp.zeros(2, dtype=jnp.float32)},
+        "source_coefficient": jnp.zeros(2, dtype=jnp.float32),
+        "residual_log_scale": jnp.asarray(0.0, dtype=jnp.float32),
+    }
+    fidelity_tree = {
+        "raw": {"weights": jnp.asarray([3.0, 4.0], dtype=jnp.float32)},
+        "source_coefficient": jnp.asarray([1.0, -2.0], dtype=jnp.float32),
+        "residual_log_scale": jnp.asarray(2.0, dtype=jnp.float32),
+    }
+    reverse_kl_tree = {
+        "raw": {"weights": jnp.asarray([2.0, 0.0], dtype=jnp.float32)},
+        "source_coefficient": jnp.asarray([0.0, 2.0], dtype=jnp.float32),
+        "residual_log_scale": jnp.asarray(-2.0, dtype=jnp.float32),
+    }
+    direction_tree = {
+        "raw": {"weights": jnp.asarray([3.0, 4.0], dtype=jnp.float32)},
+        "source_coefficient": jnp.asarray([0.0, 12.0], dtype=jnp.float32),
+        "residual_log_scale": jnp.asarray(-5.0, dtype=jnp.float32),
+    }
+    fidelity_gradient, _ = ravel_pytree(fidelity_tree)
+    reverse_kl_gradient, _ = ravel_pytree(reverse_kl_tree)
+    direction, _ = ravel_pytree(direction_tree)
+    reverse_kl_weight = 0.5
+    combined_gradient = fidelity_gradient - reverse_kl_weight * reverse_kl_gradient
+    previous_direction = jnp.ones_like(direction)
+    learning_rate = 0.1
+    max_norm = 0.5
+    updates = _scaled_direction_updates(
+        params,
+        direction,
+        learning_rate=learning_rate,
+        max_norm=max_norm,
+    )
+
+    diagnostics = _spring_optimizer_diagnostics(
+        params,
+        combined_gradient,
+        fidelity_gradient,
+        reverse_kl_gradient,
+        direction,
+        updates,
+        previous_direction,
+        reverse_kl_weight=reverse_kl_weight,
+        learning_rate=learning_rate,
+        max_norm=max_norm,
+        damping=jnp.asarray(0.02, dtype=jnp.float32),
+        decay=0.5,
+        qfi_trace=jnp.asarray(50.0, dtype=jnp.float32),
+    )
+
+    combined_norm = np.linalg.norm(np.asarray(combined_gradient))
+    fidelity_norm = np.linalg.norm(np.asarray(fidelity_gradient))
+    weighted_kl = reverse_kl_weight * np.asarray(reverse_kl_gradient)
+    weighted_kl_norm = np.linalg.norm(weighted_kl)
+    direction_norm = np.linalg.norm(np.asarray(direction))
+    update_scale = max_norm / direction_norm
+    expected_cosine = np.dot(np.asarray(fidelity_gradient), weighted_kl) / (
+        fidelity_norm * weighted_kl_norm
+    )
+
+    assert bool(diagnostics.available)
+    assert float(diagnostics.clip_factor) < 1.0
+    np.testing.assert_allclose(float(diagnostics.combined_gradient_norm), combined_norm)
+    np.testing.assert_allclose(float(diagnostics.fidelity_gradient_norm), fidelity_norm)
+    np.testing.assert_allclose(
+        float(diagnostics.weighted_reverse_kl_gradient_norm),
+        weighted_kl_norm,
+    )
+    np.testing.assert_allclose(float(diagnostics.fidelity_kl_cosine), expected_cosine)
+    np.testing.assert_allclose(
+        float(diagnostics.gradient_cancellation_ratio),
+        combined_norm / (fidelity_norm + weighted_kl_norm),
+    )
+    np.testing.assert_allclose(float(diagnostics.direction_norm), direction_norm)
+    np.testing.assert_allclose(float(diagnostics.update_norm), max_norm, rtol=2e-6)
+    np.testing.assert_allclose(
+        float(diagnostics.clip_factor),
+        update_scale / learning_rate,
+        rtol=2e-6,
+    )
+    np.testing.assert_allclose(float(diagnostics.mean_metric_diagonal), 10.0)
+    np.testing.assert_allclose(
+        float(diagnostics.history_gradient_ratio),
+        0.02 * 0.5 * np.sqrt(direction.size) / combined_norm,
+        rtol=2e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(diagnostics.parameter_group_gradient_rms),
+        [np.sqrt(10.0), np.sqrt(5.0), 3.0],
+        rtol=2e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(diagnostics.parameter_group_update_norm),
+        np.asarray([5.0, 12.0, 5.0]) * update_scale,
+        rtol=2e-6,
+    )
+
+
+def test_spring_optimizer_diagnostics_detect_exact_fidelity_kl_cancellation():
+    params = {
+        "raw": {"weight": jnp.asarray(0.0, dtype=jnp.float32)},
+        "source_coefficient": jnp.zeros(2, dtype=jnp.float32),
+        "residual_log_scale": jnp.asarray(0.0, dtype=jnp.float32),
+    }
+    fidelity_gradient = jnp.asarray([1.0, -2.0, 0.5, 3.0], dtype=jnp.float32)
+    reverse_kl_gradient = fidelity_gradient
+    combined_gradient = jnp.zeros_like(fidelity_gradient)
+    direction = jnp.zeros_like(fidelity_gradient)
+    updates = jax.tree.map(jnp.zeros_like, params)
+
+    diagnostics = _spring_optimizer_diagnostics(
+        params,
+        combined_gradient,
+        fidelity_gradient,
+        reverse_kl_gradient,
+        direction,
+        updates,
+        jnp.zeros_like(direction),
+        reverse_kl_weight=1.0,
+        learning_rate=1e-3,
+        max_norm=0.1,
+        damping=jnp.asarray(1e-3, dtype=jnp.float32),
+        decay=0.99,
+        qfi_trace=jnp.asarray(1.0, dtype=jnp.float32),
+    )
+
+    np.testing.assert_allclose(
+        float(diagnostics.fidelity_kl_cosine),
+        1.0,
+        rtol=2e-7,
+    )
+    np.testing.assert_allclose(float(diagnostics.gradient_cancellation_ratio), 0.0)
+    np.testing.assert_allclose(float(diagnostics.clip_factor), 1.0)
 
 
 @pytest.mark.parametrize("shape", [(6, 3), (3, 6)])

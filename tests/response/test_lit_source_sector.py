@@ -251,7 +251,7 @@ def test_workflow_vector_covariance_penalty_has_parameter_gradient():
     ratio = jnp.asarray([1.0, 1.1, 0.9], dtype=jnp.complex64)
     source_weight = jnp.ones(3, dtype=jnp.float32)
     spring = _SpringState(jnp.zeros(1, dtype=jnp.float32))
-    baseline, _, _ = workflow._weighted_sr_updates_from_scores(
+    baseline, _, _, _ = workflow._weighted_sr_updates_from_scores(
         params,
         score,
         ratio,
@@ -842,6 +842,7 @@ def test_direct_fallback_keeps_separate_source_sector_update_and_loss():
             spring_state,
             jnp.asarray(1e-3, dtype=jnp.float32),
             jnp.asarray(0.0, dtype=jnp.float32),
+            lit_workflow_module._empty_spring_optimizer_diagnostics(local_params),
         )
 
     def fake_direct_updates(

@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import operator
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, NamedTuple
 
@@ -131,6 +132,10 @@ class MolecularLITConfig:
     nqs_continuation_iterations: int = 100
     nqs_continuation_step_fraction: float = 0.2
     nqs_continuation_fidelity_retention: float = 0.95
+    nqs_stage_fidelity_min: float = 0.0
+    nqs_stage_reweight_ess_fraction_min: float = 0.0
+    nqs_stage_fidelity_gain_min: float = 0.0
+    nqs_continuation_allow_min_step_override: bool = True
     nqs_continuation_min_step: float | None = None
     nqs_continuation_max_points: int = 256
     nqs_response_ndets: int = 16
@@ -178,6 +183,32 @@ class _SpringState(NamedTuple):
     """Unscaled SPRING direction associated with the current frequency."""
 
     previous_direction: jax.Array
+
+
+class _SpringOptimizerDiagnostics(NamedTuple):
+    """Low-cost scalar diagnostics for one source-sampled SPRING update."""
+
+    available: jax.Array
+    combined_gradient_norm: jax.Array
+    fidelity_gradient_norm: jax.Array
+    weighted_reverse_kl_gradient_norm: jax.Array
+    fidelity_kl_cosine: jax.Array
+    gradient_cancellation_ratio: jax.Array
+    direction_norm: jax.Array
+    update_norm: jax.Array
+    clip_factor: jax.Array
+    damping: jax.Array
+    mean_metric_diagonal: jax.Array
+    history_gradient_ratio: jax.Array
+    parameter_group_gradient_rms: jax.Array
+    parameter_group_update_norm: jax.Array
+
+
+_SPRING_PARAMETER_GROUPS = (
+    "raw",
+    "source_coefficient",
+    "residual_log_scale",
+)
 
 
 class _NQSUpdateCarry(NamedTuple):
@@ -796,6 +827,14 @@ class MoleculeLITWorkflow(Workflow):
             nqs_continuation_fidelity_retention=(
                 self.lit_config.nqs_continuation_fidelity_retention
             ),
+            nqs_stage_fidelity_min=self.lit_config.nqs_stage_fidelity_min,
+            nqs_stage_reweight_ess_fraction_min=(
+                self.lit_config.nqs_stage_reweight_ess_fraction_min
+            ),
+            nqs_stage_fidelity_gain_min=self.lit_config.nqs_stage_fidelity_gain_min,
+            nqs_continuation_allow_min_step_override=bool(
+                self.lit_config.nqs_continuation_allow_min_step_override
+            ),
             nqs_continuation_min_step=_optional_float(
                 self.lit_config.nqs_continuation_min_step
             ),
@@ -1002,6 +1041,21 @@ class MoleculeLITWorkflow(Workflow):
         if not 0.0 < retention <= 1.0:
             msg = "lit.nqs_continuation_fidelity_retention must satisfy 0 < value <= 1."
             raise ValueError(msg)
+        stage_thresholds = (
+            ("nqs_stage_fidelity_min", self.lit_config.nqs_stage_fidelity_min),
+            (
+                "nqs_stage_reweight_ess_fraction_min",
+                self.lit_config.nqs_stage_reweight_ess_fraction_min,
+            ),
+            (
+                "nqs_stage_fidelity_gain_min",
+                self.lit_config.nqs_stage_fidelity_gain_min,
+            ),
+        )
+        for name, value in stage_thresholds:
+            if not np.isfinite(value) or not 0.0 <= float(value) <= 1.0:
+                msg = f"lit.{name} must be finite and between 0 and 1."
+                raise ValueError(msg)
         min_step = self.lit_config.nqs_continuation_min_step
         if min_step is not None and (
             not np.isfinite(min_step) or float(min_step) <= 0.0
@@ -1660,7 +1714,7 @@ class MoleculeLITWorkflow(Workflow):
 
         Raises:
             RuntimeError: If no held-out checkpoint satisfies the configured
-                numerical and source-covariance validity requirements.
+                numerical, source-covariance, and stage-quality requirements.
         """
 
         def evaluate(params):
@@ -1684,10 +1738,37 @@ class MoleculeLITWorkflow(Workflow):
 
         response_params = initial_params
         update_carry = update_step.init_carry(fallback_data, rng, response_params)
+        maximum_covariance = self.lit_config.nqs_source_symmetry_max_covariance
         best_params = response_params
         best_stats = evaluate(response_params)
+        initial_fidelity = float(jax.device_get(best_stats.fidelity))
+        required_fidelity = _nqs_stage_required_fidelity(
+            initial_fidelity,
+            floor=self.lit_config.nqs_stage_fidelity_min,
+            gain=self.lit_config.nqs_stage_fidelity_gain_min,
+        )
         best_iteration = 0
+        selected_params = None
+        selected_stats = None
+        selected_iteration = 0
+        if (
+            _is_eligible_nqs_checkpoint(
+                best_stats,
+                max_source_covariance=maximum_covariance,
+            )
+            and _nqs_stage_quality_failure(
+                best_stats,
+                min_fidelity=required_fidelity,
+                min_reweight_ess_fraction=(
+                    self.lit_config.nqs_stage_reweight_ess_fraction_min
+                ),
+            )
+            is None
+        ):
+            selected_params = best_params
+            selected_stats = best_stats
         last_train_stats = None
+        last_optimizer_diagnostics = None
         for iteration in range(max(0, int(iterations))):
             response_params, last_train_stats, update_carry = update_step(
                 response_params,
@@ -1695,6 +1776,11 @@ class MoleculeLITWorkflow(Workflow):
                 jnp.asarray(float(omega)),
                 update_carry,
                 iteration,
+            )
+            last_optimizer_diagnostics = getattr(
+                update_step,
+                "last_spring_optimizer_diagnostics",
+                None,
             )
             completed = iteration + 1
             should_select = (
@@ -1713,10 +1799,41 @@ class MoleculeLITWorkflow(Workflow):
                     best_params = response_params
                     best_stats = candidate_stats
                     best_iteration = completed
+                if (
+                    _is_eligible_nqs_checkpoint(
+                        candidate_stats,
+                        max_source_covariance=maximum_covariance,
+                    )
+                    and _nqs_stage_quality_failure(
+                        candidate_stats,
+                        min_fidelity=required_fidelity,
+                        min_reweight_ess_fraction=(
+                            self.lit_config.nqs_stage_reweight_ess_fraction_min
+                        ),
+                    )
+                    is None
+                    and (
+                        selected_stats is None
+                        or _is_better_nqs_checkpoint(
+                            candidate_stats,
+                            selected_stats,
+                            max_source_covariance=maximum_covariance,
+                        )
+                    )
+                ):
+                    selected_params = response_params
+                    selected_stats = candidate_stats
+                    selected_iteration = completed
             if (
                 self.lit_config.nqs_log_interval > 0
                 and completed % self.lit_config.nqs_log_interval == 0
             ):
+                reported_stats = (
+                    selected_stats if selected_stats is not None else best_stats
+                )
+                reported_iteration = (
+                    selected_iteration if selected_stats is not None else best_iteration
+                )
                 logger.info(
                     "axis=%s stage=%s omega=%.6f iter=%d train_loss=%.6e "
                     "train_fidelity=%.6f train_reverse_kl=%.6e "
@@ -1731,19 +1848,35 @@ class MoleculeLITWorkflow(Workflow):
                     float(last_train_stats.fidelity),
                     float(last_train_stats.reverse_kl),
                     float(getattr(last_train_stats, "source_covariance_loss", 0.0)),
-                    best_iteration,
-                    float(best_stats.fidelity),
-                    float(best_stats.reverse_kl),
-                    float(getattr(best_stats, "source_covariance_loss", 0.0)),
+                    reported_iteration,
+                    float(reported_stats.fidelity),
+                    float(reported_stats.reverse_kl),
                     float(
                         getattr(
-                            best_stats,
+                            reported_stats,
+                            "source_covariance_loss",
+                            0.0,
+                        )
+                    ),
+                    float(
+                        getattr(
+                            reported_stats,
                             "source_covariance_max_loss",
-                            getattr(best_stats, "source_covariance_loss", 0.0),
+                            getattr(
+                                reported_stats,
+                                "source_covariance_loss",
+                                0.0,
+                            ),
                         )
                     ),
                 )
-        maximum_covariance = self.lit_config.nqs_source_symmetry_max_covariance
+                _log_spring_optimizer_diagnostics(
+                    last_optimizer_diagnostics,
+                    axis=axis,
+                    stage=stage,
+                    omega=float(omega),
+                    iteration=completed,
+                )
         best_covariance_mean, best_covariance_max = _source_covariance_host_values(
             best_stats
         )
@@ -1758,11 +1891,51 @@ class MoleculeLITWorkflow(Workflow):
                 f"maximum={maximum_covariance!r}."
             )
             raise RuntimeError(msg)
+        if selected_stats is None or selected_params is None:
+            _require_nqs_stage_quality(
+                best_stats,
+                min_fidelity=required_fidelity,
+                min_reweight_ess_fraction=(
+                    self.lit_config.nqs_stage_reweight_ess_fraction_min
+                ),
+                context=(
+                    f"axis={_AXIS_NAMES[axis]} stage={stage} "
+                    f"omega={float(omega):.6f} failed its held-out quality gate "
+                    f"(initial fidelity={initial_fidelity:.6f}, "
+                    "configured floor="
+                    f"{self.lit_config.nqs_stage_fidelity_min:.6f}, "
+                    "required gain="
+                    f"{self.lit_config.nqs_stage_fidelity_gain_min:.6f})"
+                ),
+            )
+            msg = (
+                f"axis={_AXIS_NAMES[axis]} stage={stage} "
+                f"omega={float(omega):.6f} produced no selectable checkpoint."
+            )
+            raise RuntimeError(msg)
+        best_params = selected_params
+        best_stats = selected_stats
+        best_iteration = selected_iteration
+        _require_nqs_stage_quality(
+            best_stats,
+            min_fidelity=required_fidelity,
+            min_reweight_ess_fraction=(
+                self.lit_config.nqs_stage_reweight_ess_fraction_min
+            ),
+            context=(
+                f"axis={_AXIS_NAMES[axis]} stage={stage} "
+                f"omega={float(omega):.6f} failed its held-out quality gate "
+                f"(initial fidelity={initial_fidelity:.6f}, "
+                f"configured floor={self.lit_config.nqs_stage_fidelity_min:.6f}, "
+                f"required gain={self.lit_config.nqs_stage_fidelity_gain_min:.6f})"
+            ),
+        )
         rng = update_carry.direct.rng
         logger.info(
             "axis=%s stage=%s omega=%.6f selected_iter=%d/%d "
             "heldout_loss=%.6e fidelity=%.6f reverse_kl=%.6e "
-            "covariance_mean=%.6e covariance_max=%.6e ess=%.3f",
+            "covariance_mean=%.6e covariance_max=%.6e ess=%.3f "
+            "required_fidelity=%.6f required_ess=%.3f",
             _AXIS_NAMES[axis],
             stage,
             float(omega),
@@ -1780,6 +1953,8 @@ class MoleculeLITWorkflow(Workflow):
                 )
             ),
             float(best_stats.reweight_ess_fraction),
+            required_fidelity,
+            self.lit_config.nqs_stage_reweight_ess_fraction_min,
         )
         return best_params, best_stats, best_iteration, rng
 
@@ -1856,6 +2031,17 @@ class MoleculeLITWorkflow(Workflow):
                 f"checkpoint at omega={current_omega:.8g}"
             ),
         )
+        _require_nqs_stage_quality(
+            current_stats,
+            min_fidelity=self.lit_config.nqs_stage_fidelity_min,
+            min_reweight_ess_fraction=(
+                self.lit_config.nqs_stage_reweight_ess_fraction_min
+            ),
+            context=(
+                "Frequency continuation received a starting checkpoint below "
+                f"the absolute quality floor at omega={current_omega:.8g}"
+            ),
+        )
         min_step = _continuation_min_step(self.lit_config, spectrum_omega)
         records = []
         tolerance = np.finfo(np.float64).eps * max(1.0, abs(target_omega)) * 8.0
@@ -1883,6 +2069,10 @@ class MoleculeLITWorkflow(Workflow):
                     probe_stats,
                     retention=self.lit_config.nqs_continuation_fidelity_retention,
                     max_source_covariance=maximum_covariance,
+                    min_fidelity=self.lit_config.nqs_stage_fidelity_min,
+                    min_reweight_ess_fraction=(
+                        self.lit_config.nqs_stage_reweight_ess_fraction_min
+                    ),
                 )
                 candidate_gap = candidate_omega - current_omega
                 if probe_ok or candidate_gap <= min_step * (1.0 + 1e-12):
@@ -1902,6 +2092,28 @@ class MoleculeLITWorkflow(Workflow):
             )
             actual_step = float(candidate_omega - current_omega)
             min_step_override = not probe_ok and actual_step <= min_step * (1.0 + 1e-12)
+            if (
+                min_step_override
+                and not self.lit_config.nqs_continuation_allow_min_step_override
+            ):
+                current_fidelity = float(jax.device_get(current_stats.fidelity))
+                candidate_fidelity = float(jax.device_get(probe_stats.fidelity))
+                candidate_ess = float(jax.device_get(probe_stats.reweight_ess_fraction))
+                required_probe_fidelity = max(
+                    self.lit_config.nqs_stage_fidelity_min,
+                    self.lit_config.nqs_continuation_fidelity_retention
+                    * current_fidelity,
+                )
+                msg = (
+                    "Frequency continuation reached its minimum step without "
+                    "an acceptable inherited checkpoint; refusing the legacy "
+                    f"override at omega={candidate_omega:.8g}: fidelity="
+                    f"{candidate_fidelity:.6f}, required="
+                    f"{required_probe_fidelity:.6f}, ESS fraction="
+                    f"{candidate_ess:.6f}, required ESS="
+                    f"{self.lit_config.nqs_stage_reweight_ess_fraction_min:.6f}."
+                )
+                raise RuntimeError(msg)
             if target_omega - candidate_omega <= tolerance:
                 records.append(
                     _ContinuationRecord(
@@ -2323,23 +2535,28 @@ class MoleculeLITWorkflow(Workflow):
             omega,
             source_operation,
         ):
-            stats, updates, spring_state, damping, covariance_loss = (
-                self._source_sr_stats_and_updates(
-                    response_apply,
-                    response_params,
-                    ground_logpsi,
-                    ground_params,
-                    batched_data,
-                    response_vector_apply=response_vector_apply,
-                    source_sector=source_sector,
-                    source_operation=(source_operation if active_operations else None),
-                    spring_state=_SpringState(spring_previous),
-                    axis=axis,
-                    source_center=source_center,
-                    source_norm=source_norm,
-                    ground_energy=ground_energy,
-                    omega=omega,
-                )
+            (
+                stats,
+                updates,
+                spring_state,
+                _,
+                covariance_loss,
+                optimizer_diagnostics,
+            ) = self._source_sr_stats_and_updates(
+                response_apply,
+                response_params,
+                ground_logpsi,
+                ground_params,
+                batched_data,
+                response_vector_apply=response_vector_apply,
+                source_sector=source_sector,
+                source_operation=(source_operation if active_operations else None),
+                spring_state=_SpringState(spring_previous),
+                axis=axis,
+                source_center=source_center,
+                source_norm=source_norm,
+                ground_energy=ground_energy,
+                omega=omega,
             )
             response_params = _apply_updates(response_params, updates)
             loss = (
@@ -2360,7 +2577,7 @@ class MoleculeLITWorkflow(Workflow):
                     source_covariance_loss=covariance_loss,
                 ),
                 spring_state.previous_direction,
-                damping,
+                optimizer_diagnostics,
             )
 
         direct_train_collect_initial = self._make_direct_psi_pool_collector(
@@ -2437,8 +2654,9 @@ class MoleculeLITWorkflow(Workflow):
                 (
                     source_updates,
                     next_spring_state,
-                    spring_damping,
+                    _,
                     covariance_loss,
+                    optimizer_diagnostics,
                 ) = self._weighted_sr_updates(
                     response_apply,
                     response_params,
@@ -2473,7 +2691,7 @@ class MoleculeLITWorkflow(Workflow):
                     jnp.asarray(False),
                     jnp.asarray(False),
                     next_spring_state.previous_direction,
-                    spring_damping,
+                    optimizer_diagnostics,
                 )
 
             def direct_branch(_):
@@ -2503,7 +2721,7 @@ class MoleculeLITWorkflow(Workflow):
                         operand=None,
                     )
                 )
-                direct_stats, direct_updates, next_spring_state, spring_damping = (
+                direct_stats, direct_updates, next_spring_state, _ = (
                     self._direct_sr_stats_and_updates_from_source_sums(
                         response_apply,
                         response_params,
@@ -2561,7 +2779,7 @@ class MoleculeLITWorkflow(Workflow):
                     jnp.asarray(True),
                     jnp.asarray(True),
                     next_spring_state.previous_direction,
-                    spring_damping,
+                    _empty_spring_optimizer_diagnostics(response_params),
                 )
 
             return jax.lax.cond(
@@ -2600,12 +2818,20 @@ class MoleculeLITWorkflow(Workflow):
                     if active_operations
                     else identity_operation
                 )
-                response_params, stats, spring_previous, _ = source_update(
+                (
+                    response_params,
+                    stats,
+                    spring_previous,
+                    optimizer_diagnostics,
+                ) = source_update(
                     response_params,
                     update_batch,
                     update_carry.spring.previous_direction,
                     omega,
                     source_operation,
+                )
+                update.last_spring_optimizer_diagnostics = (  # type: ignore[attr-defined]
+                    optimizer_diagnostics
                 )
                 return (
                     response_params,
@@ -2626,7 +2852,7 @@ class MoleculeLITWorkflow(Workflow):
                 direct_initialized,
                 direct_active,
                 spring_previous,
-                _,
+                optimizer_diagnostics,
             ) = fallback_update(
                 response_params,
                 update_batch,
@@ -2638,6 +2864,9 @@ class MoleculeLITWorkflow(Workflow):
                 update_carry.spring.previous_direction,
                 omega,
                 source_operation,
+            )
+            update.last_spring_optimizer_diagnostics = (  # type: ignore[attr-defined]
+                optimizer_diagnostics
             )
             return (
                 response_params,
@@ -2669,6 +2898,7 @@ class MoleculeLITWorkflow(Workflow):
             )
 
         update.init_carry = self._init_nqs_update_carry  # type: ignore[attr-defined]
+        update.last_spring_optimizer_diagnostics = None  # type: ignore[attr-defined]
         update.precompile_direct = precompile_direct  # type: ignore[attr-defined]
         update.source_covariance_loss = (  # type: ignore[attr-defined]
             evaluate_source_covariance
@@ -2814,16 +3044,25 @@ class MoleculeLITWorkflow(Workflow):
             source_sector,
             source_operation,
         )
-        updates, spring_state, damping = self._weighted_sr_updates_from_scores(
-            response_params,
-            score,
-            ratio,
-            source_weight,
-            spring_state,
+        updates, spring_state, damping, optimizer_diagnostics = (
+            self._weighted_sr_updates_from_scores(
+                response_params,
+                score,
+                ratio,
+                source_weight,
+                spring_state,
+            )
         )
         if covariance_updates is not None:
             updates = jax.tree.map(operator.add, updates, covariance_updates)
-        return stats, updates, spring_state, damping, covariance_loss
+        return (
+            stats,
+            updates,
+            spring_state,
+            damping,
+            covariance_loss,
+            optimizer_diagnostics,
+        )
 
     def _weighted_sr_updates_from_scores(
         self,
@@ -2835,8 +3074,8 @@ class MoleculeLITWorkflow(Workflow):
     ):
         (
             grad_flat,
-            _,
-            _,
+            fidelity_gradient,
+            reverse_kl_gradient,
             psi_weight,
             centered_score,
             _,
@@ -2850,6 +3089,7 @@ class MoleculeLITWorkflow(Workflow):
         )
         weighted_score = jnp.sqrt(psi_weight)[:, None] * centered_score
         score_aug = jnp.concatenate([weighted_score.real, weighted_score.imag], axis=0)
+        qfi_trace = jnp.sum(score_aug**2)
         centering_null = jnp.sqrt(psi_weight)
         zero_null = jnp.zeros_like(centering_null)
         kernel_null_vectors = jnp.stack(
@@ -2858,6 +3098,7 @@ class MoleculeLITWorkflow(Workflow):
                 jnp.concatenate([zero_null, centering_null]),
             ]
         )
+        previous_direction = spring_state.previous_direction
         direction, spring_state, damping = _spring_direction_chunked(
             (score_aug.shape[0],),
             lambda _: score_aug,
@@ -2866,6 +3107,7 @@ class MoleculeLITWorkflow(Workflow):
             epsilon_scale=self.lit_config.nqs_spring_epsilon,
             damping_floor=self.lit_config.nqs_spring_damping_floor,
             decay=self.lit_config.nqs_spring_decay,
+            qfi_trace=qfi_trace,
             kernel_null_vectors=kernel_null_vectors,
         )
         updates = _scaled_direction_updates(
@@ -2874,7 +3116,22 @@ class MoleculeLITWorkflow(Workflow):
             learning_rate=self.lit_config.nqs_learning_rate,
             max_norm=self.lit_config.nqs_sr_max_norm,
         )
-        return updates, spring_state, damping
+        optimizer_diagnostics = _spring_optimizer_diagnostics(
+            response_params,
+            grad_flat,
+            fidelity_gradient,
+            reverse_kl_gradient,
+            direction,
+            updates,
+            previous_direction,
+            reverse_kl_weight=self.lit_config.nqs_reverse_kl_weight,
+            learning_rate=self.lit_config.nqs_learning_rate,
+            max_norm=self.lit_config.nqs_sr_max_norm,
+            damping=damping,
+            decay=self.lit_config.nqs_spring_decay,
+            qfi_trace=qfi_trace,
+        )
+        return updates, spring_state, damping, optimizer_diagnostics
 
     def _weighted_sr_updates(
         self,
@@ -2911,16 +3168,18 @@ class MoleculeLITWorkflow(Workflow):
             source_sector,
             source_operation,
         )
-        updates, spring_state, damping = self._weighted_sr_updates_from_scores(
-            response_params,
-            score,
-            ratio,
-            source_weight,
-            spring_state,
+        updates, spring_state, damping, optimizer_diagnostics = (
+            self._weighted_sr_updates_from_scores(
+                response_params,
+                score,
+                ratio,
+                source_weight,
+                spring_state,
+            )
         )
         if covariance_updates is not None:
             updates = jax.tree.map(operator.add, updates, covariance_updates)
-        return updates, spring_state, damping, covariance_loss
+        return updates, spring_state, damping, covariance_loss, optimizer_diagnostics
 
     def _direct_sr_stats_and_updates_from_source_sums(
         self,
@@ -4083,6 +4342,55 @@ class MoleculeLITWorkflow(Workflow):
 _AXIS_NAMES = ("x", "y", "z")
 
 
+def _log_spring_optimizer_diagnostics(
+    diagnostics: _SpringOptimizerDiagnostics | None,
+    *,
+    axis: int,
+    stage: str,
+    omega: float,
+    iteration: int,
+) -> None:
+    """Log the most recent source-sampled SPRING scalar diagnostics."""
+    if diagnostics is None:
+        return
+    host = jax.device_get(diagnostics)
+    if not bool(host.available):
+        return
+    logger.info(
+        "axis=%s stage=%s omega=%.6f iter=%d spring_grad=%.6e "
+        "spring_grad_fidelity=%.6e spring_grad_kl_weighted=%.6e "
+        "spring_fidelity_kl_cosine=%.6f spring_gradient_cancellation=%.6e "
+        "spring_direction=%.6e spring_update=%.6e spring_clip_factor=%.6e "
+        "spring_clipped=%d spring_damping=%.6e spring_qfi_mean_diagonal=%.6e "
+        "spring_history_gradient_ratio=%.6e raw_grad_rms=%.6e "
+        "raw_update=%.6e source_coefficient_grad_rms=%.6e "
+        "source_coefficient_update=%.6e residual_log_scale_grad_rms=%.6e "
+        "residual_log_scale_update=%.6e",
+        _AXIS_NAMES[axis],
+        stage,
+        omega,
+        iteration,
+        float(host.combined_gradient_norm),
+        float(host.fidelity_gradient_norm),
+        float(host.weighted_reverse_kl_gradient_norm),
+        float(host.fidelity_kl_cosine),
+        float(host.gradient_cancellation_ratio),
+        float(host.direction_norm),
+        float(host.update_norm),
+        float(host.clip_factor),
+        int(host.clip_factor < 1.0),
+        float(host.damping),
+        float(host.mean_metric_diagonal),
+        float(host.history_gradient_ratio),
+        float(host.parameter_group_gradient_rms[0]),
+        float(host.parameter_group_update_norm[0]),
+        float(host.parameter_group_gradient_rms[1]),
+        float(host.parameter_group_update_norm[1]),
+        float(host.parameter_group_gradient_rms[2]),
+        float(host.parameter_group_update_norm[2]),
+    )
+
+
 def _lit_omega_grid(config: MolecularLITConfig) -> np.ndarray:
     if config.omega_values:
         omega = np.asarray(tuple(float(value) for value in config.omega_values))
@@ -4157,16 +4465,100 @@ def _finite_valid_nqs_stats(
     )
 
 
+def _nqs_stage_required_fidelity(
+    initial_fidelity: float,
+    *,
+    floor: float,
+    gain: float,
+) -> float:
+    """Return the absolute fidelity required at the end of one NQS stage.
+
+    A checkpoint that already meets the configured floor may be propagated
+    unchanged.  Otherwise, the stage must both reach the floor and make the
+    requested minimum recovery from its initial held-out fidelity.
+    """
+    floor = float(floor)
+    gain = float(gain)
+    initial_fidelity = float(initial_fidelity)
+    if not np.isfinite(initial_fidelity):
+        return floor
+    if initial_fidelity >= floor:
+        return floor
+    return max(floor, initial_fidelity + gain)
+
+
+def _nqs_stage_quality_failure(
+    stats,
+    *,
+    min_fidelity: float,
+    min_reweight_ess_fraction: float,
+) -> str | None:
+    """Describe an absolute held-out quality-gate failure, if any.
+
+    Returns:
+        A human-readable failure description, or ``None`` when both active
+        thresholds pass.
+    """
+    fidelity = float(jax.device_get(stats.fidelity))
+    ess_fraction = float(jax.device_get(stats.reweight_ess_fraction))
+    failures = []
+    if min_fidelity > 0.0 and (
+        not np.isfinite(fidelity) or fidelity < float(min_fidelity)
+    ):
+        failures.append(f"fidelity={fidelity:.6f} < required={float(min_fidelity):.6f}")
+    if min_reweight_ess_fraction > 0.0 and (
+        not np.isfinite(ess_fraction) or ess_fraction < float(min_reweight_ess_fraction)
+    ):
+        failures.append(
+            "ESS fraction="
+            f"{ess_fraction:.6f} < required="
+            f"{float(min_reweight_ess_fraction):.6f}"
+        )
+    return "; ".join(failures) if failures else None
+
+
+def _require_nqs_stage_quality(
+    stats,
+    *,
+    min_fidelity: float,
+    min_reweight_ess_fraction: float,
+    context: str,
+) -> None:
+    """Raise when a finite checkpoint misses an absolute science gate.
+
+    Raises:
+        RuntimeError: If an active fidelity or ESS threshold is missed.
+    """
+    failure = _nqs_stage_quality_failure(
+        stats,
+        min_fidelity=min_fidelity,
+        min_reweight_ess_fraction=min_reweight_ess_fraction,
+    )
+    if failure is not None:
+        raise RuntimeError(f"{context}; {failure}.")
+
+
 def _continuation_probe_is_acceptable(
     current,
     candidate,
     *,
     retention: float,
     max_source_covariance: float | None = None,
+    min_fidelity: float = 0.0,
+    min_reweight_ess_fraction: float = 0.0,
 ) -> bool:
     if not _finite_valid_nqs_stats(
         candidate,
         max_source_covariance=max_source_covariance,
+    ):
+        return False
+    if (
+        _nqs_stage_quality_failure(
+            candidate,
+            min_fidelity=min_fidelity,
+            min_reweight_ess_fraction=min_reweight_ess_fraction,
+        )
+        is not None
     ):
         return False
     current_fidelity = float(jax.device_get(current.fidelity))
@@ -5004,6 +5396,167 @@ def _spring_direction_chunked(
     )
 
 
+def _direction_update_scale(
+    direction,
+    *,
+    learning_rate: float,
+    max_norm: float | None,
+):
+    """Return the scalar applied to an unscaled SPRING direction."""
+    scale = jnp.asarray(learning_rate, dtype=direction.dtype)
+    if max_norm is not None:
+        direction_norm = jnp.linalg.norm(direction)
+        scale = jnp.minimum(
+            scale,
+            jnp.asarray(max_norm, dtype=direction.dtype)
+            / (direction_norm + jnp.asarray(1e-12, dtype=direction.dtype)),
+        )
+    return scale
+
+
+def _top_level_group_rms_and_norm(tree, group_name: str, *, dtype):
+    """Return per-coordinate RMS and L2 norm for one top-level pytree group."""
+    missing = jnp.asarray(jnp.nan, dtype=dtype)
+    if not isinstance(tree, Mapping) or group_name not in tree:
+        return missing, missing
+    leaves = jax.tree_util.tree_leaves(tree[group_name])
+    element_count = sum(int(leaf.size) for leaf in leaves)
+    if element_count == 0:
+        return missing, missing
+    squared_norm = jnp.asarray(0.0, dtype=dtype)
+    for leaf in leaves:
+        leaf_array = jnp.asarray(leaf)
+        squared_norm = squared_norm + jnp.sum(jnp.abs(leaf_array) ** 2)
+    norm = jnp.sqrt(jnp.maximum(jnp.real(squared_norm), 0.0))
+    rms = norm / jnp.sqrt(jnp.asarray(element_count, dtype=dtype))
+    return rms, norm
+
+
+def _spring_optimizer_diagnostics(
+    params,
+    combined_gradient,
+    fidelity_gradient,
+    reverse_kl_gradient,
+    direction,
+    updates,
+    previous_direction,
+    *,
+    reverse_kl_weight: float | jnp.ndarray,
+    learning_rate: float,
+    max_norm: float | None,
+    damping,
+    decay: float | jnp.ndarray,
+    qfi_trace,
+) -> _SpringOptimizerDiagnostics:
+    """Summarize existing source-sampled SPRING tensors as scalar diagnostics.
+
+    Returns:
+        Scalar optimizer and top-level parameter-group diagnostics.
+    """
+    dtype = combined_gradient.dtype
+    tiny = jnp.asarray(jnp.finfo(dtype).tiny, dtype=dtype)
+    combined_gradient_norm = jnp.linalg.norm(combined_gradient)
+    fidelity_gradient_norm = jnp.linalg.norm(fidelity_gradient)
+    weighted_reverse_kl_gradient = (
+        jnp.asarray(reverse_kl_weight, dtype=dtype) * reverse_kl_gradient
+    )
+    weighted_reverse_kl_gradient_norm = jnp.linalg.norm(weighted_reverse_kl_gradient)
+    gradient_product = fidelity_gradient_norm * weighted_reverse_kl_gradient_norm
+    fidelity_kl_cosine = jnp.where(
+        gradient_product > tiny,
+        jnp.vdot(fidelity_gradient, weighted_reverse_kl_gradient).real
+        / jnp.maximum(gradient_product, tiny),
+        jnp.asarray(0.0, dtype=dtype),
+    )
+    component_gradient_norm = fidelity_gradient_norm + weighted_reverse_kl_gradient_norm
+    gradient_cancellation_ratio = jnp.where(
+        component_gradient_norm > tiny,
+        combined_gradient_norm / jnp.maximum(component_gradient_norm, tiny),
+        jnp.asarray(0.0, dtype=dtype),
+    )
+
+    direction_norm = jnp.linalg.norm(direction)
+    learning_rate_array = jnp.asarray(learning_rate, dtype=dtype)
+    update_scale = _direction_update_scale(
+        direction,
+        learning_rate=learning_rate,
+        max_norm=max_norm,
+    )
+    update_norm = jnp.abs(update_scale) * direction_norm
+    clip_factor = update_scale / learning_rate_array
+
+    parameter_count = jnp.asarray(max(int(combined_gradient.size), 1), dtype=dtype)
+    qfi_trace = jnp.asarray(qfi_trace, dtype=dtype)
+    mean_metric_diagonal = qfi_trace / parameter_count
+    damping = jnp.asarray(damping, dtype=dtype)
+    history_rhs = (
+        damping
+        * jnp.asarray(decay, dtype=dtype)
+        * jnp.asarray(previous_direction, dtype=dtype)
+    )
+    history_gradient_ratio = jnp.linalg.norm(history_rhs) / jnp.maximum(
+        combined_gradient_norm,
+        tiny,
+    )
+
+    _, unravel_fn = ravel_pytree(params)
+    gradient_tree = unravel_fn(combined_gradient)
+    group_gradient_rms = []
+    group_update_norm = []
+    for group_name in _SPRING_PARAMETER_GROUPS:
+        gradient_rms, _ = _top_level_group_rms_and_norm(
+            gradient_tree,
+            group_name,
+            dtype=dtype,
+        )
+        _, update_group_norm = _top_level_group_rms_and_norm(
+            updates,
+            group_name,
+            dtype=dtype,
+        )
+        group_gradient_rms.append(gradient_rms)
+        group_update_norm.append(update_group_norm)
+    return _SpringOptimizerDiagnostics(
+        available=jnp.asarray(True),
+        combined_gradient_norm=combined_gradient_norm,
+        fidelity_gradient_norm=fidelity_gradient_norm,
+        weighted_reverse_kl_gradient_norm=weighted_reverse_kl_gradient_norm,
+        fidelity_kl_cosine=fidelity_kl_cosine,
+        gradient_cancellation_ratio=gradient_cancellation_ratio,
+        direction_norm=direction_norm,
+        update_norm=update_norm,
+        clip_factor=clip_factor,
+        damping=damping,
+        mean_metric_diagonal=mean_metric_diagonal,
+        history_gradient_ratio=history_gradient_ratio,
+        parameter_group_gradient_rms=jnp.stack(group_gradient_rms),
+        parameter_group_update_norm=jnp.stack(group_update_norm),
+    )
+
+
+def _empty_spring_optimizer_diagnostics(params) -> _SpringOptimizerDiagnostics:
+    """Return an unavailable diagnostic record for a non-source SPRING branch."""
+    first_leaf = jax.tree_util.tree_leaves(params)[0]
+    dtype = jnp.real(first_leaf).dtype
+    missing = jnp.asarray(jnp.nan, dtype=dtype)
+    return _SpringOptimizerDiagnostics(
+        available=jnp.asarray(False),
+        combined_gradient_norm=missing,
+        fidelity_gradient_norm=missing,
+        weighted_reverse_kl_gradient_norm=missing,
+        fidelity_kl_cosine=missing,
+        gradient_cancellation_ratio=missing,
+        direction_norm=missing,
+        update_norm=missing,
+        clip_factor=missing,
+        damping=missing,
+        mean_metric_diagonal=missing,
+        history_gradient_ratio=missing,
+        parameter_group_gradient_rms=jnp.full(3, missing, dtype=dtype),
+        parameter_group_update_norm=jnp.full(3, missing, dtype=dtype),
+    )
+
+
 def _scaled_direction_updates(
     params,
     direction,
@@ -5012,14 +5565,11 @@ def _scaled_direction_updates(
     max_norm: float | None,
 ):
     _, unravel_fn = ravel_pytree(params)
-    scale = jnp.asarray(learning_rate, dtype=direction.dtype)
-    if max_norm is not None:
-        update_norm = jnp.linalg.norm(direction)
-        scale = jnp.minimum(
-            scale,
-            jnp.asarray(max_norm, dtype=direction.dtype)
-            / (update_norm + jnp.asarray(1e-12, dtype=direction.dtype)),
-        )
+    scale = _direction_update_scale(
+        direction,
+        learning_rate=learning_rate,
+        max_norm=max_norm,
+    )
     return unravel_fn(scale * direction)
 
 
