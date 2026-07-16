@@ -230,10 +230,10 @@ class MoleculeLITWorkflow(Workflow):
         rng = jax.random.PRNGKey(seed)
         rng, data_rng, ground_rng, response_rng, sample_rng = jax.random.split(rng, 5)
         batched_data = data_init(self.system_config, self.config.batch_size, data_rng)
-        example = batched_data.unbatched_example()
+        shape_example = batched_data.unbatched_example()
 
         checkpoint_step, ground_params, ground_logpsi = self._resolve_nqs_ground_state(
-            example, ground_rng
+            shape_example, ground_rng
         )
         ground_sample_plan = SamplePlan(ground_logpsi, {"electrons": self.sampler})
         sampler_state = ground_sample_plan.init(batched_data, sample_rng)
@@ -304,7 +304,12 @@ class MoleculeLITWorkflow(Workflow):
         continuation_probe_accepted: list[bool] = []
         continuation_min_step_override: list[bool] = []
 
-        source_sector = self._configured_source_sector(example)
+        # ``unbatched_example`` is deliberately shape-only and replaces fixed
+        # atoms/charges with ones.  Symmetry discovery must use the physical
+        # fixed fields, otherwise an atom at the origin is spuriously moved to
+        # (1, 1, 1) and its dipole center is projected into the wrong affine
+        # sector.
+        source_sector = self._configured_source_sector(batched_data.data)
         logger.info(
             "NQS-LIT source sector=%s order=%d active_operations=%d",
             source_sector.label,
@@ -351,7 +356,7 @@ class MoleculeLITWorkflow(Workflow):
             rng, response_rng = jax.random.split(rng)
             response_apply, response_vector_apply, response_params = (
                 self._make_response_ansatz(
-                    example,
+                    shape_example,
                     response_rng,
                     ground_params,
                     axis=axis,
@@ -1038,7 +1043,7 @@ class MoleculeLITWorkflow(Workflow):
             msg = "lit.nqs_eval_batch_size must be nonnegative."
             raise ValueError(msg)
 
-    def _configured_source_sector(self, example) -> SourceSector:
+    def _configured_source_sector(self, geometry_data) -> SourceSector:
         """Discover and cap the molecular operations used during training.
 
         Returns:
@@ -1054,7 +1059,7 @@ class MoleculeLITWorkflow(Workflow):
             (0.0, 1.0, 0.0),
             (0.0, 0.0, 1.0),
         )
-        center_array = np.mean(np.asarray(example.atoms), axis=0)
+        center_array = np.mean(np.asarray(geometry_data.atoms), axis=0)
         center = (
             float(center_array[0]),
             float(center_array[1]),
@@ -1064,8 +1069,8 @@ class MoleculeLITWorkflow(Workflow):
             return SourceSector(center=center, operations=(identity,), label="C1")
 
         sector = discover_source_sector(
-            example.atoms,
-            example.charges,
+            geometry_data.atoms,
+            geometry_data.charges,
             tolerance=float(self.lit_config.nqs_source_symmetry_tolerance),
         )
         operations = list(sector.operations)

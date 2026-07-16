@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from jax import numpy as jnp
 
+import jaqmc.app.molecule.lit_workflow as lit_workflow_module
 from jaqmc.app.molecule.data import MoleculeData
 from jaqmc.app.molecule.lit_workflow import (
     MolecularLITConfig,
@@ -357,6 +358,91 @@ def test_workflow_source_sector_c1_and_inversion_configuration():
     assert inversion_sector.order == 2
     assert len(active) == 1
     np.testing.assert_allclose(np.asarray(active[0]), -np.eye(3), atol=1e-7)
+
+
+def test_serial_scan_discovers_source_sector_from_physical_geometry(monkeypatch):
+    """Fixed atoms/charges must not come from the shape-only example."""
+
+    class ReachedSourceSector(Exception):
+        pass
+
+    atoms = jnp.asarray(
+        [[0.2, -0.1, -0.7], [0.2, -0.1, 0.9]],
+        dtype=jnp.float32,
+    )
+    charges = jnp.asarray([6.0, 8.0], dtype=jnp.float32)
+    batch = BatchedData(
+        data=MoleculeData(
+            electrons=jnp.zeros((2, 2, 3), dtype=jnp.float32),
+            atoms=atoms,
+            charges=charges,
+        ),
+        fields_with_batch=("electrons",),
+    )
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.config = SimpleNamespace(seed=7, batch_size=2)
+    workflow.system_config = SimpleNamespace()
+    workflow.sampler = object()
+    workflow.lit_config = MolecularLITConfig(
+        axes="x",
+        omega_values=(0.5,),
+        nqs_burn_in=0,
+        nqs_source_symmetry_mode="auto",
+        nqs_source_symmetry_weight=1.0,
+        nqs_source_symmetry_max_operations=16,
+    )
+
+    class FakeSamplePlan:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def init(self, _data, _rng):
+            return "sampler-state"
+
+    monkeypatch.setattr(lit_workflow_module, "data_init", lambda *_args: batch)
+    monkeypatch.setattr(lit_workflow_module, "SamplePlan", FakeSamplePlan)
+    monkeypatch.setattr(
+        workflow,
+        "_resolve_nqs_ground_state",
+        lambda *_args: (0, {}, lambda *_inner_args: jnp.asarray(0.0)),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "_resolve_ground_energy",
+        lambda _logpsi, _params, data, state, _plan, rng: (
+            -1.0,
+            data,
+            state,
+            rng,
+        ),
+    )
+
+    def verify_source_sector(
+        _params,
+        _data,
+        _state,
+        _plan,
+        _rng,
+        *,
+        source_sector,
+    ):
+        assert source_sector.label == "linear_C4v"
+        assert source_sector.order == 8
+        np.testing.assert_allclose(
+            source_sector.center,
+            [0.2, -0.1, 0.1],
+            atol=1e-7,
+        )
+        raise ReachedSourceSector
+
+    monkeypatch.setattr(
+        workflow,
+        "_estimate_vector_source_stats",
+        verify_source_sector,
+    )
+
+    with pytest.raises(ReachedSourceSector):
+        workflow._run_serial_scan()
 
 
 def test_pure_source_covariance_guard_accepts_symmetric_ground_and_rejects_leakage():
