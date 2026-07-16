@@ -56,8 +56,10 @@ lit:
   nqs_train_pool_batches: 64
   nqs_eval_pool_batches: 16
   nqs_pool_stride: 4
-  nqs_train_update_batch_size: 4096
-  nqs_eval_batch_size: 4096
+  # Hard parity evaluates the ansatz at X and IX.  Batch 1024 uses about
+  # 61 GiB on one 80-GiB A100; the previous 4096 setting is not viable.
+  nqs_train_update_batch_size: 1024
+  nqs_eval_batch_size: 1024
   nqs_source_pool_dir: ''
   # The previous pools were generated with a nonzero center and are incompatible.
   nqs_reuse_source_pool: false
