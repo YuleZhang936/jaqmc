@@ -126,6 +126,101 @@ def test_full_response_source_sampled_hydrogen_stats_are_finite():
     np.testing.assert_allclose(float(stats.source_norm), 1.0)
 
 
+def test_heldout_kernel_reuses_trace_across_params_frequency_and_center():
+    batch = _h_batch()
+    trace_calls = []
+
+    def counted_response(params, data):
+        trace_calls.append(None)
+        return _scaled_hydrogen_2pz_logpsi(params, data)
+
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(
+        eta=0.02,
+        nqs_source_floor=1e-4,
+        nqs_eval_batch_size=batch.batch_size,
+    )
+    workflow._nqs_chunk_sums_kernel_cache = {}
+    common = dict(
+        response_apply=counted_response,
+        ground_logpsi=_hydrogen_1s_logpsi,
+        ground_params={},
+        eval_pool=batch,
+        axis=2,
+        source_norm=1.0,
+        ground_energy=-0.5,
+    )
+
+    first = workflow._evaluate_nqs_checkpoint(
+        response_params={"scale": jnp.asarray(1.0, dtype=jnp.float32)},
+        source_center=0.0,
+        omega=0.35,
+        **common,
+    )
+    jax.block_until_ready(first.loss)
+    first_trace_count = len(trace_calls)
+
+    second = workflow._evaluate_nqs_checkpoint(
+        response_params={"scale": jnp.asarray(0.9, dtype=jnp.float32)},
+        source_center=0.05,
+        omega=0.4,
+        **common,
+    )
+    jax.block_until_ready(second.loss)
+
+    assert first_trace_count > 0
+    assert len(trace_calls) == first_trace_count
+
+
+def test_heldout_kernel_traces_distinct_response_closures_independently():
+    batch = _h_batch()
+    first_trace_calls = []
+    second_trace_calls = []
+
+    def first_response(params, data):
+        first_trace_calls.append(None)
+        return _scaled_hydrogen_2pz_logpsi(params, data)
+
+    def second_response(params, data):
+        second_trace_calls.append(None)
+        return _scaled_hydrogen_2pz_logpsi(params, data)
+
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(
+        eta=0.02,
+        nqs_source_floor=1e-4,
+        nqs_eval_batch_size=batch.batch_size,
+    )
+    workflow._nqs_chunk_sums_kernel_cache = {}
+    common = dict(
+        response_params={"scale": jnp.asarray(1.0, dtype=jnp.float32)},
+        ground_logpsi=_hydrogen_1s_logpsi,
+        ground_params={},
+        eval_pool=batch,
+        axis=2,
+        source_center=0.0,
+        source_norm=1.0,
+        ground_energy=-0.5,
+        omega=0.35,
+    )
+
+    first = workflow._evaluate_nqs_checkpoint(
+        response_apply=first_response,
+        **common,
+    )
+    jax.block_until_ready(first.loss)
+    first_trace_count = len(first_trace_calls)
+    second = workflow._evaluate_nqs_checkpoint(
+        response_apply=second_response,
+        **common,
+    )
+    jax.block_until_ready(second.loss)
+
+    assert first_trace_count > 0
+    assert len(first_trace_calls) == first_trace_count
+    assert second_trace_calls
+
+
 def test_fused_source_scores_preserve_source_sampled_sums():
     batch = _h_batch()
     response_params = {"scale": jnp.asarray(1.0, dtype=jnp.float32)}

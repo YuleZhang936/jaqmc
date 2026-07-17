@@ -273,6 +273,10 @@ class MoleculeLITWorkflow(Workflow):
         self.lit_config = cfg.get("lit", MolecularLITConfig)
         self.system_config, self.wf = configure_system(cfg)
         self.sampler = cfg.get("sampler", MCMCSampler)
+        self._nqs_chunk_sums_kernel_cache: dict[
+            tuple[int, int, int],
+            tuple[Any, Any, Any],
+        ] = {}
         self._validate_config()
 
     def run(self) -> None:
@@ -2103,7 +2107,7 @@ class MoleculeLITWorkflow(Workflow):
         update_carry = update_step.init_carry(fallback_data, rng, response_params)
         maximum_covariance = self.lit_config.nqs_source_symmetry_max_covariance
         best_params = response_params
-        best_stats = evaluate(response_params)
+        best_stats = jax.device_get(evaluate(response_params))
         initial_fidelity = float(jax.device_get(best_stats.fidelity))
         required_fidelity = _nqs_stage_required_fidelity(
             initial_fidelity,
@@ -2151,7 +2155,7 @@ class MoleculeLITWorkflow(Workflow):
                 or completed == int(iterations)
             )
             if should_select:
-                candidate_stats = evaluate(response_params)
+                candidate_stats = jax.device_get(evaluate(response_params))
                 if _is_better_nqs_checkpoint(
                     candidate_stats,
                     best_stats,
@@ -2197,6 +2201,9 @@ class MoleculeLITWorkflow(Workflow):
                 reported_iteration = (
                     selected_iteration if selected_stats is not None else best_iteration
                 )
+                host_train_stats, host_optimizer_diagnostics = jax.device_get(
+                    (last_train_stats, last_optimizer_diagnostics)
+                )
                 logger.info(
                     "axis=%s stage=%s omega=%.6f iter=%d train_loss=%.6e "
                     "train_fidelity=%.6f train_reverse_kl=%.6e "
@@ -2207,10 +2214,10 @@ class MoleculeLITWorkflow(Workflow):
                     stage,
                     float(omega),
                     completed,
-                    float(last_train_stats.loss),
-                    float(last_train_stats.fidelity),
-                    float(last_train_stats.reverse_kl),
-                    float(getattr(last_train_stats, "source_covariance_loss", 0.0)),
+                    float(host_train_stats.loss),
+                    float(host_train_stats.fidelity),
+                    float(host_train_stats.reverse_kl),
+                    float(getattr(host_train_stats, "source_covariance_loss", 0.0)),
                     reported_iteration,
                     float(reported_stats.fidelity),
                     float(reported_stats.reverse_kl),
@@ -2234,7 +2241,7 @@ class MoleculeLITWorkflow(Workflow):
                     ),
                 )
                 _log_spring_optimizer_diagnostics(
-                    last_optimizer_diagnostics,
+                    host_optimizer_diagnostics,
                     axis=axis,
                     stage=stage,
                     omega=float(omega),
@@ -2378,12 +2385,14 @@ class MoleculeLITWorkflow(Workflow):
         )
         current_omega = float(start_omega)
         if current_stats is None:
-            current_stats = self._evaluate_nqs_checkpoint(
-                response_params=response_params,
-                eval_pool=eval_pool,
-                omega=current_omega,
-                source_covariance_evaluator=source_covariance_evaluator,
-                **common,
+            current_stats = jax.device_get(
+                self._evaluate_nqs_checkpoint(
+                    response_params=response_params,
+                    eval_pool=eval_pool,
+                    omega=current_omega,
+                    source_covariance_evaluator=source_covariance_evaluator,
+                    **common,
+                )
             )
         maximum_covariance = self.lit_config.nqs_source_symmetry_max_covariance
         _require_eligible_nqs_checkpoint(
@@ -2420,12 +2429,14 @@ class MoleculeLITWorkflow(Workflow):
             candidate_omega = current_omega + step
             bisections = 0
             while True:
-                probe_stats = self._evaluate_nqs_checkpoint(
-                    response_params=response_params,
-                    eval_pool=eval_pool,
-                    omega=candidate_omega,
-                    source_covariance_evaluator=source_covariance_evaluator,
-                    **common,
+                probe_stats = jax.device_get(
+                    self._evaluate_nqs_checkpoint(
+                        response_params=response_params,
+                        eval_pool=eval_pool,
+                        omega=candidate_omega,
+                        source_covariance_evaluator=source_covariance_evaluator,
+                        **common,
+                    )
                 )
                 probe_ok = _continuation_probe_is_acceptable(
                     current_stats,
@@ -4097,6 +4108,67 @@ class MoleculeLITWorkflow(Workflow):
         )
         return score, ratio, source_weight
 
+    def _nqs_chunk_sums_kernel(
+        self,
+        response_apply,
+        ground_logpsi,
+        *,
+        axis: int,
+    ):
+        """Return a persistent compiled kernel for held-out source sums.
+
+        JAX caches a compiled executable by jitted callable identity.  Creating
+        the callable inside :meth:`_nqs_stats_chunked` therefore retraced and
+        recompiled the same expensive local-action kernel at every checkpoint
+        selection.  Cache one callable per response/ground closure and static
+        dipole axis; all numerical values remain dynamic arguments so the same
+        executable is reused across checkpoints and frequencies.
+
+        Returns:
+            A jitted callable that evaluates additive NQS-LIT source sums for
+            one fixed-shape chunk.
+        """
+        cache = getattr(self, "_nqs_chunk_sums_kernel_cache", None)
+        if cache is None:
+            cache = {}
+            self._nqs_chunk_sums_kernel_cache = cache
+        key = (id(response_apply), id(ground_logpsi), int(axis))
+        cached = cache.get(key)
+        if (
+            cached is not None
+            and cached[0] is response_apply
+            and cached[1] is ground_logpsi
+        ):
+            return cached[2]
+
+        @jax.jit
+        def chunk_sums(
+            local_params,
+            local_ground_params,
+            chunk,
+            local_source_center,
+            local_ground_energy,
+            local_omega,
+            local_eta,
+            local_source_floor,
+        ):
+            return nqs_lit_source_sampled_sums(
+                response_apply,
+                local_params,
+                ground_logpsi,
+                local_ground_params,
+                chunk,
+                axis=axis,
+                source_center=local_source_center,
+                ground_energy=local_ground_energy,
+                omega=local_omega,
+                eta=local_eta,
+                source_floor=local_source_floor,
+            )
+
+        cache[key] = (response_apply, ground_logpsi, chunk_sums)
+        return chunk_sums
+
     def _nqs_stats_chunked(
         self,
         response_apply,
@@ -4112,37 +4184,40 @@ class MoleculeLITWorkflow(Workflow):
         omega,
     ):
         chunk_size = self._nqs_eval_batch_size()
-
-        @jax.jit
-        def chunk_sums(local_params, chunk, local_omega):
-            return nqs_lit_source_sampled_sums(
-                response_apply,
-                local_params,
-                ground_logpsi,
-                ground_params,
-                chunk,
-                axis=axis,
-                source_center=source_center,
-                ground_energy=ground_energy,
-                omega=local_omega,
-                eta=self.lit_config.eta,
-                source_floor=self.lit_config.nqs_source_floor,
-            )
+        chunk_sums = self._nqs_chunk_sums_kernel(
+            response_apply,
+            ground_logpsi,
+            axis=axis,
+        )
+        source_center_array = jnp.asarray(source_center)
+        ground_energy_array = jnp.asarray(ground_energy)
+        omega_array = jnp.asarray(omega)
+        eta_array = jnp.asarray(self.lit_config.eta)
+        source_floor_array = jnp.asarray(self.lit_config.nqs_source_floor)
 
         total_sums = None
         for chunk in _batched_data_chunks(batched_data, chunk_size):
-            sums = chunk_sums(response_params, chunk, omega)
+            sums = chunk_sums(
+                response_params,
+                ground_params,
+                chunk,
+                source_center_array,
+                ground_energy_array,
+                omega_array,
+                eta_array,
+                source_floor_array,
+            )
             total_sums = (
                 sums if total_sums is None else _add_source_sums(total_sums, sums)
             )
         if total_sums is None:
             msg = "Cannot evaluate NQS-LIT stats with an empty source pool."
             raise ValueError(msg)
-        return nqs_lit_stats_from_source_sums(
+        return _nqs_stats_from_source_sums(
             total_sums,
-            source_norm=source_norm,
-            omega=omega,
-            eta=self.lit_config.eta,
+            jnp.asarray(source_norm),
+            omega_array,
+            eta_array,
         )
 
     def _nqs_double_stats(
@@ -5476,6 +5551,27 @@ def _batched_data_chunks(pool: BatchedData, requested_size: int):
         start += size
 
 
+@jax.jit
+def _nqs_stats_from_source_sums(
+    sums: NQSLITSourceSums,
+    source_norm,
+    omega,
+    eta,
+):
+    """Convert held-out sums with one persistent fused executable.
+
+    Returns:
+        Standard NQS-LIT statistics for the accumulated source moments.
+    """
+    return nqs_lit_stats_from_source_sums(
+        sums,
+        source_norm=source_norm,
+        omega=omega,
+        eta=eta,
+    )
+
+
+@jax.jit
 def _add_source_sums(left, right):
     """Merge independently scaled source moments without overflowing.
 
