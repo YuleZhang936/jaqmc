@@ -111,10 +111,10 @@ lit:
   nqs_response_use_last_layer: false
   nqs_response_envelope: abs_isotropic
   nqs_response_orbitals_spin_split: true
-  # Initialize at the large-negative-frequency source solution.  The runtime
-  # now supports only a hard odd-parity scalar response for an even-parity
-  # one-center atomic ground state and an unconstrained scalar response for a
-  # genuinely C1 molecule.
+  # Initialize at the large-negative-frequency source solution.  For an atom,
+  # diagnose the checkpoint's inversion parity and hard-project the scalar
+  # response into the opposite parity.  A genuinely C1 molecule remains
+  # unconstrained.
   nqs_source_aligned: true
   nqs_source_aligned_residual_scale: 1.0e-2
   nqs_source_symmetry_mode: atom_c1
@@ -122,3 +122,4 @@ lit:
   # This is now only a diagnostic inversion guard on the sampled atomic source;
   # the response parity itself is exact by construction and has no soft loss.
   nqs_source_symmetry_max_covariance: 1.0e-3
+  nqs_atomic_ground_parity_max_loss: 1.0e-3

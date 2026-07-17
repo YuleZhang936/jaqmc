@@ -249,25 +249,32 @@ def _complex_logdet_sum(orbitals: jnp.ndarray) -> jnp.ndarray:
     return jnp.log(determinant_sum) + logmax
 
 
-def odd_parity_project_log_amplitude(
+def parity_project_log_amplitude(
     log_psi: jnp.ndarray,
     inverted_log_psi: jnp.ndarray,
+    parity: int,
 ) -> jnp.ndarray:
-    r"""Return the exact odd projection of two complex log amplitudes.
+    r"""Return an exact parity projection of two complex log amplitudes.
 
     This stably represents
 
     .. math::
 
-        \log\left[\frac{\psi(X)-\psi(IX)}{2}\right]
+        \log\left[\frac{\psi(X)+p\,\psi(IX)}{2}\right],\qquad p\in\{-1,+1\}.
 
-    using a complex ``expm1`` difference about the larger amplitude.  This
-    preserves a small odd component when the two unprojected amplitudes nearly
-    cancel.  No nonzero amplitude floor is introduced: an exact parity node
-    remains an exact zero encoded by a ``-inf`` real log amplitude.  This is
-    required for the projected function to obey
-    :math:`P_-\psi(IX)=-P_-\psi(X)` exactly.
+    A common large log amplitude is factored out before either a complex
+    ``log1p`` sum or an ``expm1`` difference is formed.  The latter preserves a
+    small odd component when the two unprojected amplitudes nearly cancel.  No
+    nonzero amplitude floor is introduced: an exact parity node remains an
+    exact zero encoded by a ``-inf`` real log amplitude.
+
+    ``parity`` is a discrete model choice and must be the Python integer ``1``
+    or ``-1``.  When this function itself is jitted it must consequently be a
+    static argument (or, more commonly, be captured by a closure).
     """
+    if parity not in (-1, 1):
+        msg = f"parity must be +1 or -1, got {parity!r}."
+        raise ValueError(msg)
     log_psi_array = jnp.asarray(log_psi)
     inverted_array = jnp.asarray(inverted_log_psi)
     if log_psi_array.shape != inverted_array.shape:
@@ -286,12 +293,58 @@ def odd_parity_project_log_amplitude(
     use_first_as_base = jnp.real(log_psi_array) >= jnp.real(inverted_array)
     base = jnp.where(use_first_as_base, log_psi_array, inverted_array)
     other = jnp.where(use_first_as_base, inverted_array, log_psi_array)
-    orientation = jnp.where(use_first_as_base, -1.0, 1.0).astype(complex_dtype)
-    projected_log = (
-        base
-        + jnp.log(orientation * jnp.expm1(other - base))
-        - jnp.asarray(jnp.log(2.0), dtype=complex_dtype)
-    )
+    delta = other - base
+    exact_even_node = jnp.zeros_like(jnp.real(delta), dtype=jnp.bool_)
+    if parity == 1:
+        # ``log1p(exp(delta))`` is stable across a large real dynamic range but
+        # still loses the tiny sum when equal-magnitude amplitudes are nearly
+        # antiphase.  Around the nearest odd multiple k*pi, instead use
+        #
+        #   1 + exp(delta) = 1 - exp(delta - i*k*pi)
+        #                  = -expm1(delta - i*k*pi).
+        #
+        # Computing k from phase/pi (rather than a trigonometric phase wrap)
+        # makes phases encoded as +/-pi or any explicitly wound odd multiple
+        # land on an exact zero in the working dtype.  The regular ``log1p``
+        # path is retained in the half-plane around phase zero, where shifting
+        # by pi would introduce needless roundoff into an ordinary sum.
+        real_dtype = jnp.real(delta).dtype
+        pi = jnp.asarray(jnp.pi, dtype=real_dtype)
+        phase = jnp.imag(delta)
+        phase_in_pi = phase / pi
+        nearest_odd_winding = 2.0 * jnp.round((phase_in_pi - 1.0) / 2.0) + 1.0
+        nearest_odd_winding = jax.lax.stop_gradient(nearest_odd_winding)
+        # Preserve the more accurate direct subtraction for a genuinely nearby
+        # phase, while recognizing an explicitly encoded odd winding in units
+        # of pi.  XLA may otherwise reassociate ``phase - k*pi`` by a fraction
+        # of an ulp and turn an exact parity node into a tiny nonzero amplitude.
+        exact_odd_winding = jnp.equal(phase_in_pi, nearest_odd_winding)
+        antiphase_residual = jnp.where(
+            exact_odd_winding,
+            0.0,
+            phase - nearest_odd_winding * pi,
+        )
+        shifted_delta = jnp.real(delta) + 1j * antiphase_residual
+        near_antiphase = jnp.abs(antiphase_residual) <= 0.5 * pi
+        cancellation_stable_sum = -jnp.expm1(shifted_delta)
+        regular_sum = 1.0 + jnp.exp(delta)
+        relative_sum = jnp.where(
+            near_antiphase,
+            cancellation_stable_sum,
+            regular_sum,
+        )
+        relative_log = jnp.log(relative_sum)
+        exact_even_node = (
+            near_antiphase & jnp.equal(jnp.real(delta), 0.0) & exact_odd_winding
+        )
+    else:
+        # Preserve the original odd-projector expression exactly.  ``expm1``
+        # retains relative accuracy when the amplitudes are nearly identical;
+        # orientation restores the requested ordering psi(X) - psi(IX) after
+        # selecting either one as the numerical base.
+        orientation = jnp.where(use_first_as_base, -1.0, 1.0).astype(complex_dtype)
+        relative_log = jnp.log(orientation * jnp.expm1(delta))
+    projected_log = base + relative_log - jnp.asarray(jnp.log(2.0), dtype=complex_dtype)
     both_encoded_zero = (
         jnp.isneginf(jnp.real(log_psi_array))
         & jnp.isfinite(jnp.imag(log_psi_array))
@@ -299,7 +352,123 @@ def odd_parity_project_log_amplitude(
         & jnp.isfinite(jnp.imag(inverted_array))
     )
     encoded_zero = jnp.asarray(-jnp.inf + 0.0j, dtype=complex_dtype)
-    return jnp.where(both_encoded_zero, encoded_zero, projected_log)
+    return jnp.where(
+        both_encoded_zero | exact_even_node,
+        encoded_zero,
+        projected_log,
+    )
+
+
+def odd_parity_project_log_amplitude(
+    log_psi: jnp.ndarray,
+    inverted_log_psi: jnp.ndarray,
+) -> jnp.ndarray:
+    r"""Return ``log[(psi(X) - psi(IX)) / 2]`` stably.
+
+    This compatibility wrapper is equivalent to
+    :func:`parity_project_log_amplitude` with ``parity=-1``.
+    """
+    return parity_project_log_amplitude(log_psi, inverted_log_psi, -1)
+
+
+def parity_log_amplitude_residual(
+    log_psi: jnp.ndarray,
+    inverted_log_psi: jnp.ndarray,
+    parity: int,
+    *,
+    epsilon: float | jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    r"""Return a scale-invariant parity residual for every batch element.
+
+    For scalar log amplitudes of any matching shape, the returned array has the
+    same shape and contains
+
+    .. math::
+
+        r_p(X) =
+        \frac{|\psi(IX)-p\,\psi(X)|^2}
+        {|\psi(IX)|^2+|\psi(X)|^2}.
+
+    A separate common log scale is removed from every pair before
+    exponentiation.  Thus the diagnostic is invariant under arbitrary common
+    complex rescaling, remains finite across the float32 exponential range,
+    and assigns zero residual when both amplitudes are encoded zeros.  Invalid
+    log amplitudes propagate as ``nan`` for the affected sample.  An exact
+    parity eigenstate has residual zero, while the opposite parity has residual
+    two.
+    """
+    if parity not in (-1, 1):
+        msg = f"parity must be +1 or -1, got {parity!r}."
+        raise ValueError(msg)
+    log_psi_array = jnp.asarray(log_psi)
+    inverted_array = jnp.asarray(inverted_log_psi)
+    if log_psi_array.shape != inverted_array.shape:
+        msg = (
+            "log_psi and inverted_log_psi must have identical shapes, got "
+            f"{log_psi_array.shape} and {inverted_array.shape}."
+        )
+        raise ValueError(msg)
+
+    complex_dtype = jnp.result_type(
+        log_psi_array.dtype,
+        inverted_array.dtype,
+        jnp.complex64,
+    )
+    paired_logs = jnp.stack(
+        (
+            log_psi_array.astype(complex_dtype),
+            inverted_array.astype(complex_dtype),
+        ),
+        axis=-1,
+    )
+    real_logs = jnp.real(paired_logs)
+    imag_logs = jnp.imag(paired_logs)
+    finite = jnp.isfinite(real_logs) & jnp.isfinite(imag_logs)
+    encoded_zero = jnp.isneginf(real_logs) & jnp.isfinite(imag_logs)
+    invalid = ~(finite | encoded_zero)
+    masked_real = jnp.where(finite, real_logs, -jnp.inf)
+    log_scale = jnp.max(masked_real, axis=-1, keepdims=True)
+    log_scale = jnp.where(jnp.isfinite(log_scale), log_scale, 0.0)
+    log_scale = jax.lax.stop_gradient(log_scale)
+    safe_delta = jnp.where(finite, paired_logs - log_scale, 0.0 + 0.0j)
+    amplitudes = jnp.where(finite, jnp.exp(safe_delta), 0.0 + 0.0j)
+    psi = amplitudes[..., 0]
+    psi_at_inversion = amplitudes[..., 1]
+
+    numerator = jnp.abs(psi_at_inversion - parity * psi) ** 2
+    denominator = jnp.abs(psi_at_inversion) ** 2 + jnp.abs(psi) ** 2
+    if epsilon is None:
+        epsilon_array = jnp.asarray(
+            16.0 * jnp.finfo(jnp.real(psi).dtype).eps,
+            dtype=denominator.dtype,
+        )
+    else:
+        epsilon_array = jnp.asarray(epsilon, dtype=denominator.dtype)
+    residual = numerator / jnp.maximum(denominator, epsilon_array)
+    invalid_sample = jnp.any(invalid, axis=-1)
+    return jnp.where(
+        invalid_sample,
+        jnp.asarray(jnp.nan, dtype=residual.dtype),
+        residual,
+    )
+
+
+def parity_log_amplitude_loss(
+    log_psi: jnp.ndarray,
+    inverted_log_psi: jnp.ndarray,
+    parity: int,
+    *,
+    epsilon: float | jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    """Return the mean scale-invariant parity residual over a batch."""
+    return jnp.mean(
+        parity_log_amplitude_residual(
+            log_psi,
+            inverted_log_psi,
+            parity,
+            epsilon=epsilon,
+        )
+    )
 
 
 def source_aligned_vector_logpsi(

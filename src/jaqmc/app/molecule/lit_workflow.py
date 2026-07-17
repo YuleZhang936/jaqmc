@@ -32,7 +32,8 @@ from jaqmc.response.nqs_lit import (
     molecular_electronic_dipole,
     nqs_lit_source_sampled_sums,
     nqs_lit_stats_from_source_sums,
-    odd_parity_project_log_amplitude,
+    parity_log_amplitude_loss,
+    parity_project_log_amplitude,
     restore_params_from_checkpoint,
     source_aligned_vector_logpsi,
 )
@@ -58,7 +59,9 @@ logger = logging.LoggerAdapter(
     logging.getLogger(__name__), extra={"category": "response"}
 )
 
+_ATOM_PARITY_PENDING_SECTOR_LABEL = "atom_parity_pending"
 _ATOM_HARD_ODD_SECTOR_LABEL = "atom_odd_hard"
+_ATOM_HARD_EVEN_SECTOR_LABEL = "atom_even_hard"
 
 
 @configurable_dataclass
@@ -153,10 +156,11 @@ class MolecularLITConfig:
     nqs_response_orbitals_spin_split: bool = True
     nqs_source_aligned: bool = False
     nqs_source_aligned_residual_scale: float = 1e-3
-    # Runtime support is deliberately restricted to a hard odd-parity response
-    # for an even-parity atomic ground state, or a symmetry-free multi-center
-    # C1 response.  Legacy values are still accepted so older YAML files
-    # deserialize, but no longer enable vector-head soft-covariance training.
+    # Runtime support is deliberately restricted to an automatically selected
+    # hard atomic parity (opposite the diagnosed ground-state parity), or a
+    # symmetry-free multi-center C1 response.  Legacy values are still accepted
+    # so older YAML files deserialize, but no longer enable vector-head soft
+    # covariance training.
     nqs_source_symmetry_mode: str = "atom_c1"
     nqs_source_symmetry_weight: float = 0.0
     nqs_source_symmetry_learning_rate: float = 1e-3
@@ -167,6 +171,9 @@ class MolecularLITConfig:
     # Hard guard on the worst batch-mean loss among the active non-identity
     # operations.  Set null explicitly to disable the guard.
     nqs_source_symmetry_max_covariance: float | None = 1e-3
+    # Reject an atomic checkpoint unless one inversion parity has a held-out
+    # residual below this threshold.  The response uses the opposite parity.
+    nqs_atomic_ground_parity_max_loss: float = 1e-3
     nqs_selection_interval: int = 50
     nqs_log_interval: int = 50
 
@@ -248,6 +255,16 @@ class _SourceCovarianceMetrics(NamedTuple):
     worst_operation_index: jnp.ndarray
 
 
+class _AtomicParityResolution(NamedTuple):
+    """Host-side atomic ground/response parity admission result."""
+
+    ground_parity: int
+    response_parity: int
+    even_loss: float
+    odd_loss: float
+    selected_loss: float
+
+
 class MoleculeLITWorkflow(Workflow):
     """Compute a molecular dipole response spectrum with NQS-LIT."""
 
@@ -298,6 +315,16 @@ class MoleculeLITWorkflow(Workflow):
             rng,
         )
         logger.info("Using NQS-LIT ground energy %.10f Ha", ground_energy)
+        parity_resolution = self._resolve_atomic_parity(
+            ground_logpsi,
+            ground_params,
+            batched_data,
+            source_sector,
+        )
+        source_sector = _resolve_atomic_parity_sector(
+            source_sector,
+            parity_resolution.response_parity,
+        )
 
         lit = np.zeros((len(axes), len(omega)), dtype=np.float64)
         signed_lit = np.zeros_like(lit)
@@ -351,7 +378,10 @@ class MoleculeLITWorkflow(Workflow):
         logger.info(
             "NQS-LIT response_policy=%s source_sector=%s order=%d "
             "soft_operations=%d source_guard_operations=%d",
-            _response_symmetry_policy(source_sector),
+            _response_symmetry_policy(
+                source_sector,
+                parity_resolution.response_parity,
+            ),
             source_sector.label,
             source_sector.order,
             len(self._active_source_sector_operations(source_sector)),
@@ -407,6 +437,7 @@ class MoleculeLITWorkflow(Workflow):
                     source_center=source_center,
                     source_centers=vector_source_centers,
                     source_sector=source_sector,
+                    response_parity=parity_resolution.response_parity,
                     ground_logpsi=ground_logpsi,
                     initialization_data=_cyclic_batched_data_chunk(
                         batched_data,
@@ -482,6 +513,7 @@ class MoleculeLITWorkflow(Workflow):
                 source_sector,
                 vector_source_centers,
                 axis=axis,
+                response_parity=parity_resolution.response_parity,
             )
             pure_source_covariance_loss[axis_pos] = float(pure_source_metrics.mean_loss)
             pure_source_covariance_max_loss[axis_pos] = float(
@@ -762,12 +794,23 @@ class MoleculeLITWorkflow(Workflow):
             nqs_source_symmetry_max_covariance=_optional_float(
                 self.lit_config.nqs_source_symmetry_max_covariance
             ),
+            nqs_atomic_ground_parity_max_loss=(
+                self.lit_config.nqs_atomic_ground_parity_max_loss
+            ),
             source_sector_label=source_sector.label,
             source_sector_order=source_sector.order,
             source_sector_active_operations=source_sector_active_operations,
             source_guard_operations=source_guard_operations_array,
-            response_symmetry_policy=_response_symmetry_policy(source_sector),
-            response_hard_parity=bool(_is_atom_hard_odd_sector(source_sector)),
+            response_symmetry_policy=_response_symmetry_policy(
+                source_sector,
+                parity_resolution.response_parity,
+            ),
+            response_hard_parity=bool(_is_atom_hard_parity_sector(source_sector)),
+            atomic_ground_parity=parity_resolution.ground_parity,
+            response_parity=parity_resolution.response_parity,
+            atomic_ground_even_parity_loss=parity_resolution.even_loss,
+            atomic_ground_odd_parity_loss=parity_resolution.odd_loss,
+            atomic_ground_selected_parity_loss=parity_resolution.selected_loss,
             response_symmetry_center=np.asarray(
                 source_sector.center,
                 dtype=np.float64,
@@ -1051,6 +1094,21 @@ class MoleculeLITWorkflow(Workflow):
         ):
             msg = "lit.nqs_source_symmetry_max_covariance must be positive or null."
             raise ValueError(msg)
+        self._validate_atomic_parity_config()
+
+    def _validate_atomic_parity_config(self) -> None:
+        """Validate the mandatory atomic checkpoint parity admission guard.
+
+        Raises:
+            ValueError: If the threshold is non-finite or outside ``(0, 1)``.
+        """
+        parity_maximum = self.lit_config.nqs_atomic_ground_parity_max_loss
+        if not np.isfinite(parity_maximum) or not 0.0 < parity_maximum < 1.0:
+            msg = (
+                "lit.nqs_atomic_ground_parity_max_loss must be finite and "
+                "strictly between 0 and 1."
+            )
+            raise ValueError(msg)
 
     def _validate_continuation_config(self) -> None:
         if self.lit_config.nqs_continuation_iterations < 1:
@@ -1124,10 +1182,10 @@ class MoleculeLITWorkflow(Workflow):
         """Resolve the restricted atomic-hard-parity or molecular-C1 policy.
 
         Returns:
-            ``atom_odd_hard`` with identity and inversion for exactly one
+            ``atom_parity_pending`` with identity and inversion for exactly one
             nucleus, or the identity-only ``C1`` sector for a multi-nuclear
             geometry with no discovered nontrivial operation.  The atomic
-            source guard later verifies the required even ground-state parity.
+            ground checkpoint later selects the opposite response parity.
 
         Raises:
             NotImplementedError: If a multi-nuclear geometry is not C1.
@@ -1165,15 +1223,15 @@ class MoleculeLITWorkflow(Workflow):
             resolved = replace(
                 sector,
                 operations=(identity, inversion),
-                label=_ATOM_HARD_ODD_SECTOR_LABEL,
+                label=_ATOM_PARITY_PENDING_SECTOR_LABEL,
             )
         elif sector.is_trivial:
             resolved = replace(sector, label="C1")
         else:
             msg = (
-                "NQS-LIT currently supports only even-ground-parity one-center "
-                "atoms with a hard odd-parity response and multi-center C1 "
-                "molecules without "
+                "NQS-LIT currently supports only one-center atoms with an "
+                "automatically selected hard response parity and multi-center "
+                "C1 molecules without "
                 f"spatial symmetry; discovered n_atoms={atom_count}, "
                 f"sector={sector.label!r}, order={sector.order}."
             )
@@ -1187,15 +1245,128 @@ class MoleculeLITWorkflow(Workflow):
                 "policy=%s.",
                 mode,
                 self.lit_config.nqs_source_symmetry_weight,
-                _response_symmetry_policy(resolved),
+                _response_symmetry_policy(resolved, 0),
             )
         return resolved
+
+    def _resolve_atomic_parity(
+        self,
+        ground_logpsi,
+        ground_params,
+        batched_data: BatchedData,
+        source_sector: SourceSector,
+    ) -> _AtomicParityResolution:
+        """Diagnose atomic ground parity and select the opposite response parity.
+
+        C1 molecules have no hard spatial projector and return zero parity
+        labels with non-applicable losses.  An atom is accepted only when the
+        checkpoint is a clean inversion eigenstate on the held-out batch.
+
+        Returns:
+            The diagnosed ground parity, opposite response parity, and both
+            held-out parity losses.  C1 returns zero characters and NaN losses.
+
+        Raises:
+            RuntimeError: If neither atomic inversion parity passes the hard
+                admission threshold, the losses are invalid, or the result is
+                ambiguous because both amplitudes vanish.
+        """
+        if not _is_atom_parity_sector(source_sector):
+            return _AtomicParityResolution(
+                0, 0, float("nan"), float("nan"), float("nan")
+            )
+
+        evaluation_batch = _cyclic_batched_data_chunk(
+            batched_data,
+            min(
+                batched_data.batch_size,
+                int(self.lit_config.nqs_source_symmetry_eval_batch_size),
+            ),
+            0,
+        )
+        inversion = jnp.asarray(
+            -np.eye(3),
+            dtype=evaluation_batch.data.electrons.dtype,
+        )
+        symmetry_center = jnp.asarray(
+            source_sector.center,
+            dtype=evaluation_batch.data.electrons.dtype,
+        )
+
+        @jax.jit
+        def evaluate(local_ground_params, local_batch):
+            def paired_logs(data):
+                return (
+                    ground_logpsi(local_ground_params, data),
+                    ground_logpsi(
+                        local_ground_params,
+                        transform_molecule_data(data, inversion, symmetry_center),
+                    ),
+                )
+
+            log_amplitudes, inverted_log_amplitudes = jax.vmap(
+                paired_logs,
+                in_axes=(local_batch.vmap_axis,),
+            )(local_batch.data)
+            return (
+                parity_log_amplitude_loss(
+                    log_amplitudes,
+                    inverted_log_amplitudes,
+                    1,
+                ),
+                parity_log_amplitude_loss(
+                    log_amplitudes,
+                    inverted_log_amplitudes,
+                    -1,
+                ),
+            )
+
+        even_loss_array, odd_loss_array = jax.device_get(
+            evaluate(ground_params, evaluation_batch)
+        )
+        even_loss = float(even_loss_array)
+        odd_loss = float(odd_loss_array)
+        ground_parity = 1 if even_loss <= odd_loss else -1
+        selected_loss = even_loss if ground_parity == 1 else odd_loss
+        opposite_loss = odd_loss if ground_parity == 1 else even_loss
+        maximum = float(self.lit_config.nqs_atomic_ground_parity_max_loss)
+        logger.info(
+            "Atomic ground parity diagnosis even_loss=%.6e odd_loss=%.6e "
+            "selected=%s response=%s maximum=%.6e",
+            even_loss,
+            odd_loss,
+            "even" if ground_parity == 1 else "odd",
+            "odd" if ground_parity == 1 else "even",
+            maximum,
+        )
+        if (
+            not np.isfinite(even_loss)
+            or not np.isfinite(odd_loss)
+            or selected_loss > maximum
+            or opposite_loss < 2.0 - maximum
+        ):
+            msg = (
+                "Atomic ground checkpoint is not a clean inversion-parity "
+                f"eigenstate: even_loss={even_loss:.6e}, "
+                f"odd_loss={odd_loss:.6e}, required selected_loss <= "
+                f"lit.nqs_atomic_ground_parity_max_loss={maximum:.6e} and "
+                "opposite_loss >= 2 - maximum. Retrain or explicitly project "
+                "the ground state before computing its dipole response."
+            )
+            raise RuntimeError(msg)
+        return _AtomicParityResolution(
+            ground_parity,
+            -ground_parity,
+            even_loss,
+            odd_loss,
+            selected_loss,
+        )
 
     def _active_source_sector_operations(
         self,
         sector: SourceSector,
     ) -> tuple[jnp.ndarray, ...]:
-        if _is_atom_hard_odd_sector(sector):
+        if _is_atom_hard_parity_sector(sector):
             return ()
         if self.lit_config.nqs_source_symmetry_weight <= 0.0:
             return ()
@@ -1225,6 +1396,7 @@ class MoleculeLITWorkflow(Workflow):
         source_centers,
         *,
         axis: int,
+        response_parity: int = 0,
     ) -> _SourceCovarianceMetrics:
         """Check that the sampled dipole source belongs to its target sector.
 
@@ -1265,6 +1437,20 @@ class MoleculeLITWorkflow(Workflow):
         if centers.shape != (3,):
             msg = f"source_centers must have shape (3,), got {centers.shape}."
             raise ValueError(msg)
+
+        if _is_atom_hard_parity_sector(source_sector):
+            return self._validate_atomic_source_parity(
+                ground_logpsi,
+                ground_params,
+                evaluation_batch,
+                source_sector,
+                centers,
+                active_operations,
+                axis=axis,
+                response_parity=response_parity,
+                maximum=float(maximum),
+            )
+
         operations = jnp.stack(active_operations)
 
         def pure_source_vector_apply(local_ground_params, data):
@@ -1326,6 +1512,118 @@ class MoleculeLITWorkflow(Workflow):
             raise RuntimeError(msg)
         return metrics
 
+    def _validate_atomic_source_parity(
+        self,
+        ground_logpsi,
+        ground_params,
+        evaluation_batch: BatchedData,
+        source_sector: SourceSector,
+        centers,
+        active_operations: tuple[jnp.ndarray, ...],
+        *,
+        axis: int,
+        response_parity: int,
+        maximum: float,
+    ) -> _SourceCovarianceMetrics:
+        """Validate one atomic dipole source against its diagnosed parity.
+
+        Returns:
+            The scalar parity loss encoded as the mean and maximum covariance
+            metric, with the inversion operation recorded as the worst index.
+
+        Raises:
+            ValueError: If the requested parity disagrees with the resolved
+                atomic sector.
+            RuntimeError: If the sector lacks a unique inversion operation or
+                the held-out source parity is non-finite or above ``maximum``.
+        """
+        expected_parity = _response_parity_character(source_sector)
+        if response_parity != expected_parity:
+            msg = (
+                "Atomic source validation requires resolved response parity "
+                f"{expected_parity:+d}, got {response_parity!r}."
+            )
+            raise ValueError(msg)
+        if len(active_operations) != 1 or not np.allclose(
+            np.asarray(jax.device_get(active_operations[0])),
+            -np.eye(3),
+            rtol=0.0,
+            atol=1e-10,
+        ):
+            msg = (
+                "A resolved atomic source sector must contain exactly one "
+                "non-identity inversion operation."
+            )
+            raise RuntimeError(msg)
+
+        inversion = jnp.asarray(
+            active_operations[0],
+            dtype=evaluation_batch.data.electrons.dtype,
+        )
+        symmetry_center = jnp.asarray(
+            source_sector.center,
+            dtype=evaluation_batch.data.electrons.dtype,
+        )
+
+        def pure_source_scalar_apply(local_ground_params, data):
+            ground_log_amplitude = ground_logpsi(local_ground_params, data)
+            complex_dtype = jnp.result_type(ground_log_amplitude, jnp.complex64)
+            source_factor = jnp.asarray(
+                molecular_electronic_dipole(data, axis) - centers[axis],
+                dtype=complex_dtype,
+            )
+            return jnp.asarray(
+                ground_log_amplitude,
+                dtype=complex_dtype,
+            ) + jnp.log(source_factor)
+
+        @jax.jit
+        def evaluate_parity(local_ground_params, local_evaluation_batch):
+            def paired_logs(data):
+                return (
+                    pure_source_scalar_apply(local_ground_params, data),
+                    pure_source_scalar_apply(
+                        local_ground_params,
+                        transform_molecule_data(data, inversion, symmetry_center),
+                    ),
+                )
+
+            source_logs, inverted_source_logs = jax.vmap(
+                paired_logs,
+                in_axes=(local_evaluation_batch.vmap_axis,),
+            )(local_evaluation_batch.data)
+            return parity_log_amplitude_loss(
+                source_logs,
+                inverted_source_logs,
+                response_parity,
+            )
+
+        loss_array = jax.device_get(evaluate_parity(ground_params, evaluation_batch))
+        loss = float(loss_array)
+        logger.info(
+            "axis=%s pure_source_heldout_parity=%+.0f loss=%.6e maximum=%.6e",
+            _AXIS_NAMES[axis],
+            float(response_parity),
+            loss,
+            maximum,
+        )
+        if not np.isfinite(loss) or loss > maximum:
+            msg = (
+                f"axis={_AXIS_NAMES[axis]} pure-source held-out parity loss "
+                f"{loss:.6e} exceeds "
+                "lit.nqs_source_symmetry_max_covariance="
+                f"{maximum:.6e} for response parity {response_parity:+d}. "
+                "The sampled (D-D0)Psi0 source is outside the diagnosed "
+                "atomic response sector; check the ground checkpoint, source "
+                "center, and source-pool equilibration."
+            )
+            raise RuntimeError(msg)
+        return _SourceCovarianceMetrics(
+            mean_loss=jnp.asarray(loss_array),
+            max_loss=jnp.asarray(loss_array),
+            worst_operation_index=jnp.asarray(0, dtype=jnp.int32),
+        )
+
     def _make_response_ansatz(  # noqa: C901
         self,
         example,
@@ -1336,6 +1634,7 @@ class MoleculeLITWorkflow(Workflow):
         source_center: float,
         source_centers=None,
         source_sector: SourceSector | None = None,
+        response_parity: int = 0,
         ground_logpsi=None,
         initialization_data: BatchedData | None = None,
         initial_omega: float | None = None,
@@ -1347,7 +1646,21 @@ class MoleculeLITWorkflow(Workflow):
             )
             raise ValueError(msg)
         del source_centers
-        hard_odd_parity = _is_atom_hard_odd_sector(source_sector)
+        hard_atomic_parity = _is_atom_hard_parity_sector(source_sector)
+        if _is_atom_parity_sector(source_sector) and not hard_atomic_parity:
+            msg = "Atomic response parity must be diagnosed before ansatz creation."
+            raise ValueError(msg)
+        if hard_atomic_parity:
+            expected_parity = _response_parity_character(source_sector)
+            if response_parity != expected_parity:
+                msg = (
+                    "Atomic response ansatz requires resolved parity "
+                    f"{expected_parity:+d}, got {response_parity!r}."
+                )
+                raise ValueError(msg)
+        elif response_parity != 0:
+            msg = "A C1 response must not receive a hard parity character."
+            raise ValueError(msg)
         response = MolecularResponseFermiNet(
             nspins=_two_spin_tuple(self.system_config.electron_spins),
             ndets=int(self.lit_config.nqs_response_ndets),
@@ -1374,11 +1687,12 @@ class MoleculeLITWorkflow(Workflow):
 
         def projected_raw_apply(params, data):
             raw_logpsi = raw_apply(params, data)
-            if not hard_odd_parity:
+            if not hard_atomic_parity:
                 return raw_logpsi
-            return odd_parity_project_log_amplitude(
+            return parity_project_log_amplitude(
                 raw_logpsi,
                 raw_apply(params, inverted_data(data)),
+                response_parity,
             )
 
         if not self.lit_config.nqs_source_aligned:
@@ -1411,11 +1725,12 @@ class MoleculeLITWorkflow(Workflow):
 
         def projected_source_logpsi(data):
             source_log_amplitude = source_logpsi(data)
-            if not hard_odd_parity:
+            if not hard_atomic_parity:
                 return source_log_amplitude
-            return odd_parity_project_log_amplitude(
+            return parity_project_log_amplitude(
                 source_log_amplitude,
                 source_logpsi(inverted_data(data)),
+                response_parity,
             )
 
         if initialization_data is None:
@@ -1440,7 +1755,7 @@ class MoleculeLITWorkflow(Workflow):
                 projected_source_logpsi,
                 in_axes=(initialization_data.vmap_axis,),
             )(initialization_data.data)
-        if hard_odd_parity:
+        if hard_atomic_parity:
             residual_log_scale = _calibrated_residual_log_scale_from_logs(
                 jnp.asarray(raw_initial_logpsi)[..., None],
                 jnp.asarray(projected_source_initial_logpsi)[..., None],
@@ -1491,11 +1806,12 @@ class MoleculeLITWorkflow(Workflow):
 
         def aligned_apply(params, data):
             aligned_logpsi = unprojected_aligned_apply(params, data)
-            if not hard_odd_parity:
+            if not hard_atomic_parity:
                 return aligned_logpsi
-            return odd_parity_project_log_amplitude(
+            return parity_project_log_amplitude(
                 aligned_logpsi,
                 unprojected_aligned_apply(params, inverted_data(data)),
+                response_parity,
             )
 
         return aligned_apply, None, response_params
@@ -4778,9 +5094,17 @@ def _is_identity_operation(operation, *, tolerance: float = 1e-10) -> bool:
     )
 
 
-def _is_atom_hard_odd_sector(sector: SourceSector) -> bool:
-    """Return whether a resolved sector denotes the hard atomic odd policy."""
-    if sector.label != _ATOM_HARD_ODD_SECTOR_LABEL or sector.order != 2:
+def _is_atom_parity_sector(sector: SourceSector) -> bool:
+    """Return whether a sector denotes pending or resolved atomic parity."""
+    if (
+        sector.label
+        not in {
+            _ATOM_PARITY_PENDING_SECTOR_LABEL,
+            _ATOM_HARD_ODD_SECTOR_LABEL,
+            _ATOM_HARD_EVEN_SECTOR_LABEL,
+        }
+        or sector.order != 2
+    ):
         return False
     return any(
         np.allclose(
@@ -4793,9 +5117,87 @@ def _is_atom_hard_odd_sector(sector: SourceSector) -> bool:
     )
 
 
-def _response_symmetry_policy(sector: SourceSector) -> str:
-    """Return the persisted runtime policy name for one resolved geometry."""
-    return "atom_hard_odd" if _is_atom_hard_odd_sector(sector) else "molecule_c1"
+def _is_atom_hard_parity_sector(sector: SourceSector) -> bool:
+    """Return whether an atomic sector has a diagnosed response parity."""
+    return _is_atom_parity_sector(sector) and sector.label in {
+        _ATOM_HARD_ODD_SECTOR_LABEL,
+        _ATOM_HARD_EVEN_SECTOR_LABEL,
+    }
+
+
+def _response_parity_character(sector: SourceSector) -> int:
+    """Return +1 for hard even, -1 for hard odd, or zero if unresolved/C1."""
+    if sector.label == _ATOM_HARD_EVEN_SECTOR_LABEL:
+        return 1
+    if sector.label == _ATOM_HARD_ODD_SECTOR_LABEL:
+        return -1
+    return 0
+
+
+def _resolve_atomic_parity_sector(
+    sector: SourceSector,
+    response_parity: int,
+) -> SourceSector:
+    """Attach one diagnosed response parity to a pending atomic sector.
+
+    Returns:
+        The resolved hard-parity atomic sector, or the unchanged C1 sector.
+
+    Raises:
+        ValueError: If the supplied character is invalid for the sector.
+    """
+    if sector.label == _ATOM_PARITY_PENDING_SECTOR_LABEL:
+        if response_parity not in (-1, 1):
+            msg = (
+                "A pending atomic sector requires response parity +1 or -1, "
+                f"got {response_parity!r}."
+            )
+            raise ValueError(msg)
+        label = (
+            _ATOM_HARD_EVEN_SECTOR_LABEL
+            if response_parity == 1
+            else _ATOM_HARD_ODD_SECTOR_LABEL
+        )
+        return replace(sector, label=label)
+    if _is_atom_hard_parity_sector(sector):
+        expected = _response_parity_character(sector)
+        if response_parity != expected:
+            msg = (
+                f"Resolved atomic sector requires parity {expected:+d}, got "
+                f"{response_parity!r}."
+            )
+            raise ValueError(msg)
+        return sector
+    if response_parity != 0:
+        msg = f"C1 sector cannot resolve atomic parity {response_parity!r}."
+        raise ValueError(msg)
+    return sector
+
+
+def _response_symmetry_policy(sector: SourceSector, response_parity: int) -> str:
+    """Return the persisted runtime policy name for one resolved geometry.
+
+    Raises:
+        ValueError: If the supplied character is invalid for the sector.
+    """
+    if sector.label == _ATOM_PARITY_PENDING_SECTOR_LABEL:
+        if response_parity != 0:
+            msg = "Pending atomic parity cannot have a resolved character."
+            raise ValueError(msg)
+        return "atom_hard_auto"
+    if _is_atom_hard_parity_sector(sector):
+        expected = _response_parity_character(sector)
+        if response_parity != expected:
+            msg = (
+                f"Atomic response policy requires parity {expected:+d}, got "
+                f"{response_parity!r}."
+            )
+            raise ValueError(msg)
+        return "atom_hard_even" if response_parity == 1 else "atom_hard_odd"
+    if response_parity != 0:
+        msg = f"C1 response policy cannot use parity {response_parity!r}."
+        raise ValueError(msg)
+    return "molecule_c1"
 
 
 def _project_source_center_to_invariant_subspace(

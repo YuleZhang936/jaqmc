@@ -22,6 +22,9 @@ from jaqmc.response.nqs_lit import (
     nqs_lit_source_sampled_sums,
     nqs_lit_stats_from_source_sums,
     odd_parity_project_log_amplitude,
+    parity_log_amplitude_loss,
+    parity_log_amplitude_residual,
+    parity_project_log_amplitude,
     restore_params_from_checkpoint,
     source_aligned_vector_logpsi,
 )
@@ -348,6 +351,97 @@ def test_odd_parity_projection_is_stable_under_extreme_common_log_shifts():
     )
 
 
+def test_even_parity_projection_is_stable_under_extreme_common_log_shifts():
+    base_log_psi = jnp.asarray(0.4 + 0.3j, dtype=jnp.complex64)
+    base_inverted_log_psi = jnp.asarray(-0.7 - 0.2j, dtype=jnp.complex64)
+    common_shifts = jnp.asarray([1.0e3, -1.0e3], dtype=jnp.float32)
+
+    projected_logs = parity_project_log_amplitude(
+        base_log_psi + common_shifts,
+        base_inverted_log_psi + common_shifts,
+        1,
+    )
+    scaled_amplitudes = jnp.exp(projected_logs - common_shifts)
+    expected = 0.5 * (jnp.exp(base_log_psi) + jnp.exp(base_inverted_log_psi))
+
+    assert np.all(np.isfinite(np.asarray(projected_logs)))
+    np.testing.assert_allclose(
+        np.asarray(scaled_amplitudes),
+        np.broadcast_to(np.asarray(expected), (2,)),
+        rtol=2e-4,
+        atol=2e-4,
+    )
+
+
+def test_even_parity_projection_encodes_wrapped_antiphase_nodes_exactly():
+    pi = jnp.asarray(jnp.pi, dtype=jnp.float32)
+    log_psi = jnp.asarray(
+        [
+            2.0 + 0.0j,
+            -700.0 + 0.3j,
+            40.0 - 0.7j,
+            -40.0 + 0.2j,
+            0.1 + 0.0j,
+            -0.1 + 0.0j,
+        ],
+        dtype=jnp.complex64,
+    )
+    odd_windings = jnp.asarray([1, -1, 3, -3, 5, -5], dtype=jnp.float32)
+    inverted_log_psi = log_psi + 1j * odd_windings * pi
+
+    projected = jax.jit(
+        lambda first, second: parity_project_log_amplitude(first, second, 1)
+    )(log_psi, inverted_log_psi)
+
+    assert np.all(np.isneginf(np.asarray(jnp.real(projected))))
+    assert np.all(np.isfinite(np.asarray(jnp.imag(projected))))
+    np.testing.assert_array_equal(
+        np.asarray(jnp.exp(projected)),
+        np.zeros((6,), dtype=np.complex64),
+    )
+
+
+def test_even_parity_projection_preserves_nearly_cancelled_sum():
+    pi = jnp.asarray(jnp.pi, dtype=jnp.float32)
+    log_psi = jnp.asarray(
+        [40.0 + 0.7j, 40.0 - 0.4j],
+        dtype=jnp.complex64,
+    )
+    inverted_log_psi = log_psi + jnp.asarray(
+        [-2.0e-5 + 1j * (pi + 3.0e-6), -3.0e-5 + 1j * (-pi - 4.0e-6)],
+        dtype=jnp.complex64,
+    )
+
+    projected = parity_project_log_amplitude(log_psi, inverted_log_psi, 1)
+    scaled_amplitude = jnp.exp(projected - log_psi)
+    actual_delta = np.asarray(inverted_log_psi - log_psi, dtype=np.complex64).astype(
+        np.complex128
+    )
+    nearest_antiphase = np.asarray([np.pi, -np.pi], dtype=np.float32).astype(np.float64)
+    shifted_delta = actual_delta.real + 1j * (actual_delta.imag - nearest_antiphase)
+    expected = -0.5 * np.expm1(shifted_delta)
+
+    np.testing.assert_allclose(
+        np.asarray(scaled_amplitude),
+        expected,
+        rtol=3e-5,
+        atol=2e-10,
+    )
+
+
+def test_odd_parity_wrapper_matches_generic_projection():
+    log_psi = jnp.asarray([40.0 + 0.7j, -800.0 - 0.1j], dtype=jnp.complex64)
+    inverted_log_psi = jnp.asarray(
+        [39.99998 + 0.700003j, -801.0 + 0.4j],
+        dtype=jnp.complex64,
+    )
+
+    wrapped = odd_parity_project_log_amplitude(log_psi, inverted_log_psi)
+    generic = parity_project_log_amplitude(log_psi, inverted_log_psi, -1)
+
+    np.testing.assert_array_equal(np.asarray(wrapped), np.asarray(generic))
+
+
 def test_odd_parity_projection_changes_amplitude_sign_when_swapped():
     log_psi = jnp.asarray(0.2 + 0.8j, dtype=jnp.complex64)
     inverted_log_psi = jnp.asarray(-0.5 - 0.3j, dtype=jnp.complex64)
@@ -392,6 +486,21 @@ def test_odd_parity_projection_encodes_exact_node_as_zero():
         np.asarray(jnp.exp(projected)),
         np.asarray(0.0 + 0.0j, dtype=np.complex64),
     )
+
+
+def test_parity_projection_preserves_encoded_zeros():
+    encoded_zero = jnp.asarray(-jnp.inf + 0.0j, dtype=jnp.complex64)
+
+    even = parity_project_log_amplitude(encoded_zero, encoded_zero, 1)
+    odd = parity_project_log_amplitude(encoded_zero, encoded_zero, -1)
+
+    for projected in (even, odd):
+        assert np.isneginf(float(jnp.real(projected)))
+        assert not np.isnan(float(jnp.imag(projected)))
+        np.testing.assert_array_equal(
+            np.asarray(jnp.exp(projected)),
+            np.asarray(0.0 + 0.0j, dtype=np.complex64),
+        )
 
 
 def test_odd_parity_projection_supports_jit_and_vmap():
@@ -445,6 +554,135 @@ def test_odd_parity_projection_has_finite_derivatives_away_from_node():
 
     assert np.all(np.isfinite(np.asarray(first)))
     assert np.all(np.isfinite(np.asarray(second)))
+
+
+def test_even_parity_projection_supports_jit_vmap_grad_and_hessian():
+    log_psi = jnp.asarray(
+        [0.1 + 0.2j, -0.4 + 0.6j, 0.8 - 0.3j],
+        dtype=jnp.complex64,
+    )
+    inverted_log_psi = jnp.asarray(
+        [-0.6 - 0.1j, 0.2 - 0.5j, -0.3 + 0.4j],
+        dtype=jnp.complex64,
+    )
+
+    def project_even(first, second):
+        return parity_project_log_amplitude(first, second, 1)
+
+    jitted = jax.jit(project_even)(log_psi, inverted_log_psi)
+    vmapped = jax.vmap(project_even)(log_psi, inverted_log_psi)
+    expected_amplitudes = 0.5 * (jnp.exp(log_psi) + jnp.exp(inverted_log_psi))
+
+    np.testing.assert_allclose(
+        np.asarray(jnp.exp(jitted)),
+        np.asarray(expected_amplitudes),
+        rtol=2e-6,
+        atol=2e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(jnp.exp(vmapped)),
+        np.asarray(expected_amplitudes),
+        rtol=2e-6,
+        atol=2e-6,
+    )
+
+    def objective(coordinates):
+        x, y = coordinates
+        first = 0.3 * x - 0.2 * y**2 + 1j * (0.4 * y + 0.1 * x**2)
+        second = -0.7 + 0.1 * x * y + 1j * (-0.2 * x + 0.3 * y)
+        projected = project_even(first, second)
+        return jnp.real(projected) + 0.25 * jnp.imag(projected)
+
+    coordinates = jnp.asarray([0.4, -0.2], dtype=jnp.float32)
+    first = jax.grad(objective)(coordinates)
+    second = jax.hessian(objective)(coordinates)
+
+    assert np.all(np.isfinite(np.asarray(first)))
+    assert np.all(np.isfinite(np.asarray(second)))
+
+
+def test_even_parity_near_cancellation_has_finite_grad_and_hessian():
+    pi = jnp.asarray(jnp.pi, dtype=jnp.float32)
+
+    def objective(coordinates):
+        x, y = coordinates
+        common = 30.0 + 0.1 * x + 1j * (0.2 - 0.05 * y)
+        magnitude_gap = 0.02 + 0.003 * x**2
+        phase_offset = 0.01 * y
+        inverted = common - magnitude_gap + 1j * (pi + phase_offset)
+        projected = parity_project_log_amplitude(common, inverted, 1)
+        return jnp.real(projected) + 0.25 * jnp.imag(projected)
+
+    coordinates = jnp.asarray([0.4, -0.2], dtype=jnp.float32)
+    first = jax.grad(objective)(coordinates)
+    second = jax.hessian(objective)(coordinates)
+
+    assert np.all(np.isfinite(np.asarray(first)))
+    assert np.all(np.isfinite(np.asarray(second)))
+
+
+def test_parity_residual_is_scale_invariant_and_distinguishes_parity():
+    log_psi = jnp.asarray(
+        [0.2 + 0.3j, -0.7 - 0.2j, 1.1 + 0.8j],
+        dtype=jnp.complex64,
+    )
+    common_shifts = jnp.asarray([1.0e3, -1.0e3, 500.0], dtype=jnp.float32)
+    even_inverted = log_psi
+    odd_inverted = log_psi + jnp.asarray(1j * jnp.pi, dtype=jnp.complex64)
+
+    even_residual = parity_log_amplitude_residual(
+        log_psi + common_shifts,
+        even_inverted + common_shifts,
+        1,
+    )
+    even_wrong_residual = parity_log_amplitude_residual(
+        log_psi + common_shifts,
+        even_inverted + common_shifts,
+        -1,
+    )
+    odd_residual = parity_log_amplitude_residual(
+        log_psi + common_shifts,
+        odd_inverted + common_shifts,
+        -1,
+    )
+    odd_wrong_residual = parity_log_amplitude_residual(
+        log_psi + common_shifts,
+        odd_inverted + common_shifts,
+        1,
+    )
+
+    np.testing.assert_allclose(np.asarray(even_residual), 0.0, atol=1e-7)
+    np.testing.assert_allclose(np.asarray(even_wrong_residual), 2.0, rtol=2e-6)
+    np.testing.assert_allclose(np.asarray(odd_residual), 0.0, atol=2e-11)
+    np.testing.assert_allclose(np.asarray(odd_wrong_residual), 2.0, rtol=2e-6)
+
+
+def test_parity_loss_handles_batches_encoded_zeros_and_jit():
+    encoded_zero = jnp.asarray(-jnp.inf + 0.0j, dtype=jnp.complex64)
+    log_psi = jnp.asarray(
+        [0.2 + 0.3j, encoded_zero, -800.0 - 0.4j],
+        dtype=jnp.complex64,
+    )
+    inverted_log_psi = log_psi
+
+    residual = jax.jit(
+        lambda first, second: parity_log_amplitude_residual(first, second, 1)
+    )(log_psi, inverted_log_psi)
+    loss = jax.jit(lambda first, second: parity_log_amplitude_loss(first, second, 1))(
+        log_psi, inverted_log_psi
+    )
+
+    np.testing.assert_allclose(np.asarray(residual), 0.0, atol=1e-7)
+    np.testing.assert_allclose(float(loss), 0.0, atol=1e-7)
+
+
+def test_parity_helpers_reject_invalid_parity_and_shape():
+    log_psi = jnp.asarray([0.2 + 0.3j, -0.1 + 0.4j])
+
+    with np.testing.assert_raises_regex(ValueError, "parity must be"):
+        parity_project_log_amplitude(log_psi, log_psi, 0)
+    with np.testing.assert_raises_regex(ValueError, "identical shapes"):
+        parity_log_amplitude_residual(log_psi, log_psi[:1], 1)
 
 
 def test_source_aligned_vector_logpsi_is_source_dominated_at_initialization():
