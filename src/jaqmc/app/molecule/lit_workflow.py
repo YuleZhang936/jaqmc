@@ -5,12 +5,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import operator
 import time
-from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, fields, replace
+from enum import Enum
+from functools import partial
 from typing import Any, NamedTuple
+from zipfile import BadZipFile
 
 import jax
 import numpy as np
@@ -27,6 +32,7 @@ from jaqmc.response.lit import lit_error_bound
 from jaqmc.response.nqs_lit import (
     MolecularResponseFermiNet,
     NQSLITSourceSums,
+    NQSLITStats,
     ground_local_energy,
     local_action_ratio,
     molecular_electronic_dipole,
@@ -46,6 +52,7 @@ from jaqmc.response.source_sector import (
 from jaqmc.response.spectrum import find_spectrum_peaks
 from jaqmc.sampler.base import SamplePlan
 from jaqmc.sampler.mcmc import MCMCSampler, MCMCState
+from jaqmc.utils.checkpoint import NumPyCheckpointManager
 from jaqmc.utils.config import ConfigManager, configurable_dataclass
 from jaqmc.wavefunction.output.envelope import EnvelopeType
 from jaqmc.workflow.base import Workflow
@@ -62,6 +69,8 @@ logger = logging.LoggerAdapter(
 _ATOM_PARITY_PENDING_SECTOR_LABEL = "atom_parity_pending"
 _ATOM_HARD_ODD_SECTOR_LABEL = "atom_odd_hard"
 _ATOM_HARD_EVEN_SECTOR_LABEL = "atom_even_hard"
+_CONTINUATION_CHECKPOINT_SCHEMA_VERSION = 1
+_CONTINUATION_CHECKPOINT_PREFIX = "continuation"
 
 
 @configurable_dataclass
@@ -144,6 +153,9 @@ class MolecularLITConfig:
     nqs_continuation_allow_min_step_override: bool = True
     nqs_continuation_min_step: float | None = None
     nqs_continuation_max_points: int = 256
+    # Optional previous run, continuation-checkpoint root, axis directory, or
+    # checkpoint file.  New checkpoints are always written below save_path.
+    nqs_continuation_restore_path: str = ""
     nqs_response_ndets: int = 16
     nqs_response_hidden_dims_single: tuple[int, ...] = field(
         default_factory=lambda: (256, 256, 256, 256)
@@ -240,6 +252,39 @@ class _ContinuationRecord(NamedTuple):
     bisections: int
     probe_accepted: bool
     min_step_override: bool
+
+
+class _ContinuationCheckpoint(NamedTuple):
+    """Serializable latest-good state for one response-axis bridge chain."""
+
+    schema_version: int
+    state_fingerprint: str
+    full_config_digest: str
+    axis: int
+    target_omega: float
+    current_omega: float
+    accepted_points: int
+    ground_checkpoint_step: int
+    ground_energy: float
+    source_center: float
+    source_norm: float
+    response_parity: int
+    response_params: Any
+    rng: jax.Array
+    current_stats: NQSLITStats
+    history_json: str
+    warm_start_selected_iteration: int
+
+
+class _ContinuationResumeState(NamedTuple):
+    """Validated in-memory continuation state restored from one checkpoint."""
+
+    response_params: Any
+    rng: jax.Array
+    current_stats: NQSLITStats
+    current_omega: float
+    records: tuple[_ContinuationRecord, ...]
+    warm_start_selected_iteration: int
 
 
 class _SourceCovarianceMetrics(NamedTuple):
@@ -538,32 +583,26 @@ class MoleculeLITWorkflow(Workflow):
                 source_center=source_center,
                 source_norm=axis_phi_norm,
             )
-            precompile_omega = (
-                float(self.lit_config.nqs_warm_start_omega)
-                if self.lit_config.nqs_warm_start_omega is not None
-                else float(omega[0])
-            )
-            rng = self._precompile_direct_estimator(
-                update_step,
-                response_params,
-                train_pool,
-                axis_batched_data,
-                rng,
+            state_fingerprint, full_config_digest = _continuation_checkpoint_digests(
+                self.lit_config,
+                response_params=response_params,
+                ground_params=ground_params,
+                train_pool=train_pool,
+                eval_pool=eval_pool,
                 axis=axis,
-                omega=jnp.asarray(precompile_omega),
+                source_center=source_center,
+                source_norm=axis_phi_norm,
+                ground_energy=ground_energy,
+                ground_checkpoint_step=checkpoint_step,
+                response_parity=parity_resolution.response_parity,
+                target_omega=float(omega[0]),
+                spectrum_omega=omega,
             )
-            (
+            resume_state = self._restore_nqs_continuation_checkpoint(
                 response_params,
-                warm_start_stats,
-                warm_start_selected_iteration[axis_pos],
                 rng,
-            ) = self._warm_start_axis(
-                update_step,
-                response_params,
-                train_pool,
                 eval_pool,
-                axis_batched_data,
-                rng,
+                update_step,
                 response_apply=response_apply,
                 ground_logpsi=ground_logpsi,
                 ground_params=ground_params,
@@ -571,11 +610,77 @@ class MoleculeLITWorkflow(Workflow):
                 source_center=source_center,
                 source_norm=axis_phi_norm,
                 ground_energy=ground_energy,
+                ground_checkpoint_step=checkpoint_step,
+                response_parity=parity_resolution.response_parity,
+                target_omega=float(omega[0]),
+                state_fingerprint=state_fingerprint,
+                full_config_digest=full_config_digest,
+            )
+            if resume_state is None:
+                precompile_omega = (
+                    float(self.lit_config.nqs_warm_start_omega)
+                    if self.lit_config.nqs_warm_start_omega is not None
+                    else float(omega[0])
+                )
+                rng = self._precompile_direct_estimator(
+                    update_step,
+                    response_params,
+                    train_pool,
+                    axis_batched_data,
+                    rng,
+                    axis=axis,
+                    omega=jnp.asarray(precompile_omega),
+                )
+                (
+                    response_params,
+                    continuation_start_stats,
+                    warm_start_selected_iteration[axis_pos],
+                    rng,
+                ) = self._warm_start_axis(
+                    update_step,
+                    response_params,
+                    train_pool,
+                    eval_pool,
+                    axis_batched_data,
+                    rng,
+                    response_apply=response_apply,
+                    ground_logpsi=ground_logpsi,
+                    ground_params=ground_params,
+                    axis=axis,
+                    source_center=source_center,
+                    source_norm=axis_phi_norm,
+                    ground_energy=ground_energy,
+                )
+                resume_omega = None
+                existing_records: tuple[_ContinuationRecord, ...] = ()
+            else:
+                response_params = resume_state.response_params
+                rng = resume_state.rng
+                continuation_start_stats = resume_state.current_stats
+                warm_start_selected_iteration[axis_pos] = (
+                    resume_state.warm_start_selected_iteration
+                )
+                resume_omega = resume_state.current_omega
+                existing_records = resume_state.records
+            checkpoint_callback = partial(
+                self._save_nqs_continuation_checkpoint,
+                axis=axis,
+                target_omega=float(omega[0]),
+                ground_checkpoint_step=checkpoint_step,
+                ground_energy=ground_energy,
+                source_center=source_center,
+                source_norm=axis_phi_norm,
+                response_parity=parity_resolution.response_parity,
+                state_fingerprint=state_fingerprint,
+                full_config_digest=full_config_digest,
+                warm_start_selected_iteration=int(
+                    warm_start_selected_iteration[axis_pos]
+                ),
             )
             response_params, _, bridge_records, rng = self._continue_nqs_to_spectrum(
                 update_step,
                 response_params,
-                warm_start_stats,
+                continuation_start_stats,
                 train_pool,
                 eval_pool,
                 axis_batched_data,
@@ -589,6 +694,9 @@ class MoleculeLITWorkflow(Workflow):
                 ground_energy=ground_energy,
                 target_omega=float(omega[0]),
                 spectrum_omega=omega,
+                resume_omega=resume_omega,
+                existing_records=existing_records,
+                checkpoint_callback=checkpoint_callback,
             )
             for record in bridge_records:
                 host_bridge_stats = jax.device_get(record.stats)
@@ -908,6 +1016,9 @@ class MoleculeLITWorkflow(Workflow):
                 self.lit_config.nqs_continuation_min_step
             ),
             nqs_continuation_max_points=self.lit_config.nqs_continuation_max_points,
+            nqs_continuation_restore_path=(
+                self.lit_config.nqs_continuation_restore_path
+            ),
             source_centers=source_centers,
             axis_source_norm=axis_source_norm,
             peak_energies=np.asarray([peak.energy for peak in peaks]),
@@ -2328,6 +2439,408 @@ class MoleculeLITWorkflow(Workflow):
         )
         return best_params, best_stats, best_iteration, rng
 
+    def _continuation_checkpoint_save_dir(self, axis: int) -> UPath | None:
+        save_path = getattr(self, "save_path", None)
+        if save_path is None:
+            return None
+        return (
+            UPath(save_path)
+            / "continuation_checkpoints"
+            / (f"axis_{_AXIS_NAMES[axis]}")
+        )
+
+    def _continuation_checkpoint_restore_path(
+        self,
+        axis: int,
+    ) -> tuple[UPath | None, bool]:
+        """Resolve one optional explicit or same-run continuation restore path.
+
+        Returns:
+            Resolved path and whether that exact axis checkpoint is required.
+            A configured run/checkpoint root is optional per axis so axes not
+            reached before an interruption can start fresh.
+        """
+        configured = str(self.lit_config.nqs_continuation_restore_path).strip()
+        explicit = bool(configured)
+        if not explicit:
+            return self._continuation_checkpoint_save_dir(axis), False
+
+        root = UPath(configured)
+        if root.suffix == ".npz":
+            return root, True
+        axis_name = f"axis_{_AXIS_NAMES[axis]}"
+        if root.name == axis_name:
+            return root, True
+        if not root.exists():
+            return root / axis_name, True
+        nested_root = root / "continuation_checkpoints"
+        if nested_root.exists():
+            root = nested_root
+        return root / axis_name, False
+
+    def _load_nqs_continuation_checkpoint(
+        self,
+        template: _ContinuationCheckpoint,
+        *,
+        axis: int,
+        state_fingerprint: str,
+        full_config_digest: str,
+    ) -> tuple[UPath, _ContinuationCheckpoint] | None:
+        """Load one structurally compatible latest checkpoint, if present.
+
+        Returns:
+            Checkpoint path and restored bundle, or ``None`` for a fresh run.
+
+        Raises:
+            RuntimeError: If an explicit checkpoint is absent or a discovered
+                checkpoint has incompatible metadata or tree structure.
+        """
+        restore_path, required = self._continuation_checkpoint_restore_path(axis)
+        if restore_path is None:
+            return None
+        checkpoint_path = _latest_continuation_checkpoint_path(restore_path)
+        if checkpoint_path is None:
+            if required:
+                msg = (
+                    "No readable continuation checkpoint found for axis="
+                    f"{_AXIS_NAMES[axis]} at explicit restore path {restore_path}."
+                )
+                raise RuntimeError(msg)
+            return None
+
+        metadata = _read_continuation_checkpoint_metadata(checkpoint_path)
+        if metadata["schema_version"] != _CONTINUATION_CHECKPOINT_SCHEMA_VERSION:
+            msg = (
+                f"Continuation checkpoint {checkpoint_path} uses schema "
+                f"{metadata['schema_version']}, expected "
+                f"{_CONTINUATION_CHECKPOINT_SCHEMA_VERSION}."
+            )
+            raise RuntimeError(msg)
+        if metadata["state_fingerprint"] != state_fingerprint:
+            msg = (
+                f"Continuation checkpoint {checkpoint_path} is incompatible "
+                "with the current physical/ansatz state fingerprint "
+                f"({metadata['state_fingerprint']} != {state_fingerprint})."
+            )
+            raise RuntimeError(msg)
+        if metadata["full_config_digest"] != full_config_digest:
+            logger.warning(
+                "Restoring continuation checkpoint %s with a changed non-state "
+                "configuration; current gates will be re-applied (%s != %s)",
+                checkpoint_path,
+                metadata["full_config_digest"],
+                full_config_digest,
+            )
+
+        save_dir = self._continuation_checkpoint_save_dir(axis)
+        if save_dir is None:
+            save_dir = checkpoint_path.parent
+        manager = NumPyCheckpointManager(
+            save_dir,
+            checkpoint_path,
+            prefix=_CONTINUATION_CHECKPOINT_PREFIX,
+        )
+        try:
+            initial_step, restored = manager.restore(template)
+        except (KeyError, TypeError, ValueError) as exc:
+            msg = f"Continuation checkpoint {checkpoint_path} has an incompatible tree."
+            raise RuntimeError(msg) from exc
+        if initial_step != int(restored.accepted_points):
+            msg = (
+                f"Continuation checkpoint {checkpoint_path} has inconsistent "
+                f"step/count metadata ({initial_step} != "
+                f"{int(restored.accepted_points)})."
+            )
+            raise RuntimeError(msg)
+        return checkpoint_path, restored
+
+    def _restore_nqs_continuation_checkpoint(
+        self,
+        response_params_template,
+        rng_template,
+        eval_pool,
+        update_step,
+        *,
+        response_apply,
+        ground_logpsi,
+        ground_params,
+        axis: int,
+        source_center: float,
+        source_norm: float,
+        ground_energy: float,
+        ground_checkpoint_step: int,
+        response_parity: int,
+        target_omega: float,
+        state_fingerprint: str,
+        full_config_digest: str,
+    ) -> _ContinuationResumeState | None:
+        """Restore and revalidate the latest complete bridge checkpoint.
+
+        Returns:
+            Validated resume state, or ``None`` when an implicit same-run
+            checkpoint does not exist.
+
+        Raises:
+            RuntimeError: If an explicit checkpoint is absent or a discovered
+                checkpoint is incompatible, malformed, or fails current gates.
+        """
+        template = _ContinuationCheckpoint(
+            schema_version=_CONTINUATION_CHECKPOINT_SCHEMA_VERSION,
+            state_fingerprint=state_fingerprint,
+            full_config_digest=full_config_digest,
+            axis=int(axis),
+            target_omega=float(target_omega),
+            current_omega=float(self.lit_config.nqs_warm_start_omega or target_omega),
+            accepted_points=0,
+            ground_checkpoint_step=int(ground_checkpoint_step),
+            ground_energy=float(ground_energy),
+            source_center=float(source_center),
+            source_norm=float(source_norm),
+            response_parity=int(response_parity),
+            response_params=response_params_template,
+            rng=rng_template,
+            current_stats=_empty_nqs_lit_stats(),
+            history_json="[]",
+            warm_start_selected_iteration=0,
+        )
+        loaded = self._load_nqs_continuation_checkpoint(
+            template,
+            axis=axis,
+            state_fingerprint=state_fingerprint,
+            full_config_digest=full_config_digest,
+        )
+        if loaded is None:
+            return None
+        checkpoint_path, restored = loaded
+        if int(restored.axis) != int(axis):
+            msg = (
+                f"Continuation checkpoint {checkpoint_path} is for axis="
+                f"{int(restored.axis)}, expected {axis}."
+            )
+            raise RuntimeError(msg)
+
+        current_omega = float(restored.current_omega)
+        start_omega = self.lit_config.nqs_warm_start_omega
+        if (
+            start_omega is None
+            or current_omega < float(start_omega)
+            or current_omega >= float(target_omega)
+        ):
+            msg = (
+                f"Continuation checkpoint {checkpoint_path} has current omega "
+                f"{current_omega:.8g} outside the resumable interval "
+                f"[{start_omega}, {target_omega})."
+            )
+            raise RuntimeError(msg)
+
+        records = _continuation_records_from_json(
+            str(restored.history_json),
+            stats_template=restored.current_stats,
+        )
+        optimized_count = sum(record.optimized for record in records)
+        if optimized_count != int(restored.accepted_points):
+            msg = (
+                f"Continuation checkpoint {checkpoint_path} history contains "
+                f"{optimized_count} optimized points, expected "
+                f"{int(restored.accepted_points)}."
+            )
+            raise RuntimeError(msg)
+        if not records or not records[-1].optimized:
+            msg = (
+                f"Continuation checkpoint {checkpoint_path} has no latest-good record."
+            )
+            raise RuntimeError(msg)
+        if not np.isclose(records[-1].omega, current_omega, rtol=0.0, atol=1e-12):
+            msg = (
+                f"Continuation checkpoint {checkpoint_path} history ends at "
+                f"{records[-1].omega:.8g}, not current omega {current_omega:.8g}."
+            )
+            raise RuntimeError(msg)
+
+        source_covariance_evaluator = getattr(
+            update_step,
+            "source_covariance_metrics",
+            getattr(update_step, "source_covariance_loss", None),
+        )
+        revalidated_stats = jax.device_get(
+            self._evaluate_nqs_checkpoint(
+                response_apply=response_apply,
+                response_params=restored.response_params,
+                ground_logpsi=ground_logpsi,
+                ground_params=ground_params,
+                eval_pool=eval_pool,
+                axis=axis,
+                source_center=source_center,
+                source_norm=source_norm,
+                ground_energy=ground_energy,
+                omega=current_omega,
+                source_covariance_evaluator=source_covariance_evaluator,
+            )
+        )
+        _require_eligible_nqs_checkpoint(
+            revalidated_stats,
+            max_source_covariance=self.lit_config.nqs_source_symmetry_max_covariance,
+            context=(
+                f"Restored continuation checkpoint at omega={current_omega:.8g} "
+                "failed current numerical/covariance validation"
+            ),
+        )
+        required_fidelity = _nqs_stage_required_fidelity(
+            records[-1].inherited_fidelity,
+            floor=self.lit_config.nqs_stage_fidelity_min,
+            gain=self.lit_config.nqs_stage_fidelity_gain_min,
+        )
+        _require_nqs_stage_quality(
+            revalidated_stats,
+            min_fidelity=required_fidelity,
+            min_reweight_ess_fraction=(
+                self.lit_config.nqs_stage_reweight_ess_fraction_min
+            ),
+            context=(
+                f"Restored continuation checkpoint at omega={current_omega:.8g} "
+                "failed the current absolute quality/gain gate "
+                f"(inherited fidelity={records[-1].inherited_fidelity:.6f}, "
+                "configured floor="
+                f"{self.lit_config.nqs_stage_fidelity_min:.6f}, required gain="
+                f"{self.lit_config.nqs_stage_fidelity_gain_min:.6f})"
+            ),
+        )
+        records[-1] = records[-1]._replace(stats=revalidated_stats)
+        logger.info(
+            "Restored axis=%s continuation checkpoint %s omega=%.6f "
+            "bridge_points=%d stored_fidelity=%.6f revalidated_fidelity=%.6f "
+            "revalidated_ess=%.3f",
+            _AXIS_NAMES[axis],
+            checkpoint_path,
+            current_omega,
+            optimized_count,
+            float(restored.current_stats.fidelity),
+            float(revalidated_stats.fidelity),
+            float(revalidated_stats.reweight_ess_fraction),
+        )
+        return _ContinuationResumeState(
+            response_params=restored.response_params,
+            rng=restored.rng,
+            current_stats=revalidated_stats,
+            current_omega=current_omega,
+            records=tuple(records),
+            warm_start_selected_iteration=int(restored.warm_start_selected_iteration),
+        )
+
+    def _save_nqs_continuation_checkpoint(
+        self,
+        response_params,
+        current_stats,
+        rng,
+        current_omega: float,
+        records: list[_ContinuationRecord],
+        *,
+        axis: int,
+        target_omega: float,
+        ground_checkpoint_step: int,
+        ground_energy: float,
+        source_center: float,
+        source_norm: float,
+        response_parity: int,
+        state_fingerprint: str,
+        full_config_digest: str,
+        warm_start_selected_iteration: int,
+    ) -> None:
+        """Atomically persist one optimized and fully gate-qualified bridge."""
+        if jax.process_index() != 0:
+            return
+        save_dir = self._continuation_checkpoint_save_dir(axis)
+        if save_dir is None:
+            return
+        accepted_points = sum(record.optimized for record in records)
+        if accepted_points <= 0 or not records or not records[-1].optimized:
+            return
+        checkpoint = _ContinuationCheckpoint(
+            schema_version=_CONTINUATION_CHECKPOINT_SCHEMA_VERSION,
+            state_fingerprint=state_fingerprint,
+            full_config_digest=full_config_digest,
+            axis=int(axis),
+            target_omega=float(target_omega),
+            current_omega=float(current_omega),
+            accepted_points=int(accepted_points),
+            ground_checkpoint_step=int(ground_checkpoint_step),
+            ground_energy=float(ground_energy),
+            source_center=float(source_center),
+            source_norm=float(source_norm),
+            response_parity=int(response_parity),
+            response_params=response_params,
+            rng=rng,
+            current_stats=current_stats,
+            history_json=_continuation_records_to_json(records),
+            warm_start_selected_iteration=int(warm_start_selected_iteration),
+        )
+        manager = NumPyCheckpointManager(
+            save_dir,
+            prefix=_CONTINUATION_CHECKPOINT_PREFIX,
+        )
+        checkpoint_path = manager.save(accepted_points - 1, jax.device_get(checkpoint))
+        logger.info(
+            "Saved axis=%s continuation checkpoint %s omega=%.6f "
+            "bridge_points=%d fidelity=%.6f ess=%.3f",
+            _AXIS_NAMES[axis],
+            checkpoint_path,
+            current_omega,
+            accepted_points,
+            float(current_stats.fidelity),
+            float(current_stats.reweight_ess_fraction),
+        )
+
+    def _require_continuation_probe_recovery_allowed(
+        self,
+        current_stats,
+        probe_stats,
+        *,
+        candidate_omega: float,
+        min_step_override: bool,
+    ) -> None:
+        """Reject an unsafe or explicitly disabled minimum-step recovery.
+
+        Raises:
+            RuntimeError: If held-out ESS is too low or minimum-step recovery
+                was explicitly disabled.
+        """
+        if not min_step_override:
+            return
+        probe_ess_failure = _nqs_stage_quality_failure(
+            probe_stats,
+            min_fidelity=0.0,
+            min_reweight_ess_fraction=(
+                self.lit_config.nqs_stage_reweight_ess_fraction_min
+            ),
+        )
+        if probe_ess_failure is not None:
+            msg = (
+                "Frequency continuation reached its minimum step with "
+                "insufficient held-out importance-sampling ESS; refusing to "
+                "optimize from an unreliable estimator at "
+                f"omega={candidate_omega:.8g}: "
+                f"{probe_ess_failure}."
+            )
+            raise RuntimeError(msg)
+        if self.lit_config.nqs_continuation_allow_min_step_override:
+            return
+        current_fidelity = float(jax.device_get(current_stats.fidelity))
+        candidate_fidelity = float(jax.device_get(probe_stats.fidelity))
+        candidate_ess = float(jax.device_get(probe_stats.reweight_ess_fraction))
+        required_probe_fidelity = max(
+            self.lit_config.nqs_continuation_fidelity_retention * current_fidelity,
+            0.0,
+        )
+        msg = (
+            "Frequency continuation reached its minimum step without an "
+            "acceptable inherited checkpoint and recovery is disabled at "
+            f"omega={candidate_omega:.8g}: fidelity={candidate_fidelity:.6f}, "
+            f"required relative fidelity={required_probe_fidelity:.6f}, ESS "
+            f"fraction={candidate_ess:.6f}, required ESS="
+            f"{self.lit_config.nqs_stage_reweight_ess_fraction_min:.6f}."
+        )
+        raise RuntimeError(msg)
+
     def _continue_nqs_to_spectrum(
         self,
         update_step,
@@ -2347,6 +2860,13 @@ class MoleculeLITWorkflow(Workflow):
         ground_energy: float,
         target_omega: float,
         spectrum_omega: np.ndarray,
+        resume_omega: float | None = None,
+        existing_records: tuple[_ContinuationRecord, ...] = (),
+        checkpoint_callback: Callable[
+            [Any, Any, Any, float, list[_ContinuationRecord]],
+            None,
+        ]
+        | None = None,
     ):
         """Adaptively bridge the warm start to the first reported frequency.
 
@@ -2365,9 +2885,13 @@ class MoleculeLITWorkflow(Workflow):
             RuntimeError: If a probe is invalid, an optimized bridge checkpoint
                 is invalid, or the configured bridge-point cap is exhausted.
         """
-        start_omega = self.lit_config.nqs_warm_start_omega
+        start_omega = (
+            float(resume_omega)
+            if resume_omega is not None
+            else self.lit_config.nqs_warm_start_omega
+        )
         if start_omega is None or float(start_omega) >= float(target_omega):
-            return response_params, current_stats, [], rng
+            return response_params, current_stats, list(existing_records), rng
 
         common = dict(
             response_apply=response_apply,
@@ -2415,7 +2939,15 @@ class MoleculeLITWorkflow(Workflow):
             ),
         )
         min_step = _continuation_min_step(self.lit_config, spectrum_omega)
-        records = []
+        records = list(existing_records)
+        existing_optimized_count = sum(record.optimized for record in records)
+        if existing_optimized_count > self.lit_config.nqs_continuation_max_points:
+            msg = (
+                "Restored frequency continuation already contains "
+                f"{existing_optimized_count} bridge points, exceeding the current "
+                f"limit {self.lit_config.nqs_continuation_max_points}."
+            )
+            raise RuntimeError(msg)
         tolerance = np.finfo(np.float64).eps * max(1.0, abs(target_omega)) * 8.0
 
         while target_omega - current_omega > tolerance:
@@ -2443,7 +2975,6 @@ class MoleculeLITWorkflow(Workflow):
                     probe_stats,
                     retention=self.lit_config.nqs_continuation_fidelity_retention,
                     max_source_covariance=maximum_covariance,
-                    min_fidelity=self.lit_config.nqs_stage_fidelity_min,
                     min_reweight_ess_fraction=(
                         self.lit_config.nqs_stage_reweight_ess_fraction_min
                     ),
@@ -2466,28 +2997,12 @@ class MoleculeLITWorkflow(Workflow):
             )
             actual_step = float(candidate_omega - current_omega)
             min_step_override = not probe_ok and actual_step <= min_step * (1.0 + 1e-12)
-            if (
-                min_step_override
-                and not self.lit_config.nqs_continuation_allow_min_step_override
-            ):
-                current_fidelity = float(jax.device_get(current_stats.fidelity))
-                candidate_fidelity = float(jax.device_get(probe_stats.fidelity))
-                candidate_ess = float(jax.device_get(probe_stats.reweight_ess_fraction))
-                required_probe_fidelity = max(
-                    self.lit_config.nqs_stage_fidelity_min,
-                    self.lit_config.nqs_continuation_fidelity_retention
-                    * current_fidelity,
-                )
-                msg = (
-                    "Frequency continuation reached its minimum step without "
-                    "an acceptable inherited checkpoint; refusing the legacy "
-                    f"override at omega={candidate_omega:.8g}: fidelity="
-                    f"{candidate_fidelity:.6f}, required="
-                    f"{required_probe_fidelity:.6f}, ESS fraction="
-                    f"{candidate_ess:.6f}, required ESS="
-                    f"{self.lit_config.nqs_stage_reweight_ess_fraction_min:.6f}."
-                )
-                raise RuntimeError(msg)
+            self._require_continuation_probe_recovery_allowed(
+                current_stats,
+                probe_stats,
+                candidate_omega=candidate_omega,
+                min_step_override=min_step_override,
+            )
             if target_omega - candidate_omega <= tolerance:
                 records.append(
                     _ContinuationRecord(
@@ -2591,6 +3106,14 @@ class MoleculeLITWorkflow(Workflow):
                 min_step_override,
             )
             current_omega = candidate_omega
+            if checkpoint_callback is not None:
+                checkpoint_callback(
+                    response_params,
+                    current_stats,
+                    rng,
+                    current_omega,
+                    records,
+                )
 
         return response_params, current_stats, records, rng
 
@@ -4982,9 +5505,15 @@ def _continuation_probe_is_acceptable(
     *,
     retention: float,
     max_source_covariance: float | None = None,
-    min_fidelity: float = 0.0,
     min_reweight_ess_fraction: float = 0.0,
 ) -> bool:
+    """Return whether an inherited checkpoint is safe enough to optimize.
+
+    The absolute fidelity floor is deliberately not a probe requirement.  It
+    applies to the optimized stage result; requiring it before optimization
+    conflates initialization quality with final scientific quality and can
+    force arbitrarily small continuation steps near a response pole.
+    """
     if not _finite_valid_nqs_stats(
         candidate,
         max_source_covariance=max_source_covariance,
@@ -4993,7 +5522,7 @@ def _continuation_probe_is_acceptable(
     if (
         _nqs_stage_quality_failure(
             candidate,
-            min_fidelity=min_fidelity,
+            min_fidelity=0.0,
             min_reweight_ess_fraction=min_reweight_ess_fraction,
         )
         is not None
@@ -5142,6 +5671,283 @@ def _save_npz(path: UPath, **payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as f_out:
         np.savez(f_out, **payload)  # type: ignore[arg-type]
+
+
+_CONTINUATION_HISTORY_STAT_FIELDS = (
+    "fidelity",
+    "reverse_kl",
+    "invalid_sample_fraction",
+    "source_covariance_loss",
+    "source_covariance_max_loss",
+)
+
+_CONTINUATION_STATE_CONFIG_EXCLUSIONS = frozenset(
+    {
+        "output_filename",
+        "peak_min_height_fraction",
+        "preview_roots",
+        "scan_parallel",
+        "scan_parallel_workers",
+        "scan_parallel_procs_per_device",
+        "scan_parallel_min_points_per_worker",
+        "scan_parallel_remote_hosts",
+        "scan_parallel_remote_root",
+        "scan_parallel_remote_python",
+        "scan_parallel_ssh_options",
+        "scan_parallel_worker",
+        "scan_parallel_worker_index",
+        "nqs_checkpoint_path",
+        "nqs_source_pool_dir",
+        "nqs_reuse_source_pool",
+        "nqs_save_source_pool",
+        "nqs_iterations",
+        "nqs_continuation_iterations",
+        "nqs_continuation_step_fraction",
+        "nqs_continuation_fidelity_retention",
+        "nqs_stage_fidelity_min",
+        "nqs_stage_reweight_ess_fraction_min",
+        "nqs_stage_fidelity_gain_min",
+        "nqs_continuation_allow_min_step_override",
+        "nqs_continuation_min_step",
+        "nqs_continuation_max_points",
+        "nqs_continuation_restore_path",
+        "nqs_selection_interval",
+        "nqs_log_interval",
+    }
+)
+
+
+def _empty_nqs_lit_stats() -> NQSLITStats:
+    return NQSLITStats(*(jnp.asarray(0.0) for _ in NQSLITStats._fields))
+
+
+def _checkpoint_json_value(value):
+    if isinstance(value, Enum):
+        return _checkpoint_json_value(value.value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _checkpoint_json_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (tuple, list)):
+        return [_checkpoint_json_value(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return _checkpoint_json_value(value.tolist())
+    if isinstance(value, np.generic):
+        return _checkpoint_json_value(value.item())
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    return repr(value)
+
+
+def _tree_shape_dtype_signature(tree) -> dict[str, object]:
+    leaves_with_path, treedef = jax.tree_util.tree_flatten_with_path(tree)
+    leaves = []
+    for key_path, leaf in leaves_with_path:
+        shape = tuple(int(size) for size in getattr(leaf, "shape", ()))
+        dtype = getattr(leaf, "dtype", type(leaf).__name__)
+        leaves.append(
+            {
+                "path": str(key_path),
+                "shape": list(shape),
+                "dtype": str(dtype),
+            }
+        )
+    return {"treedef": str(treedef), "leaves": leaves}
+
+
+def _tree_content_digest(tree) -> str:
+    """Return a deterministic SHA-256 digest of one concrete PyTree.
+
+    Checkpoint compatibility must distinguish equal-shaped ground states and
+    source pools belonging to different systems or runs.  Fresh response
+    parameters intentionally use only their shape/dtype signature because
+    they are a restore template and are replaced by the saved parameters.
+
+    Raises:
+        TypeError: If a leaf uses an object dtype without stable byte content.
+    """
+    leaves_with_path, treedef = jax.tree_util.tree_flatten_with_path(tree)
+    digest = hashlib.sha256(str(treedef).encode("utf-8"))
+    for key_path, leaf in leaves_with_path:
+        array = np.asarray(jax.device_get(leaf))
+        if array.dtype.hasobject:
+            msg = (
+                "Continuation checkpoint fingerprints cannot hash object-dtype "
+                f"leaf {key_path}."
+            )
+            raise TypeError(msg)
+        metadata = json.dumps(
+            {
+                "path": str(key_path),
+                "shape": list(array.shape),
+                "dtype": array.dtype.str,
+            },
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        digest.update(len(metadata).to_bytes(8, "big"))
+        digest.update(metadata)
+        contiguous = np.ascontiguousarray(array)
+        digest.update(contiguous.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _canonical_sha256(payload: object) -> str:
+    encoded = json.dumps(
+        _checkpoint_json_value(payload),
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _continuation_checkpoint_digests(
+    config: MolecularLITConfig,
+    *,
+    response_params,
+    ground_params,
+    train_pool,
+    eval_pool,
+    axis: int,
+    source_center: float,
+    source_norm: float,
+    ground_energy: float,
+    ground_checkpoint_step: int,
+    response_parity: int,
+    target_omega: float,
+    spectrum_omega: np.ndarray,
+) -> tuple[str, str]:
+    """Return compatibility and full-audit digests for continuation state."""
+    config_payload = {
+        config_field.name: getattr(config, config_field.name)
+        for config_field in fields(config)
+        if config_field.name != "nqs_continuation_restore_path"
+    }
+    state_config = {
+        name: value
+        for name, value in config_payload.items()
+        if name not in _CONTINUATION_STATE_CONFIG_EXCLUSIONS
+    }
+    dynamic_payload = {
+        "schema_version": _CONTINUATION_CHECKPOINT_SCHEMA_VERSION,
+        "axis": int(axis),
+        "source_center": float(source_center),
+        "source_norm": float(source_norm),
+        "ground_energy": float(ground_energy),
+        "ground_checkpoint_step": int(ground_checkpoint_step),
+        "response_parity": int(response_parity),
+        "target_omega": float(target_omega),
+        "spectrum_omega": np.asarray(spectrum_omega, dtype=np.float64),
+        "response_params": _tree_shape_dtype_signature(response_params),
+        "ground_params": {
+            "signature": _tree_shape_dtype_signature(ground_params),
+            "content_sha256": _tree_content_digest(ground_params),
+        },
+        # Pool contents include the sampled electron configurations and the
+        # static molecular data, so they bind a resume to both its held-out
+        # population and its Hamiltonian/system identity.
+        "train_pool_sha256": _tree_content_digest(train_pool),
+        "eval_pool_sha256": _tree_content_digest(eval_pool),
+    }
+    state_fingerprint = _canonical_sha256(
+        {"config": state_config, "dynamic": dynamic_payload}
+    )
+    full_config_digest = _canonical_sha256(
+        {"config": config_payload, "dynamic": dynamic_payload}
+    )
+    return state_fingerprint, full_config_digest
+
+
+def _continuation_records_to_json(records: list[_ContinuationRecord]) -> str:
+    payload = []
+    for record in records:
+        stats_payload = {
+            name: float(jax.device_get(getattr(record.stats, name, 0.0)))
+            for name in _CONTINUATION_HISTORY_STAT_FIELDS
+        }
+        payload.append(
+            {
+                "omega": float(record.omega),
+                "optimized": bool(record.optimized),
+                "selected_iteration": int(record.selected_iteration),
+                "stats": stats_payload,
+                "inherited_fidelity": float(record.inherited_fidelity),
+                "step": float(record.step),
+                "bisections": int(record.bisections),
+                "probe_accepted": bool(record.probe_accepted),
+                "min_step_override": bool(record.min_step_override),
+            }
+        )
+    return json.dumps(payload, allow_nan=False, separators=(",", ":"), sort_keys=True)
+
+
+def _continuation_records_from_json(
+    encoded: str,
+    *,
+    stats_template: NQSLITStats,
+) -> list[_ContinuationRecord]:
+    try:
+        payload = json.loads(encoded)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Continuation checkpoint history is not valid JSON."
+        ) from exc
+    if not isinstance(payload, list):
+        raise RuntimeError("Continuation checkpoint history must be a JSON list.")
+    records = []
+    for item in payload:
+        if not isinstance(item, dict) or not isinstance(item.get("stats"), dict):
+            raise RuntimeError("Continuation checkpoint history entry is malformed.")
+        replacements = {
+            name: jnp.asarray(float(item["stats"][name]))
+            for name in _CONTINUATION_HISTORY_STAT_FIELDS
+        }
+        records.append(
+            _ContinuationRecord(
+                omega=float(item["omega"]),
+                optimized=bool(item["optimized"]),
+                selected_iteration=int(item["selected_iteration"]),
+                stats=stats_template._replace(**replacements),
+                inherited_fidelity=float(item["inherited_fidelity"]),
+                step=float(item["step"]),
+                bisections=int(item["bisections"]),
+                probe_accepted=bool(item["probe_accepted"]),
+                min_step_override=bool(item["min_step_override"]),
+            )
+        )
+    return records
+
+
+def _read_continuation_checkpoint_metadata(path: UPath) -> dict[str, object]:
+    with path.open("rb") as f_in, np.load(f_in, allow_pickle=False) as npf:
+        return {
+            "schema_version": int(npf["schema_version"].item()),
+            "state_fingerprint": str(npf["state_fingerprint"].item()),
+            "full_config_digest": str(npf["full_config_digest"].item()),
+        }
+
+
+def _latest_continuation_checkpoint_path(path: UPath) -> UPath | None:
+    if path.is_file():
+        candidates = [path]
+    elif path.is_dir():
+        candidates = sorted(
+            path.glob(f"{_CONTINUATION_CHECKPOINT_PREFIX}_ckpt_*.npz"),
+            reverse=True,
+        )
+    else:
+        return None
+    for candidate in candidates:
+        try:
+            _read_continuation_checkpoint_metadata(candidate)
+        except (OSError, EOFError, BadZipFile, KeyError, ValueError):
+            logger.warning("Ignoring unreadable continuation checkpoint %s", candidate)
+            continue
+        return candidate
+    return None
 
 
 def _axis_indices(axes: str) -> tuple[int, ...]:

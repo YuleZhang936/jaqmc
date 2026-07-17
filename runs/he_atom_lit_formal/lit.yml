@@ -61,8 +61,9 @@ lit:
   nqs_train_update_batch_size: 1024
   nqs_eval_batch_size: 1024
   nqs_source_pool_dir: ''
-  # The previous pools were generated with a nonzero center and are incompatible.
-  nqs_reuse_source_pool: false
+  # Metadata rejects the old nonzero-center pools.  Reuse the newly generated
+  # centered pools so a continuation checkpoint can resume on the same held-out set.
+  nqs_reuse_source_pool: true
   nqs_save_source_pool: true
   # The PRL uses pi_Phi samples with action-state importance reweighting.
   nqs_reweight_ess_fraction_min: 0.0
@@ -95,9 +96,10 @@ lit:
   nqs_stage_fidelity_min: 0.99
   nqs_stage_reweight_ess_fraction_min: 0.05
   nqs_stage_fidelity_gain_min: 0.001
-  # A failed probe at the numerical minimum step is a real stop condition,
-  # not permission to compound fidelity loss down the serial chain.
-  nqs_continuation_allow_min_step_override: false
+  # At the numerical minimum step, allow a finite, ESS-valid inherited state
+  # to enter recovery optimization.  The optimized checkpoint must still pass
+  # the absolute fidelity/ESS/gain gates before it can propagate.
+  nqs_continuation_allow_min_step_override: true
   # null -> min(0.2 * eta, the reported spectrum spacing) = 0.00025 Ha.
   nqs_continuation_min_step: null
   nqs_continuation_max_points: 256

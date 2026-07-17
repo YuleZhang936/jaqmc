@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -83,7 +84,7 @@ class NumPyCheckpointManager:
         """
         if not restore_path.is_file():
             raise ValueError(f"{restore_path} is not a file.")
-        with restore_path.open("rb") as f, np.load(f) as npf:
+        with restore_path.open("rb") as f, np.load(f, allow_pickle=False) as npf:
             logger.info("Restoring checkpoint %s", restore_path)
             step = npf["step"].item()
             data = tree_from_npz(npf, fallback)
@@ -132,24 +133,38 @@ class NumPyCheckpointManager:
         for ckpt_path in ckpt_files:
             try:
                 return self.restore_from_file(ckpt_path, fallback)
-            except (OSError, EOFError, BadZipFile):
+            except (OSError, EOFError, BadZipFile, KeyError, ValueError):
                 logger.warning("Fail to restore checkpoint %s", ckpt_path)
         return 0, fallback
 
-    def save(self, step: int, data):
+    def save(self, step: int, data) -> UPath:
         """Save a checkpoint for the given step.
 
         Args:
             step: Step index associated with this checkpoint.
             data: PyTree to serialize into the checkpoint.
+
+        Returns:
+            Path of the atomically committed checkpoint file.
         """
         # Ensure directory exists for all filesystem implementations
         self.save_path.mkdir(parents=True, exist_ok=True)
         ckpt_path = self.save_path / f"{self.prefix}ckpt_{step:06d}.npz"
         logger.info("Saving checkpoint %s", ckpt_path)
 
-        with ckpt_path.open("wb") as f:
-            np.savez_compressed(f, allow_pickle=False, step=step, **tree_to_npz(data))
+        tmp_path = ckpt_path.with_name(f".{ckpt_path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with tmp_path.open("wb") as f:
+                np.savez_compressed(
+                    f,
+                    step=step,
+                    **tree_to_npz(data),  # type: ignore[arg-type]
+                )
+            tmp_path.rename(ckpt_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        return ckpt_path
 
 
 # https://github.com/jax-ml/jax/blob/jax-v0.8.0/jax/_src/tree_util.py#L856-L866

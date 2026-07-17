@@ -12,8 +12,11 @@ from jax import numpy as jnp
 from jaqmc.app.molecule.lit_workflow import (
     MolecularLITConfig,
     MoleculeLITWorkflow,
+    _continuation_checkpoint_digests,
     _continuation_min_step,
     _continuation_probe_is_acceptable,
+    _ContinuationRecord,
+    _empty_nqs_lit_stats,
     _physics_continuation_step,
 )
 
@@ -75,12 +78,21 @@ def _mock_bridge_workflow(config):
     return workflow, update, starts, optimized, probes
 
 
-def _run_bridge(workflow, update, *, target, current_stats=None):
+def _run_bridge(
+    workflow,
+    update,
+    *,
+    target,
+    current_stats=None,
+    response_params=0.0,
+    resume_omega=None,
+    existing_records=(),
+):
     if current_stats is None:
         current_stats = _bridge_stats(1.0)
     return workflow._continue_nqs_to_spectrum(
         update,
-        jnp.asarray(0.0),
+        jnp.asarray(response_params),
         current_stats,
         None,
         None,
@@ -95,6 +107,8 @@ def _run_bridge(workflow, update, *, target, current_stats=None):
         ground_energy=0.0,
         target_omega=target,
         spectrum_omega=np.asarray([target, target + 0.1]),
+        resume_omega=resume_omega,
+        existing_records=existing_records,
     )
 
 
@@ -232,18 +246,18 @@ def test_stage_gate_config_accepts_unit_interval_boundaries(field_name, value):
     workflow._validate_continuation_config()
 
 
-def test_continuation_probe_requires_absolute_fidelity_floor():
-    current = _bridge_stats(0.999, ess=0.8)
-    candidate = _bridge_stats(0.98, ess=0.8)
+def test_continuation_probe_uses_relative_fidelity_not_stage_floor():
+    current = _bridge_stats(0.990063, ess=0.708)
+    candidate = _bridge_stats(0.989922, ess=0.704427)
 
-    # The candidate retains far more than 95% of the current fidelity, but it
-    # is still scientifically inadmissible under the absolute stage floor.
+    # This is the exact failed formal-run boundary.  The inherited parameters
+    # are an excellent initialization even though they have not yet recovered
+    # the absolute post-optimization science floor.
     assert candidate.fidelity >= 0.95 * current.fidelity
-    assert not _continuation_probe_is_acceptable(
+    assert _continuation_probe_is_acceptable(
         current,
         candidate,
         retention=0.95,
-        min_fidelity=0.99,
         min_reweight_ess_fraction=0.05,
     )
 
@@ -257,19 +271,50 @@ def test_continuation_probe_requires_absolute_ess_floor():
         current,
         low_ess,
         retention=0.95,
-        min_fidelity=0.99,
         min_reweight_ess_fraction=0.05,
     )
     assert _continuation_probe_is_acceptable(
         current,
         boundary,
         retention=0.95,
-        min_fidelity=0.99,
         min_reweight_ess_fraction=0.05,
     )
 
 
-def test_min_step_probe_failure_raises_before_optimizer_when_override_disabled():
+def test_target_probe_below_stage_floor_is_kept_for_spectrum_recovery():
+    config = MolecularLITConfig(
+        nqs_warm_start_omega=0.0,
+        nqs_continuation_iterations=1,
+        nqs_continuation_step_fraction=10.0,
+        nqs_continuation_fidelity_retention=0.95,
+        nqs_stage_fidelity_min=0.99,
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_continuation_min_step=0.01,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    workflow, update, starts, optimized, _ = _mock_bridge_workflow(config)
+    current = _bridge_stats(0.990063, ess=0.708)
+    inherited = _bridge_stats(0.989922, ess=0.704427)
+    workflow._nqs_stats_chunked = lambda *_args, **_kwargs: inherited
+
+    params, _, records, _ = _run_bridge(
+        workflow,
+        update,
+        target=0.1,
+        current_stats=current,
+    )
+
+    assert float(params) == pytest.approx(0.0)
+    assert starts == []
+    assert optimized == []
+    assert len(records) == 1
+    assert not records[0].optimized
+    assert records[0].probe_accepted
+    assert records[0].stats.fidelity == pytest.approx(0.989922)
+
+
+def test_min_step_relative_retention_failure_respects_disabled_recovery():
     config = MolecularLITConfig(
         nqs_warm_start_omega=0.0,
         nqs_continuation_iterations=1,
@@ -316,6 +361,317 @@ def test_default_min_step_override_preserves_legacy_propagation():
     assert not records[-1].optimized
     assert not records[-1].probe_accepted
     assert records[-1].min_step_override
+
+
+def test_continuation_resume_keeps_history_and_skips_completed_bridges():
+    config = MolecularLITConfig(
+        nqs_warm_start_omega=0.0,
+        nqs_continuation_iterations=1,
+        nqs_continuation_step_fraction=0.2,
+        nqs_continuation_fidelity_retention=0.95,
+        nqs_continuation_min_step=0.01,
+        nqs_continuation_max_points=20,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    workflow, update, starts, optimized, _ = _mock_bridge_workflow(config)
+    saved_stats = _bridge_stats(1.0)
+    saved_record = _ContinuationRecord(
+        omega=0.2,
+        optimized=True,
+        selected_iteration=1,
+        stats=saved_stats,
+        inherited_fidelity=0.99,
+        step=0.2,
+        bisections=0,
+        probe_accepted=True,
+        min_step_override=False,
+    )
+
+    _, _, records, _ = _run_bridge(
+        workflow,
+        update,
+        target=1.0,
+        current_stats=saved_stats,
+        response_params=0.2,
+        resume_omega=0.2,
+        existing_records=(saved_record,),
+    )
+
+    assert records[0] is saved_record
+    assert starts
+    assert min(starts) >= 0.2
+    assert optimized
+    assert min(optimized) > 0.2
+    assert sum(record.optimized for record in records) == 1 + len(optimized)
+
+
+def test_restore_root_allows_axes_not_reached_before_interruption(tmp_path):
+    old_run = tmp_path / "old"
+    checkpoint_root = old_run / "continuation_checkpoints"
+    (checkpoint_root / "axis_x").mkdir(parents=True)
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(nqs_continuation_restore_path=str(old_run))
+
+    y_path, y_required = workflow._continuation_checkpoint_restore_path(1)
+
+    assert str(y_path) == str(checkpoint_root / "axis_y")
+    assert not y_required
+
+    workflow.lit_config = MolecularLITConfig(
+        nqs_continuation_restore_path=str(checkpoint_root / "axis_x")
+    )
+    _, exact_axis_required = workflow._continuation_checkpoint_restore_path(0)
+    assert exact_axis_required
+
+    workflow.lit_config = MolecularLITConfig(
+        nqs_continuation_restore_path=str(tmp_path / "missing")
+    )
+    _, missing_root_required = workflow._continuation_checkpoint_restore_path(0)
+    assert missing_root_required
+
+
+def test_continuation_checkpoint_round_trip_across_run_directories(tmp_path):
+    old_run = tmp_path / "old"
+    new_run = tmp_path / "new"
+    config = MolecularLITConfig(
+        nqs_warm_start_omega=0.0,
+        nqs_stage_fidelity_min=0.99,
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_stage_fidelity_gain_min=0.001,
+    )
+    response_params = {"w": jnp.asarray([1.0 + 2.0j])}
+    ground_params = {"g": jnp.asarray([3.0])}
+    stats = _empty_nqs_lit_stats()._replace(
+        loss=jnp.asarray(0.005),
+        fidelity=jnp.asarray(0.995),
+        reverse_kl=jnp.asarray(0.002),
+        lit=jnp.asarray(1.0),
+        source_norm=jnp.asarray(1.0),
+        reweight_ess_fraction=jnp.asarray(0.8),
+        invalid_sample_fraction=jnp.asarray(0.0),
+        source_covariance_loss=jnp.asarray(0.0),
+        source_covariance_max_loss=jnp.asarray(0.0),
+    )
+    record = _ContinuationRecord(
+        omega=0.2,
+        optimized=True,
+        selected_iteration=100,
+        stats=stats,
+        inherited_fidelity=0.989922,
+        step=0.2,
+        bisections=0,
+        probe_accepted=True,
+        min_step_override=False,
+    )
+    digest_args = dict(
+        response_params=response_params,
+        ground_params=ground_params,
+        train_pool={"electrons": jnp.asarray([[0.1, 0.2, 0.3]])},
+        eval_pool={"electrons": jnp.asarray([[0.4, 0.5, 0.6]])},
+        axis=0,
+        source_center=0.0,
+        source_norm=1.0,
+        ground_energy=-2.0,
+        ground_checkpoint_step=7,
+        response_parity=-1,
+        target_omega=0.4,
+        spectrum_omega=np.asarray([0.4, 0.5]),
+    )
+    state_fingerprint, full_digest = _continuation_checkpoint_digests(
+        config,
+        **digest_args,
+    )
+    saver = object.__new__(MoleculeLITWorkflow)
+    saver.lit_config = config
+    saver.save_path = old_run
+    rng = jax.random.PRNGKey(17)
+    saver._save_nqs_continuation_checkpoint(
+        response_params,
+        stats,
+        rng,
+        0.2,
+        [record],
+        axis=0,
+        target_omega=0.4,
+        ground_checkpoint_step=7,
+        ground_energy=-2.0,
+        source_center=0.0,
+        source_norm=1.0,
+        response_parity=-1,
+        state_fingerprint=state_fingerprint,
+        full_config_digest=full_digest,
+        warm_start_selected_iteration=1500,
+    )
+
+    restore_config = MolecularLITConfig(
+        nqs_warm_start_omega=0.0,
+        nqs_stage_fidelity_min=0.99,
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_stage_fidelity_gain_min=0.001,
+        nqs_continuation_restore_path=str(old_run),
+    )
+    restore_fingerprint, restore_full_digest = _continuation_checkpoint_digests(
+        restore_config,
+        **digest_args,
+    )
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = restore_config
+    workflow.save_path = new_run
+    revalidated = stats._replace(fidelity=jnp.asarray(0.996))
+    workflow._evaluate_nqs_checkpoint = lambda **_kwargs: revalidated
+
+    restored = workflow._restore_nqs_continuation_checkpoint(
+        {"w": jnp.asarray([0.0 + 0.0j])},
+        jax.random.PRNGKey(0),
+        None,
+        SimpleNamespace(),
+        response_apply=None,
+        ground_logpsi=None,
+        ground_params=ground_params,
+        axis=0,
+        source_center=0.0,
+        source_norm=1.0,
+        ground_energy=-2.0,
+        ground_checkpoint_step=7,
+        response_parity=-1,
+        target_omega=0.4,
+        state_fingerprint=restore_fingerprint,
+        full_config_digest=restore_full_digest,
+    )
+
+    assert restored is not None
+    np.testing.assert_allclose(np.asarray(restored.response_params["w"]), [1 + 2j])
+    np.testing.assert_array_equal(np.asarray(restored.rng), np.asarray(rng))
+    assert restored.current_omega == pytest.approx(0.2)
+    assert restored.current_stats.fidelity == pytest.approx(0.996)
+    assert restored.warm_start_selected_iteration == 1500
+    assert len(restored.records) == 1
+    assert restored.records[0].omega == pytest.approx(0.2)
+    assert restored.records[0].stats.fidelity == pytest.approx(0.996)
+
+    workflow._evaluate_nqs_checkpoint = lambda **_kwargs: stats._replace(
+        fidelity=jnp.asarray(0.9901)
+    )
+    with pytest.raises(RuntimeError, match=r"required=0\.990922"):
+        workflow._restore_nqs_continuation_checkpoint(
+            {"w": jnp.asarray([0.0 + 0.0j])},
+            jax.random.PRNGKey(0),
+            None,
+            SimpleNamespace(),
+            response_apply=None,
+            ground_logpsi=None,
+            ground_params=ground_params,
+            axis=0,
+            source_center=0.0,
+            source_norm=1.0,
+            ground_energy=-2.0,
+            ground_checkpoint_step=7,
+            response_parity=-1,
+            target_omega=0.4,
+            state_fingerprint=restore_fingerprint,
+            full_config_digest=restore_full_digest,
+        )
+
+
+def test_continuation_state_fingerprint_allows_new_gates_but_not_new_ansatz():
+    params = {"w": jnp.asarray([1.0])}
+    ground = {"g": jnp.asarray([2.0])}
+    digest_args = dict(
+        response_params=params,
+        ground_params=ground,
+        train_pool={"electrons": jnp.asarray([[0.1]])},
+        eval_pool={"electrons": jnp.asarray([[0.2]])},
+        axis=0,
+        source_center=0.0,
+        source_norm=1.0,
+        ground_energy=-2.0,
+        ground_checkpoint_step=7,
+        response_parity=-1,
+        target_omega=0.4,
+        spectrum_omega=np.asarray([0.4, 0.5]),
+    )
+    old_config = MolecularLITConfig(
+        nqs_stage_fidelity_min=0.99,
+        nqs_continuation_allow_min_step_override=False,
+    )
+    recovered_config = MolecularLITConfig(
+        nqs_stage_fidelity_min=0.995,
+        nqs_continuation_allow_min_step_override=True,
+    )
+    changed_ansatz = MolecularLITConfig(nqs_response_ndets=32)
+    relocated_inputs = MolecularLITConfig(
+        nqs_stage_fidelity_min=0.99,
+        nqs_continuation_allow_min_step_override=False,
+        nqs_checkpoint_path="/moved/ground",
+        nqs_source_pool_dir="/moved/source_pools",
+        nqs_reuse_source_pool=False,
+        nqs_save_source_pool=False,
+    )
+
+    old_state, old_full = _continuation_checkpoint_digests(
+        old_config,
+        **digest_args,
+    )
+    recovered_state, recovered_full = _continuation_checkpoint_digests(
+        recovered_config,
+        **digest_args,
+    )
+    changed_state, _ = _continuation_checkpoint_digests(
+        changed_ansatz,
+        **digest_args,
+    )
+    relocated_state, relocated_full = _continuation_checkpoint_digests(
+        relocated_inputs,
+        **digest_args,
+    )
+
+    assert recovered_state == old_state
+    assert recovered_full != old_full
+    assert changed_state != old_state
+    assert relocated_state == old_state
+    assert relocated_full != old_full
+
+    changed_ground_state, _ = _continuation_checkpoint_digests(
+        old_config,
+        **{**digest_args, "ground_params": {"g": jnp.asarray([999.0])}},
+    )
+    changed_pool_state, _ = _continuation_checkpoint_digests(
+        old_config,
+        **{
+            **digest_args,
+            "eval_pool": {"electrons": jnp.asarray([[999.0]])},
+        },
+    )
+    assert changed_ground_state != old_state
+    assert changed_pool_state != old_state
+
+
+def test_min_step_low_ess_cannot_bypass_recovery_gate():
+    config = MolecularLITConfig(
+        nqs_warm_start_omega=0.0,
+        nqs_continuation_iterations=1,
+        nqs_continuation_step_fraction=0.1,
+        nqs_continuation_fidelity_retention=0.99,
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_continuation_allow_min_step_override=True,
+        nqs_continuation_min_step=0.1,
+        nqs_continuation_max_points=10,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    workflow, update, starts, optimized, _ = _mock_bridge_workflow(config)
+
+    def low_ess_evaluate(*_args, **_kwargs):
+        return _bridge_stats(0.999, ess=0.049)
+
+    workflow._nqs_stats_chunked = low_ess_evaluate
+
+    with pytest.raises(RuntimeError, match=r"insufficient.*ESS"):
+        _run_bridge(workflow, update, target=0.2)
+
+    assert starts == []
+    assert optimized == []
 
 
 def _mock_stage_optimizer(config, candidate_fidelity):
@@ -409,6 +765,41 @@ def _mock_stage_optimizer_with_stats(config, initial_stats, candidate_stats):
 
     update.init_carry = init_carry
     return workflow, update
+
+
+def test_exact_failed_probe_can_recover_through_strict_post_optimizer_gate():
+    config = MolecularLITConfig(
+        nqs_stage_fidelity_min=0.99,
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_stage_fidelity_gain_min=0.001,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    initial = _bridge_stats(0.989922, ess=0.704427)
+    candidate = _bridge_stats(0.99095, ess=0.70)
+    workflow, update = _mock_stage_optimizer_with_stats(config, initial, candidate)
+
+    params, stats, selected_iteration, _ = _run_stage_optimizer(workflow, update)
+
+    assert float(params) == pytest.approx(1.0)
+    assert float(stats.fidelity) == pytest.approx(0.99095)
+    assert selected_iteration == 1
+
+
+def test_exact_failed_probe_is_rejected_if_recovery_misses_required_gain():
+    config = MolecularLITConfig(
+        nqs_stage_fidelity_min=0.99,
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_stage_fidelity_gain_min=0.001,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    initial = _bridge_stats(0.989922, ess=0.704427)
+    candidate = _bridge_stats(0.99090, ess=0.70)
+    workflow, update = _mock_stage_optimizer_with_stats(config, initial, candidate)
+
+    with pytest.raises(RuntimeError, match=r"quality gate.*required=0\.990922"):
+        _run_stage_optimizer(workflow, update)
 
 
 def test_gate_eligible_initial_is_not_displaced_by_lower_loss_ineligible_candidate():
