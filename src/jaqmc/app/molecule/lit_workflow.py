@@ -254,6 +254,21 @@ class _ContinuationRecord(NamedTuple):
     min_step_override: bool
 
 
+class _NQSStageQualityError(RuntimeError):
+    """Held-out stage-quality failure with machine-readable gate causes."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        fidelity_failed: bool,
+        ess_failed: bool,
+    ) -> None:
+        super().__init__(message)
+        self.fidelity_failed = bool(fidelity_failed)
+        self.ess_failed = bool(ess_failed)
+
+
 class _ContinuationCheckpoint(NamedTuple):
     """Serializable latest-good state for one response-axis bridge chain."""
 
@@ -2950,6 +2965,17 @@ class MoleculeLITWorkflow(Workflow):
             raise RuntimeError(msg)
         tolerance = np.finfo(np.float64).eps * max(1.0, abs(target_omega)) * 8.0
 
+        def evaluate_probe(omega: float):
+            return jax.device_get(
+                self._evaluate_nqs_checkpoint(
+                    response_params=response_params,
+                    eval_pool=eval_pool,
+                    omega=omega,
+                    source_covariance_evaluator=source_covariance_evaluator,
+                    **common,
+                )
+            )
+
         while target_omega - current_omega > tolerance:
             gap = float(target_omega - current_omega)
             step = _physics_continuation_step(
@@ -2961,115 +2987,152 @@ class MoleculeLITWorkflow(Workflow):
             candidate_omega = current_omega + step
             bisections = 0
             while True:
-                probe_stats = jax.device_get(
-                    self._evaluate_nqs_checkpoint(
-                        response_params=response_params,
-                        eval_pool=eval_pool,
-                        omega=candidate_omega,
-                        source_covariance_evaluator=source_covariance_evaluator,
-                        **common,
+                probe_stats, candidate_omega, probe_ok, probe_bisections = (
+                    _bisect_continuation_probe(
+                        evaluate_probe,
+                        current_stats,
+                        current_omega=current_omega,
+                        candidate_omega=candidate_omega,
+                        target_omega=target_omega,
+                        min_step=min_step,
+                        retention=(self.lit_config.nqs_continuation_fidelity_retention),
+                        max_source_covariance=maximum_covariance,
+                        min_reweight_ess_fraction=(
+                            self.lit_config.nqs_stage_reweight_ess_fraction_min
+                        ),
                     )
                 )
-                probe_ok = _continuation_probe_is_acceptable(
+                bisections += probe_bisections
+
+                _require_eligible_nqs_checkpoint(
+                    probe_stats,
+                    max_source_covariance=maximum_covariance,
+                    context=(
+                        "Frequency continuation produced non-finite/invalid "
+                        "held-out statistics at "
+                        f"omega={candidate_omega:.8g}; refusing to propagate "
+                        "a corrupted checkpoint"
+                    ),
+                )
+                actual_step = float(candidate_omega - current_omega)
+                min_step_override = not probe_ok and actual_step <= min_step * (
+                    1.0 + 1e-12
+                )
+                self._require_continuation_probe_recovery_allowed(
                     current_stats,
                     probe_stats,
-                    retention=self.lit_config.nqs_continuation_fidelity_retention,
-                    max_source_covariance=maximum_covariance,
-                    min_reweight_ess_fraction=(
-                        self.lit_config.nqs_stage_reweight_ess_fraction_min
-                    ),
+                    candidate_omega=candidate_omega,
+                    min_step_override=min_step_override,
                 )
-                candidate_gap = candidate_omega - current_omega
-                if probe_ok or candidate_gap <= min_step * (1.0 + 1e-12):
-                    break
-                candidate_gap = max(min_step, 0.5 * candidate_gap)
-                candidate_omega = min(target_omega, current_omega + candidate_gap)
-                bisections += 1
-
-            _require_eligible_nqs_checkpoint(
-                probe_stats,
-                max_source_covariance=maximum_covariance,
-                context=(
-                    "Frequency continuation produced non-finite/invalid held-out "
-                    f"statistics at omega={candidate_omega:.8g}; refusing to "
-                    "propagate a corrupted checkpoint"
-                ),
-            )
-            actual_step = float(candidate_omega - current_omega)
-            min_step_override = not probe_ok and actual_step <= min_step * (1.0 + 1e-12)
-            self._require_continuation_probe_recovery_allowed(
-                current_stats,
-                probe_stats,
-                candidate_omega=candidate_omega,
-                min_step_override=min_step_override,
-            )
-            if target_omega - candidate_omega <= tolerance:
-                records.append(
-                    _ContinuationRecord(
-                        omega=float(candidate_omega),
-                        optimized=False,
-                        selected_iteration=-1,
-                        stats=probe_stats,
-                        inherited_fidelity=float(probe_stats.fidelity),
-                        step=actual_step,
-                        bisections=bisections,
-                        probe_accepted=probe_ok,
-                        min_step_override=min_step_override,
-                    )
-                )
-                logger.info(
-                    "axis=%s continuation_probe target=%.6f inherited_fidelity=%.6f "
-                    "covariance_mean=%.6e covariance_max=%.6e step=%.6e "
-                    "bisections=%d accepted=%s min_step_override=%s",
-                    _AXIS_NAMES[axis],
-                    target_omega,
-                    float(probe_stats.fidelity),
-                    float(getattr(probe_stats, "source_covariance_loss", 0.0)),
-                    float(
-                        getattr(
-                            probe_stats,
-                            "source_covariance_max_loss",
-                            getattr(probe_stats, "source_covariance_loss", 0.0),
+                if target_omega - candidate_omega <= tolerance:
+                    records.append(
+                        _ContinuationRecord(
+                            omega=float(candidate_omega),
+                            optimized=False,
+                            selected_iteration=-1,
+                            stats=probe_stats,
+                            inherited_fidelity=float(probe_stats.fidelity),
+                            step=actual_step,
+                            bisections=bisections,
+                            probe_accepted=probe_ok,
+                            min_step_override=min_step_override,
                         )
-                    ),
-                    actual_step,
-                    bisections,
-                    probe_ok,
-                    min_step_override,
+                    )
+                    logger.info(
+                        "axis=%s continuation_probe target=%.6f "
+                        "inherited_fidelity=%.6f covariance_mean=%.6e "
+                        "covariance_max=%.6e step=%.6e bisections=%d "
+                        "accepted=%s min_step_override=%s",
+                        _AXIS_NAMES[axis],
+                        target_omega,
+                        float(probe_stats.fidelity),
+                        float(getattr(probe_stats, "source_covariance_loss", 0.0)),
+                        float(
+                            getattr(
+                                probe_stats,
+                                "source_covariance_max_loss",
+                                getattr(
+                                    probe_stats,
+                                    "source_covariance_loss",
+                                    0.0,
+                                ),
+                            )
+                        ),
+                        actual_step,
+                        bisections,
+                        probe_ok,
+                        min_step_override,
+                    )
+                    return response_params, current_stats, records, rng
+
+                optimized_count = sum(record.optimized for record in records)
+                _require_continuation_point_capacity(
+                    optimized_count,
+                    maximum=self.lit_config.nqs_continuation_max_points,
+                    target_omega=target_omega,
                 )
+                inherited_fidelity = float(probe_stats.fidelity)
+                try:
+                    (
+                        candidate_params,
+                        candidate_stats,
+                        selected_iteration,
+                        candidate_rng,
+                    ) = self._optimize_nqs_frequency(
+                        update_step,
+                        response_params,
+                        train_pool,
+                        eval_pool,
+                        fallback_data,
+                        rng,
+                        omega=candidate_omega,
+                        iterations=self.lit_config.nqs_continuation_iterations,
+                        stage="continuation",
+                        **common,
+                    )
+                except _NQSStageQualityError as error:
+                    # Only a pure fidelity miss is evidence that the homotopy
+                    # jump was too large.  ESS failures remain fail-closed:
+                    # retrying the same estimator at another frequency could
+                    # hide an unreliable held-out sample.
+                    retry_step = _continuation_retry_step_or_raise(
+                        error,
+                        actual_step=actual_step,
+                        min_step=min_step,
+                    )
+                    retry_omega = min(target_omega, current_omega + retry_step)
+                    logger.warning(
+                        "axis=%s continuation_backtrack failed_omega=%.6f "
+                        "failed_step=%.6e retry_omega=%.6f retry_step=%.6e "
+                        "reason=%s",
+                        _AXIS_NAMES[axis],
+                        candidate_omega,
+                        actual_step,
+                        retry_omega,
+                        retry_step,
+                        error,
+                    )
+                    candidate_omega = retry_omega
+                    bisections += 1
+                    continue
+
+                _require_eligible_nqs_checkpoint(
+                    candidate_stats,
+                    max_source_covariance=maximum_covariance,
+                    context=(
+                        "Frequency continuation failed to obtain a finite "
+                        "held-out checkpoint at "
+                        f"omega={candidate_omega:.8g}"
+                    ),
+                )
+                # Commit the candidate only after every post-optimization gate
+                # has passed.  Failed attempts leave params, RNG, stats, and
+                # checkpoint history at the last accepted frequency.
+                response_params = candidate_params
+                current_stats = candidate_stats
+                rng = candidate_rng
                 break
 
-            optimized_count = sum(record.optimized for record in records)
-            if optimized_count >= self.lit_config.nqs_continuation_max_points:
-                msg = (
-                    "Adaptive frequency continuation exceeded "
-                    f"{self.lit_config.nqs_continuation_max_points} bridge points "
-                    f"before omega={target_omega:.8g}."
-                )
-                raise RuntimeError(msg)
-            inherited_fidelity = float(probe_stats.fidelity)
-            response_params, current_stats, selected_iteration, rng = (
-                self._optimize_nqs_frequency(
-                    update_step,
-                    response_params,
-                    train_pool,
-                    eval_pool,
-                    fallback_data,
-                    rng,
-                    omega=candidate_omega,
-                    iterations=self.lit_config.nqs_continuation_iterations,
-                    stage="continuation",
-                    **common,
-                )
-            )
-            _require_eligible_nqs_checkpoint(
-                current_stats,
-                max_source_covariance=maximum_covariance,
-                context=(
-                    "Frequency continuation failed to obtain a finite held-out "
-                    f"checkpoint at omega={candidate_omega:.8g}"
-                ),
-            )
             records.append(
                 _ContinuationRecord(
                     omega=float(candidate_omega),
@@ -5395,6 +5458,76 @@ def _continuation_min_step(
     return max(np.finfo(np.float64).eps, min(candidates))
 
 
+def _bisect_continuation_probe(
+    evaluate: Callable[[float], Any],
+    current_stats,
+    *,
+    current_omega: float,
+    candidate_omega: float,
+    target_omega: float,
+    min_step: float,
+    retention: float,
+    max_source_covariance: float | None,
+    min_reweight_ess_fraction: float,
+):
+    """Bisect an inherited-parameter probe until it is safe or minimal.
+
+    Returns:
+        Probe statistics, accepted frequency, acceptance flag, and bisections.
+    """
+    bisections = 0
+    while True:
+        probe_stats = evaluate(candidate_omega)
+        probe_ok = _continuation_probe_is_acceptable(
+            current_stats,
+            probe_stats,
+            retention=retention,
+            max_source_covariance=max_source_covariance,
+            min_reweight_ess_fraction=min_reweight_ess_fraction,
+        )
+        candidate_gap = candidate_omega - current_omega
+        if probe_ok or candidate_gap <= min_step * (1.0 + 1e-12):
+            return probe_stats, candidate_omega, probe_ok, bisections
+        candidate_gap = max(min_step, 0.5 * candidate_gap)
+        candidate_omega = min(target_omega, current_omega + candidate_gap)
+        bisections += 1
+
+
+def _require_continuation_point_capacity(
+    optimized_count: int,
+    *,
+    maximum: int,
+    target_omega: float,
+) -> None:
+    """Reject an additional optimized bridge after the configured cap.
+
+    Raises:
+        RuntimeError: If no additional bridge point may be optimized.
+    """
+    if optimized_count >= maximum:
+        msg = (
+            "Adaptive frequency continuation exceeded "
+            f"{maximum} bridge points before omega={target_omega:.8g}."
+        )
+        raise RuntimeError(msg)
+
+
+def _continuation_retry_step_or_raise(
+    error: _NQSStageQualityError,
+    *,
+    actual_step: float,
+    min_step: float,
+) -> float:
+    """Return a smaller step for a pure fidelity miss, or re-raise it."""
+    if (
+        not error.fidelity_failed
+        or error.ess_failed
+        or actual_step <= min_step * (1.0 + 1e-12)
+    ):
+        raise error
+    return max(min_step, 0.5 * actual_step)
+
+
 def _physics_continuation_step(stats, *, gap: float, fraction: float, min_step: float):
     """Choose a homotopy step from the inherited LIT residual estimate.
 
@@ -5488,7 +5621,8 @@ def _require_nqs_stage_quality(
     """Raise when a finite checkpoint misses an absolute science gate.
 
     Raises:
-        RuntimeError: If an active fidelity or ESS threshold is missed.
+        _NQSStageQualityError: If an active fidelity or ESS threshold is
+            missed.
     """
     failure = _nqs_stage_quality_failure(
         stats,
@@ -5496,7 +5630,20 @@ def _require_nqs_stage_quality(
         min_reweight_ess_fraction=min_reweight_ess_fraction,
     )
     if failure is not None:
-        raise RuntimeError(f"{context}; {failure}.")
+        fidelity = float(jax.device_get(stats.fidelity))
+        ess_fraction = float(jax.device_get(stats.reweight_ess_fraction))
+        fidelity_failed = min_fidelity > 0.0 and (
+            not np.isfinite(fidelity) or fidelity < float(min_fidelity)
+        )
+        ess_failed = min_reweight_ess_fraction > 0.0 and (
+            not np.isfinite(ess_fraction)
+            or ess_fraction < float(min_reweight_ess_fraction)
+        )
+        raise _NQSStageQualityError(
+            f"{context}; {failure}.",
+            fidelity_failed=fidelity_failed,
+            ess_failed=ess_failed,
+        )
 
 
 def _continuation_probe_is_acceptable(

@@ -87,9 +87,13 @@ def _run_bridge(
     response_params=0.0,
     resume_omega=None,
     existing_records=(),
+    rng=None,
+    checkpoint_callback=None,
 ):
     if current_stats is None:
         current_stats = _bridge_stats(1.0)
+    if rng is None:
+        rng = jax.random.PRNGKey(0)
     return workflow._continue_nqs_to_spectrum(
         update,
         jnp.asarray(response_params),
@@ -97,7 +101,7 @@ def _run_bridge(
         None,
         None,
         None,
-        jax.random.PRNGKey(0),
+        rng,
         response_apply=None,
         ground_logpsi=None,
         ground_params=None,
@@ -109,7 +113,51 @@ def _run_bridge(
         spectrum_omega=np.asarray([target, target + 0.1]),
         resume_omega=resume_omega,
         existing_records=existing_records,
+        checkpoint_callback=checkpoint_callback,
     )
+
+
+def _post_gate_bridge_workflow(
+    config,
+    *,
+    large_optimized_fidelity=0.978273,
+    optimized_ess=0.8,
+):
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = config
+    starts = []
+    rng_starts = []
+    attempts = []
+
+    def init_carry(_data, rng, params):
+        starts.append(float(params))
+        rng_starts.append(np.asarray(rng).copy())
+        return SimpleNamespace(direct=SimpleNamespace(rng=rng))
+
+    def update(_params, _pool, omega, carry, _iteration):
+        omega_value = float(omega)
+        attempts.append(omega_value)
+        next_rng = jax.random.fold_in(
+            carry.direct.rng,
+            round(1000.0 * omega_value),
+        )
+        next_carry = SimpleNamespace(direct=SimpleNamespace(rng=next_rng))
+        return omega, _bridge_stats(1.0), next_carry
+
+    update.init_carry = init_carry
+
+    def evaluate(_response_apply, params, *_args, **kwargs):
+        omega = float(kwargs["omega"])
+        optimized = np.isclose(float(params), omega)
+        if omega > 0.3:
+            fidelity = large_optimized_fidelity if optimized else 0.974661
+        else:
+            fidelity = 0.995 if optimized else 0.985
+        ess = optimized_ess if optimized else 0.8
+        return _bridge_stats(fidelity, ess=ess)
+
+    workflow._nqs_stats_chunked = evaluate
+    return workflow, update, starts, rng_starts, attempts
 
 
 def test_continuation_default_min_step_uses_finer_spectrum_spacing():
@@ -159,6 +207,169 @@ def test_adaptive_continuation_bisects_and_propagates_bridge_best():
     assert not records[-1].optimized
     assert probes[0] == pytest.approx(1.0)
     assert probes[-1] == pytest.approx(1.0)
+
+
+def test_post_optimizer_fidelity_failure_backtracks_from_last_good_state():
+    config = MolecularLITConfig(
+        nqs_warm_start_omega=0.0,
+        nqs_continuation_iterations=1,
+        nqs_continuation_step_fraction=0.4,
+        nqs_continuation_fidelity_retention=0.95,
+        nqs_stage_fidelity_min=0.99,
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_stage_fidelity_gain_min=0.001,
+        nqs_continuation_min_step=0.1,
+        nqs_continuation_max_points=10,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    workflow, update, starts, rng_starts, attempts = _post_gate_bridge_workflow(config)
+    initial_rng = jax.random.PRNGKey(17)
+    checkpoints = []
+
+    params, stats, records, rng = _run_bridge(
+        workflow,
+        update,
+        target=0.6,
+        current_stats=_bridge_stats(0.990259, ess=0.971),
+        rng=initial_rng,
+        checkpoint_callback=lambda *args: checkpoints.append(
+            (*args[:-1], list(args[-1]))
+        ),
+    )
+
+    # This reproduces the formal failure shape: the relative probe accepts the
+    # inherited F=0.974661 at the large step, but optimization only reaches
+    # F=0.978273.  The failed state is discarded and the half-step succeeds.
+    assert attempts == pytest.approx([0.4, 0.2])
+    assert starts == pytest.approx([0.0, 0.0])
+    assert len(rng_starts) == 2
+    np.testing.assert_array_equal(rng_starts[0], initial_rng)
+    np.testing.assert_array_equal(rng_starts[1], initial_rng)
+    assert float(params) == pytest.approx(0.2)
+    assert float(stats.fidelity) == pytest.approx(0.995)
+    np.testing.assert_array_equal(rng, jax.random.fold_in(initial_rng, 200))
+
+    optimized_records = [record for record in records if record.optimized]
+    assert len(optimized_records) == 1
+    assert optimized_records[0].omega == pytest.approx(0.2)
+    assert optimized_records[0].bisections == 1
+    assert records[-1].omega == pytest.approx(0.6)
+    assert not records[-1].optimized
+
+    # A failed trial is never committed to the durable continuation chain.
+    assert len(checkpoints) == 1
+    checkpoint_params, _, checkpoint_rng, checkpoint_omega, checkpoint_records = (
+        checkpoints[0]
+    )
+    assert float(checkpoint_params) == pytest.approx(0.2)
+    assert checkpoint_omega == pytest.approx(0.2)
+    np.testing.assert_array_equal(
+        checkpoint_rng,
+        jax.random.fold_in(initial_rng, 200),
+    )
+    assert checkpoint_records[-1].omega == pytest.approx(0.2)
+    assert checkpoint_records[-1].optimized
+
+
+def test_post_optimizer_fidelity_failure_at_min_step_fails_closed():
+    config = MolecularLITConfig(
+        nqs_warm_start_omega=0.0,
+        nqs_continuation_iterations=1,
+        nqs_continuation_step_fraction=0.4,
+        nqs_continuation_fidelity_retention=0.95,
+        nqs_stage_fidelity_min=0.99,
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_stage_fidelity_gain_min=0.001,
+        nqs_continuation_allow_min_step_override=True,
+        nqs_continuation_min_step=0.4,
+        nqs_continuation_max_points=10,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    workflow, update, starts, _, attempts = _post_gate_bridge_workflow(config)
+    checkpoints = []
+
+    with pytest.raises(RuntimeError, match=r"quality gate.*required=0\.990000"):
+        _run_bridge(
+            workflow,
+            update,
+            target=0.6,
+            current_stats=_bridge_stats(0.990259, ess=0.971),
+            checkpoint_callback=lambda *args: checkpoints.append(args),
+        )
+
+    assert attempts == pytest.approx([0.4])
+    assert starts == pytest.approx([0.0])
+    assert checkpoints == []
+
+
+def test_post_optimizer_ess_failure_is_not_backtracked():
+    config = MolecularLITConfig(
+        nqs_warm_start_omega=0.0,
+        nqs_continuation_iterations=1,
+        nqs_continuation_step_fraction=0.4,
+        nqs_continuation_fidelity_retention=0.95,
+        nqs_stage_fidelity_min=0.99,
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_stage_fidelity_gain_min=0.001,
+        nqs_continuation_min_step=0.1,
+        nqs_continuation_max_points=10,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    workflow, update, starts, _, attempts = _post_gate_bridge_workflow(
+        config,
+        large_optimized_fidelity=0.995,
+        optimized_ess=0.01,
+    )
+    checkpoints = []
+
+    with pytest.raises(RuntimeError, match=r"ESS fraction=.*required=0\.050000"):
+        _run_bridge(
+            workflow,
+            update,
+            target=0.6,
+            current_stats=_bridge_stats(0.990259, ess=0.971),
+            checkpoint_callback=lambda *args: checkpoints.append(args),
+        )
+
+    assert attempts == pytest.approx([0.4])
+    assert starts == pytest.approx([0.0])
+    assert checkpoints == []
+
+
+def test_post_optimizer_runtime_error_is_not_backtracked():
+    config = MolecularLITConfig(
+        nqs_warm_start_omega=0.0,
+        nqs_continuation_iterations=1,
+        nqs_continuation_step_fraction=0.4,
+        nqs_continuation_fidelity_retention=0.95,
+        nqs_stage_fidelity_min=0.99,
+        nqs_continuation_min_step=0.1,
+        nqs_continuation_max_points=10,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    workflow, update, starts, _, _ = _post_gate_bridge_workflow(config)
+    checkpoints = []
+
+    def fail_update(*_args, **_kwargs):
+        raise RuntimeError("optimizer backend sentinel")
+
+    fail_update.init_carry = update.init_carry
+
+    with pytest.raises(RuntimeError, match="optimizer backend sentinel"):
+        _run_bridge(
+            workflow,
+            fail_update,
+            target=0.6,
+            current_stats=_bridge_stats(0.990259),
+            checkpoint_callback=lambda *args: checkpoints.append(args),
+        )
+
+    assert starts == pytest.approx([0.0])
+    assert checkpoints == []
 
 
 def test_bridge_point_cap_still_allows_final_target_probe():
