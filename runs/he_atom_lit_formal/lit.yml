@@ -60,6 +60,9 @@ lit:
   # 61 GiB on one 80-GiB A100; the previous 4096 setting is not viable.
   nqs_train_update_batch_size: 1024
   nqs_eval_batch_size: 1024
+  # Keep omega continuation serial, but split each 1024-walker update/eval
+  # batch over every GPU visible to this single process.
+  nqs_data_parallel: local_devices
   nqs_source_pool_dir: ''
   # Metadata rejects the old nonzero-center pools.  Reuse the newly generated
   # centered pools so a continuation checkpoint can resume on the same held-out set.

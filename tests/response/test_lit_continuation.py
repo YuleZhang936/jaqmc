@@ -1271,6 +1271,11 @@ def test_continuation_state_fingerprint_allows_new_gates_but_not_new_ansatz():
         nqs_continuation_allow_min_step_override=False,
         nqs_continuation_iteration_schedule=(100, 200, 400),
     )
+    changed_execution_layout = MolecularLITConfig(
+        nqs_stage_fidelity_min=0.99,
+        nqs_continuation_allow_min_step_override=False,
+        nqs_data_parallel="local_devices",
+    )
 
     old_state, old_full = _continuation_checkpoint_digests(
         old_config,
@@ -1296,6 +1301,10 @@ def test_continuation_state_fingerprint_allows_new_gates_but_not_new_ansatz():
         changed_iteration_schedule,
         **digest_args,
     )
+    execution_state, execution_full = _continuation_checkpoint_digests(
+        changed_execution_layout,
+        **digest_args,
+    )
 
     assert recovered_state == old_state
     assert recovered_full != old_full
@@ -1306,6 +1315,8 @@ def test_continuation_state_fingerprint_allows_new_gates_but_not_new_ansatz():
     assert controller_full != old_full
     assert schedule_state == old_state
     assert schedule_full != old_full
+    assert execution_state == old_state
+    assert execution_full != old_full
 
     changed_ground_state, _ = _continuation_checkpoint_digests(
         old_config,

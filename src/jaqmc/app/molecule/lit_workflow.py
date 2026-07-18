@@ -53,6 +53,7 @@ from jaqmc.response.source_sector import (
 from jaqmc.response.spectrum import find_spectrum_peaks
 from jaqmc.sampler.base import SamplePlan
 from jaqmc.sampler.mcmc import MCMCSampler, MCMCState
+from jaqmc.utils import parallel_jax
 from jaqmc.utils.checkpoint import NumPyCheckpointManager
 from jaqmc.utils.config import ConfigManager, configurable_dataclass
 from jaqmc.wavefunction.output.envelope import EnvelopeType
@@ -120,6 +121,11 @@ class MolecularLITConfig:
     nqs_pool_stride: int = 1
     nqs_train_update_batch_size: int = 0
     nqs_eval_batch_size: int = 0
+    # Frequencies always remain one serial continuation chain.  This optional
+    # execution mode shards the Monte Carlo batch for one frequency across all
+    # process-local devices while keeping parameters, statistics, and SPRING
+    # state replicated.
+    nqs_data_parallel: str = "off"
     nqs_source_pool_dir: str = ""
     nqs_reuse_source_pool: bool = True
     nqs_save_source_pool: bool = True
@@ -584,6 +590,7 @@ class MoleculeLITWorkflow(Workflow):
             else:
                 train_pool, eval_pool = loaded_pools
                 axis_batched_data = batched_data
+            self._validate_data_parallel_source_pools(train_pool, eval_pool)
             logger.info(
                 "axis=%s source_pool train=%d eval=%d",
                 _AXIS_NAMES[axis],
@@ -1078,6 +1085,7 @@ class MoleculeLITWorkflow(Workflow):
             raise ValueError(msg)
         self._validate_serial_scan_config(omega)
         self._validate_chunk_config()
+        self._validate_data_parallel_config()
         if not 0.0 <= self.lit_config.nqs_reweight_ess_fraction_min <= 1.0:
             msg = (
                 "lit.nqs_reweight_ess_fraction_min must be between 0 and 1, got "
@@ -1337,6 +1345,54 @@ class MoleculeLITWorkflow(Workflow):
         if self.lit_config.nqs_eval_batch_size < 0:
             msg = "lit.nqs_eval_batch_size must be nonnegative."
             raise ValueError(msg)
+
+    def _validate_data_parallel_config(self) -> None:
+        mode = self._nqs_data_parallel_mode()
+        if mode not in {"off", "local_devices"}:
+            msg = (
+                "lit.nqs_data_parallel must be 'off' or 'local_devices', got "
+                f"{self.lit_config.nqs_data_parallel!r}."
+            )
+            raise ValueError(msg)
+        if mode == "off":
+            return
+        if jax.process_count() != 1:
+            msg = (
+                "lit.nqs_data_parallel=local_devices currently requires one JAX "
+                "process; use one process controlling all GPUs on the worker."
+            )
+            raise ValueError(msg)
+        if self.lit_config.nqs_direct_psi_train:
+            msg = (
+                "lit.nqs_data_parallel=local_devices is only defined for the "
+                "formal source-sampled estimator; set lit.nqs_direct_psi_train=false."
+            )
+            raise ValueError(msg)
+        # A fully constructed workflow always has the base workflow config.
+        # Keep mode-only validation usable by lightweight object.__new__ unit
+        # fixtures that deliberately provide only ``lit_config``.
+        if not hasattr(self, "config"):
+            return
+        configured_train_batch = int(self.lit_config.nqs_train_update_batch_size)
+        train_batch_size = (
+            configured_train_batch
+            if configured_train_batch > 0
+            else int(self.config.batch_size)
+        )
+        configured_eval_batch = int(self.lit_config.nqs_eval_batch_size)
+        eval_batch_size = (
+            configured_eval_batch
+            if configured_eval_batch > 0
+            else int(self.config.batch_size)
+        )
+        self._validate_data_parallel_batch_size(
+            train_batch_size,
+            purpose="training",
+        )
+        self._validate_data_parallel_batch_size(
+            eval_batch_size,
+            purpose="evaluation",
+        )
 
     def _configured_source_sector(self, geometry_data) -> SourceSector:
         """Resolve the restricted atomic-hard-parity or molecular-C1 policy.
@@ -3581,6 +3637,19 @@ class MoleculeLITWorkflow(Workflow):
             if source_sector is not None and response_vector_apply is not None
             else ()
         )
+        data_parallel = self._nqs_data_parallel_enabled()
+        data_parallel_device_count = jax.local_device_count()
+        if data_parallel and active_operations:
+            msg = (
+                "Data-parallel NQS-LIT does not support the retired soft "
+                "vector-covariance branch; use the hard atomic parity or C1 policy."
+            )
+            raise RuntimeError(msg)
+        data_parallel_ground_params = (
+            _replicate_across_local_devices(ground_params)
+            if data_parallel
+            else ground_params
+        )
         identity_operation = jnp.eye(3)
 
         if active_operations:
@@ -3629,37 +3698,60 @@ class MoleculeLITWorkflow(Workflow):
                 evaluation_pool,
             ).mean_loss
 
-        @jax.jit
-        def source_update(
+        def source_update_impl(
             response_params,
+            local_ground_params,
             batched_data,
             spring_previous,
             omega,
             source_operation,
         ):
-            (
-                stats,
-                updates,
-                spring_state,
-                _,
-                covariance_loss,
-                optimizer_diagnostics,
-            ) = self._source_sr_stats_and_updates(
-                response_apply,
-                response_params,
-                ground_logpsi,
-                ground_params,
-                batched_data,
-                response_vector_apply=response_vector_apply,
-                source_sector=source_sector,
-                source_operation=(source_operation if active_operations else None),
-                spring_state=_SpringState(spring_previous),
-                axis=axis,
-                source_center=source_center,
-                source_norm=source_norm,
-                ground_energy=ground_energy,
-                omega=omega,
-            )
+            if data_parallel:
+                (
+                    stats,
+                    updates,
+                    spring_state,
+                    _,
+                    covariance_loss,
+                    optimizer_diagnostics,
+                ) = self._source_sr_stats_and_updates_data_parallel(
+                    response_apply,
+                    response_params,
+                    ground_logpsi,
+                    local_ground_params,
+                    batched_data,
+                    spring_state=_SpringState(spring_previous),
+                    axis=axis,
+                    source_center=source_center,
+                    source_norm=source_norm,
+                    ground_energy=ground_energy,
+                    omega=omega,
+                    device_count=data_parallel_device_count,
+                )
+            else:
+                (
+                    stats,
+                    updates,
+                    spring_state,
+                    _,
+                    covariance_loss,
+                    optimizer_diagnostics,
+                ) = self._source_sr_stats_and_updates(
+                    response_apply,
+                    response_params,
+                    ground_logpsi,
+                    local_ground_params,
+                    batched_data,
+                    response_vector_apply=response_vector_apply,
+                    source_sector=source_sector,
+                    source_operation=(source_operation if active_operations else None),
+                    spring_state=_SpringState(spring_previous),
+                    axis=axis,
+                    source_center=source_center,
+                    source_norm=source_norm,
+                    ground_energy=ground_energy,
+                    omega=omega,
+                )
             response_params = _apply_updates(response_params, updates)
             loss = (
                 _regularized_loss(
@@ -3681,6 +3773,8 @@ class MoleculeLITWorkflow(Workflow):
                 spring_state.previous_direction,
                 optimizer_diagnostics,
             )
+
+        source_update_kernel = None if data_parallel else jax.jit(source_update_impl)
 
         direct_train_collect_initial = self._make_direct_psi_pool_collector(
             response_apply,
@@ -3902,6 +3996,7 @@ class MoleculeLITWorkflow(Workflow):
             update_carry,
             batch_index: int = 0,
         ):
+            nonlocal source_update_kernel
             if int(batch_index) == 0:
                 update_carry = update_carry._replace(
                     direct=update_carry.direct._replace(
@@ -3920,17 +4015,43 @@ class MoleculeLITWorkflow(Workflow):
                     if active_operations
                     else identity_operation
                 )
+                if source_update_kernel is None:
+                    source_update_kernel = self._data_parallel_source_update_kernel(
+                        source_update_impl,
+                        update_batch,
+                    )
+                kernel_response_params = response_params
+                kernel_ground_params = data_parallel_ground_params
+                kernel_batch = update_batch
+                kernel_spring_previous = update_carry.spring.previous_direction
+                kernel_omega = omega
+                kernel_source_operation = source_operation
+                if data_parallel:
+                    kernel_response_params = _replicate_across_local_devices(
+                        kernel_response_params
+                    )
+                    kernel_batch = _shard_batched_data_across_local_devices(
+                        kernel_batch
+                    )
+                    kernel_spring_previous = _replicate_across_local_devices(
+                        kernel_spring_previous
+                    )
+                    kernel_omega = _replicate_across_local_devices(kernel_omega)
+                    kernel_source_operation = _replicate_across_local_devices(
+                        kernel_source_operation
+                    )
                 (
                     response_params,
                     stats,
                     spring_previous,
                     optimizer_diagnostics,
-                ) = source_update(
-                    response_params,
-                    update_batch,
-                    update_carry.spring.previous_direction,
-                    omega,
-                    source_operation,
+                ) = source_update_kernel(
+                    kernel_response_params,
+                    kernel_ground_params,
+                    kernel_batch,
+                    kernel_spring_previous,
+                    kernel_omega,
+                    kernel_source_operation,
                 )
                 update.last_spring_optimizer_diagnostics = (  # type: ignore[attr-defined]
                     optimizer_diagnostics
@@ -4165,6 +4286,148 @@ class MoleculeLITWorkflow(Workflow):
             covariance_loss,
             optimizer_diagnostics,
         )
+
+    def _source_sr_stats_and_updates_data_parallel(
+        self,
+        response_apply,
+        response_params,
+        ground_logpsi,
+        ground_params,
+        batched_data,
+        *,
+        spring_state: _SpringState,
+        axis: int,
+        source_center: float,
+        source_norm: float,
+        ground_energy: float,
+        omega,
+        device_count: int,
+    ):
+        """Evaluate one exact global source update from local batch shards.
+
+        Returns:
+            Global statistics, replicated updates and SPRING state, damping,
+            the inactive covariance loss, and optimizer diagnostics.
+        """
+        score, ratio, source_weight, local_source_sums = (
+            self._source_sampled_action_scores_and_sums(
+                response_apply,
+                parallel_jax.pvary(response_params),
+                ground_logpsi,
+                ground_params,
+                batched_data,
+                axis=axis,
+                source_center=source_center,
+                ground_energy=ground_energy,
+                omega=omega,
+            )
+        )
+        source_sums = _merge_source_sums_across_devices(local_source_sums)
+        stats = nqs_lit_stats_from_source_sums(
+            source_sums,
+            source_norm=source_norm,
+            omega=omega,
+            eta=self.lit_config.eta,
+        )
+        updates, spring_state, damping, optimizer_diagnostics = (
+            self._weighted_sr_updates_from_scores_data_parallel(
+                response_params,
+                score,
+                ratio,
+                source_weight,
+                spring_state,
+                device_count=device_count,
+            )
+        )
+        first_leaf = jax.tree_util.tree_leaves(response_params)[0]
+        covariance_loss = jnp.asarray(0.0, dtype=first_leaf.dtype)
+        return (
+            stats,
+            updates,
+            spring_state,
+            damping,
+            covariance_loss,
+            optimizer_diagnostics,
+        )
+
+    def _weighted_sr_updates_from_scores_data_parallel(
+        self,
+        response_params,
+        score,
+        ratio,
+        source_weight,
+        spring_state: _SpringState,
+        *,
+        device_count: int,
+    ):
+        """Return a replicated SPRING update from row-sharded action scores."""
+        (
+            grad_flat,
+            fidelity_gradient,
+            reverse_kl_gradient,
+            psi_weight,
+            centered_score,
+            _,
+            _,
+        ) = _regularized_action_gradient(
+            score,
+            ratio,
+            source_weight,
+            reverse_kl_weight=self.lit_config.nqs_reverse_kl_weight,
+            eps=self.lit_config.nqs_sr_score_eps,
+            axis_name=parallel_jax.BATCH_AXIS_NAME,
+        )
+        weighted_score = jnp.sqrt(psi_weight)[:, None] * centered_score
+        local_score_aug = jnp.concatenate(
+            [weighted_score.real, weighted_score.imag],
+            axis=0,
+        )
+        qfi_trace = jax.lax.psum(
+            jnp.sum(local_score_aug**2),
+            axis_name=parallel_jax.BATCH_AXIS_NAME,
+        )
+        centering_null = jnp.sqrt(psi_weight)
+        zero_null = jnp.zeros_like(centering_null)
+        local_kernel_null_vectors = jnp.stack(
+            [
+                jnp.concatenate([centering_null, zero_null]),
+                jnp.concatenate([zero_null, centering_null]),
+            ]
+        )
+        previous_direction = spring_state.previous_direction
+        direction, spring_state, damping = _spring_direction_data_parallel(
+            local_score_aug,
+            grad_flat,
+            spring_state,
+            epsilon_scale=self.lit_config.nqs_spring_epsilon,
+            damping_floor=self.lit_config.nqs_spring_damping_floor,
+            decay=self.lit_config.nqs_spring_decay,
+            device_count=device_count,
+            qfi_trace=qfi_trace,
+            local_kernel_null_vectors=local_kernel_null_vectors,
+        )
+        updates = _scaled_direction_updates(
+            response_params,
+            direction,
+            learning_rate=self.lit_config.nqs_learning_rate,
+            max_norm=self.lit_config.nqs_sr_max_norm,
+        )
+        optimizer_diagnostics = _spring_optimizer_diagnostics(
+            response_params,
+            grad_flat,
+            fidelity_gradient,
+            reverse_kl_gradient,
+            direction,
+            updates,
+            previous_direction,
+            reverse_kl_weight=self.lit_config.nqs_reverse_kl_weight,
+            learning_rate=self.lit_config.nqs_learning_rate,
+            max_norm=self.lit_config.nqs_sr_max_norm,
+            damping=damping,
+            decay=self.lit_config.nqs_spring_decay,
+            qfi_trace=qfi_trace,
+        )
+        return updates, spring_state, damping, optimizer_diagnostics
 
     def _weighted_sr_updates_from_scores(
         self,
@@ -4840,6 +5103,7 @@ class MoleculeLITWorkflow(Workflow):
         self,
         response_apply,
         ground_logpsi,
+        batched_data,
         *,
         axis: int,
     ):
@@ -4860,7 +5124,15 @@ class MoleculeLITWorkflow(Workflow):
         if cache is None:
             cache = {}
             self._nqs_chunk_sums_kernel_cache = cache
-        key = (id(response_apply), id(ground_logpsi), int(axis))
+        data_parallel = self._nqs_data_parallel_enabled()
+        device_count = jax.local_device_count() if data_parallel else 1
+        key = (
+            id(response_apply),
+            id(ground_logpsi),
+            int(axis),
+            data_parallel,
+            device_count,
+        )
         cached = cache.get(key)
         if (
             cached is not None
@@ -4869,8 +5141,7 @@ class MoleculeLITWorkflow(Workflow):
         ):
             return cached[2]
 
-        @jax.jit
-        def chunk_sums(
+        def chunk_sums_impl(
             local_params,
             local_ground_params,
             chunk,
@@ -4880,7 +5151,7 @@ class MoleculeLITWorkflow(Workflow):
             local_eta,
             local_source_floor,
         ):
-            return nqs_lit_source_sampled_sums(
+            sums = nqs_lit_source_sampled_sums(
                 response_apply,
                 local_params,
                 ground_logpsi,
@@ -4893,6 +5164,32 @@ class MoleculeLITWorkflow(Workflow):
                 eta=local_eta,
                 source_floor=local_source_floor,
             )
+            if data_parallel:
+                sums = _merge_source_sums_across_devices(sums)
+            return sums
+
+        if data_parallel:
+            chunk_sums = parallel_jax.jit_sharded(
+                chunk_sums_impl,
+                in_specs=(
+                    parallel_jax.SHARE_PARTITION,
+                    parallel_jax.SHARE_PARTITION,
+                    batched_data.partition_spec,
+                    parallel_jax.SHARE_PARTITION,
+                    parallel_jax.SHARE_PARTITION,
+                    parallel_jax.SHARE_PARTITION,
+                    parallel_jax.SHARE_PARTITION,
+                    parallel_jax.SHARE_PARTITION,
+                ),
+                out_specs=parallel_jax.SHARE_PARTITION,
+                check_vma=True,
+            )
+            logger.info(
+                "Configured held-out NQS-LIT data parallelism devices=%d",
+                device_count,
+            )
+        else:
+            chunk_sums = jax.jit(chunk_sums_impl)
 
         cache[key] = (response_apply, ground_logpsi, chunk_sums)
         return chunk_sums
@@ -4912,9 +5209,14 @@ class MoleculeLITWorkflow(Workflow):
         omega,
     ):
         chunk_size = self._nqs_eval_batch_size()
+        self._validate_data_parallel_batch(
+            batched_data,
+            purpose="held-out evaluation pool",
+        )
         chunk_sums = self._nqs_chunk_sums_kernel(
             response_apply,
             ground_logpsi,
+            batched_data,
             axis=axis,
         )
         source_center_array = jnp.asarray(source_center)
@@ -4922,18 +5224,39 @@ class MoleculeLITWorkflow(Workflow):
         omega_array = jnp.asarray(omega)
         eta_array = jnp.asarray(self.lit_config.eta)
         source_floor_array = jnp.asarray(self.lit_config.nqs_source_floor)
+        kernel_response_params = response_params
+        kernel_ground_params = ground_params
+        kernel_source_center = source_center_array
+        kernel_ground_energy = ground_energy_array
+        kernel_omega = omega_array
+        kernel_eta = eta_array
+        kernel_source_floor = source_floor_array
+        if self._nqs_data_parallel_enabled():
+            kernel_response_params = _replicate_across_local_devices(response_params)
+            kernel_ground_params = _replicate_across_local_devices(ground_params)
+            kernel_source_center = _replicate_across_local_devices(source_center_array)
+            kernel_ground_energy = _replicate_across_local_devices(ground_energy_array)
+            kernel_omega = _replicate_across_local_devices(omega_array)
+            kernel_eta = _replicate_across_local_devices(eta_array)
+            kernel_source_floor = _replicate_across_local_devices(source_floor_array)
 
         total_sums = None
         for chunk in _batched_data_chunks(batched_data, chunk_size):
+            self._validate_data_parallel_batch(chunk, purpose="evaluation")
+            kernel_chunk = (
+                _shard_batched_data_across_local_devices(chunk)
+                if self._nqs_data_parallel_enabled()
+                else chunk
+            )
             sums = chunk_sums(
-                response_params,
-                ground_params,
-                chunk,
-                source_center_array,
-                ground_energy_array,
-                omega_array,
-                eta_array,
-                source_floor_array,
+                kernel_response_params,
+                kernel_ground_params,
+                kernel_chunk,
+                kernel_source_center,
+                kernel_ground_energy,
+                kernel_omega,
+                kernel_eta,
+                kernel_source_floor,
             )
             total_sums = (
                 sums if total_sums is None else _add_source_sums(total_sums, sums)
@@ -5236,6 +5559,89 @@ class MoleculeLITWorkflow(Workflow):
         if configured > 0:
             return configured
         return max(1, int(self.config.batch_size))
+
+    def _nqs_data_parallel_enabled(self) -> bool:
+        return self._nqs_data_parallel_mode() == "local_devices"
+
+    def _nqs_data_parallel_mode(self) -> str:
+        # YAML 1.1 parsers commonly decode an unquoted ``off`` as ``False``.
+        # Preserve that established spelling without accepting ``True`` as a
+        # second, underspecified parallel mode.
+        configured = self.lit_config.nqs_data_parallel
+        if configured is False:
+            return "off"
+        return str(configured).lower()
+
+    def _validate_data_parallel_batch_size(
+        self,
+        batch_size: int,
+        *,
+        purpose: str,
+    ) -> None:
+        if not self._nqs_data_parallel_enabled():
+            return
+        device_count = jax.local_device_count()
+        if batch_size < device_count or batch_size % device_count != 0:
+            msg = (
+                f"Data-parallel NQS-LIT {purpose} batch size {batch_size} must "
+                f"be a positive multiple of the {device_count} local devices."
+            )
+            raise ValueError(msg)
+
+    def _validate_data_parallel_batch(self, batched_data, *, purpose: str) -> None:
+        self._validate_data_parallel_batch_size(
+            int(batched_data.batch_size),
+            purpose=purpose,
+        )
+
+    def _validate_data_parallel_source_pools(
+        self,
+        train_pool,
+        eval_pool,
+    ) -> None:
+        """Fail before covariance checks or training if reused pools cannot shard."""
+        if not self._nqs_data_parallel_enabled():
+            return
+        train_batch_size = min(
+            self._nqs_train_update_batch_size(),
+            int(train_pool.batch_size),
+        )
+        self._validate_data_parallel_batch_size(
+            train_batch_size,
+            purpose="training update",
+        )
+        # The last held-out chunk has size ``pool % eval_batch``.  Since the
+        # configured eval batch was checked above, requiring the complete pool
+        # to shard evenly is exactly the condition that also makes this tail
+        # safe for shard_map.  This catches stale/reused pools immediately.
+        self._validate_data_parallel_batch(
+            eval_pool,
+            purpose="held-out evaluation pool",
+        )
+
+    def _data_parallel_source_update_kernel(self, source_update, update_batch):
+        self._validate_data_parallel_batch(update_batch, purpose="training")
+        device_count = jax.local_device_count()
+        logger.info(
+            "Compiling single-frequency NQS-LIT data parallelism devices=%d "
+            "global_train_batch=%d local_train_batch=%d",
+            device_count,
+            int(update_batch.batch_size),
+            int(update_batch.batch_size) // device_count,
+        )
+        return parallel_jax.jit_sharded(
+            source_update,
+            in_specs=(
+                parallel_jax.SHARE_PARTITION,
+                parallel_jax.SHARE_PARTITION,
+                update_batch.partition_spec,
+                parallel_jax.SHARE_PARTITION,
+                parallel_jax.SHARE_PARTITION,
+                parallel_jax.SHARE_PARTITION,
+            ),
+            out_specs=parallel_jax.SHARE_PARTITION,
+            check_vma=True,
+        )
 
     def _init_direct_psi_state(self, batched_data, rng) -> _DirectPsiState:
         rng, sample_rng = jax.random.split(rng)
@@ -6212,6 +6618,7 @@ _CONTINUATION_STATE_CONFIG_EXCLUSIONS = frozenset(
         "nqs_source_pool_dir",
         "nqs_reuse_source_pool",
         "nqs_save_source_pool",
+        "nqs_data_parallel",
         "nqs_iterations",
         "nqs_continuation_iterations",
         "nqs_continuation_iteration_schedule",
@@ -6825,6 +7232,30 @@ def _tile_batched_data(pool: BatchedData, repeats: int) -> BatchedData:
     )
 
 
+def _replicate_across_local_devices(value):
+    """Place a pytree with replicated sharding on the local device mesh.
+
+    Returns:
+        The same logical value with ``PartitionSpec()`` sharding.
+    """
+    return jax.device_put(
+        value,
+        parallel_jax.make_sharding(parallel_jax.SHARE_PARTITION),
+    )
+
+
+def _shard_batched_data_across_local_devices(pool: BatchedData) -> BatchedData:
+    """Place batch fields across the local mesh and replicate shared fields.
+
+    Returns:
+        The unchanged global batch with its declared partitioning applied.
+    """
+    return jax.device_put(
+        pool,
+        parallel_jax.make_sharding(pool.partition_spec),
+    )
+
+
 def _slice_batched_data(pool: BatchedData, start: int, size: int) -> BatchedData:
     if size < 1:
         msg = "BatchedData chunk size must be positive."
@@ -6936,6 +7367,198 @@ def _add_source_sums(left, right):
                 right_factor,
             )
         ),
+    )
+
+
+def _merge_source_sums_across_devices(
+    local_sums: NQSLITSourceSums,
+    *,
+    axis_name: str = parallel_jax.BATCH_AXIS_NAME,
+) -> NQSLITSourceSums:
+    """Merge independently scaled source moments across data-parallel shards.
+
+    Each shard chooses its own overflow-safe ``ratio_scale``.  Scale-sensitive
+    moments must therefore be converted to a common global scale before the
+    collective sum; directly applying ``psum`` to every field is incorrect.
+
+    Returns:
+        Source moments for the unchanged global Monte Carlo batch, replicated
+        on every device in ``axis_name``.
+    """
+    local_has_ratio_mass = (
+        (local_sums.ratio_abs2_sum > 0.0)
+        | (local_sums.psi_weight_sum > 0.0)
+        | (jnp.abs(local_sums.ratio_sum) > 0.0)
+    )
+    local_scale = jnp.where(
+        local_has_ratio_mass,
+        local_sums.ratio_scale,
+        jnp.asarray(0.0, dtype=local_sums.ratio_scale.dtype),
+    )
+    scale = jax.lax.pmax(local_scale, axis_name=axis_name)
+    scale = jnp.where(
+        scale > 0.0,
+        scale,
+        jnp.asarray(1.0, dtype=scale.dtype),
+    )
+    tiny = jnp.asarray(jnp.finfo(scale.dtype).tiny, dtype=scale.dtype)
+    factor = local_sums.ratio_scale / jnp.maximum(scale, tiny)
+    factor = jnp.where(local_has_ratio_mass, factor, 0.0)
+    factor_sq = factor**2
+    safe_factor = jnp.maximum(factor, tiny)
+
+    merged = jax.tree.map(
+        lambda value: jax.lax.psum(value, axis_name=axis_name),
+        local_sums,
+    )
+    return merged._replace(
+        ratio_scale=scale,
+        ratio_sum=jax.lax.psum(
+            factor * local_sums.ratio_sum,
+            axis_name=axis_name,
+        ),
+        ratio_abs2_sum=jax.lax.psum(
+            factor_sq * local_sums.ratio_abs2_sum,
+            axis_name=axis_name,
+        ),
+        psi_weight_sum=jax.lax.psum(
+            factor_sq * local_sums.psi_weight_sum,
+            axis_name=axis_name,
+        ),
+        psi_weight_sq_sum=jax.lax.psum(
+            factor_sq**2 * local_sums.psi_weight_sq_sum,
+            axis_name=axis_name,
+        ),
+        psi_log_ratio_abs2_sum=jax.lax.psum(
+            factor_sq
+            * (
+                local_sums.psi_log_ratio_abs2_sum
+                + 2.0 * jnp.log(safe_factor) * local_sums.psi_weight_sum
+            ),
+            axis_name=axis_name,
+        ),
+    )
+
+
+def _solve_sr_direction_data_parallel(
+    local_score_aug,
+    grad_flat,
+    damping,
+    *,
+    device_count: int,
+    local_kernel_null_vectors=None,
+    kernel_projector_scale=1.0,
+    axis_name: str = parallel_jax.BATCH_AXIS_NAME,
+):
+    """Solve the exact global SR system without gathering the full score.
+
+    The dual branch redistributes parameter columns with ``all_to_all``.  Each
+    device therefore owns all global sample rows for only a fraction of the
+    parameters, constructs one Gram contribution, and replicates only the
+    ``O(batch**2)`` kernel and Cholesky factor.
+
+    Returns:
+        The replicated flattened SR direction.
+
+    Raises:
+        ValueError: If ``device_count`` is not positive.
+    """
+    if device_count < 1:
+        msg = "device_count must be positive."
+        raise ValueError(msg)
+    parameter_count = int(grad_flat.shape[0])
+    local_sample_count = int(local_score_aug.shape[0])
+    sample_count = local_sample_count * int(device_count)
+    original_dtype = grad_flat.dtype
+    with _enable_x64(True):
+        solve_dtype = jnp.float64
+        score_solve = local_score_aug.astype(solve_dtype)
+        grad_solve = grad_flat.astype(solve_dtype)
+        damping_solve = jnp.asarray(damping, dtype=solve_dtype)
+        if parameter_count <= sample_count:
+            metric = jax.lax.psum(
+                score_solve.T @ score_solve,
+                axis_name=axis_name,
+            )
+            metric = (metric + metric.T) / 2.0
+            metric = metric + damping_solve * jnp.eye(
+                parameter_count,
+                dtype=solve_dtype,
+            )
+            chol = jsp.linalg.cho_factor(metric, lower=True)
+            direction = jsp.linalg.cho_solve(chol, grad_solve)
+        else:
+            padded_parameter_count = (
+                (parameter_count + device_count - 1) // device_count
+            ) * device_count
+            score_padded = jnp.pad(
+                score_solve,
+                ((0, 0), (0, padded_parameter_count - parameter_count)),
+            )
+            score_by_parameter = jax.lax.all_to_all(
+                score_padded,
+                axis_name=axis_name,
+                split_axis=1,
+                concat_axis=0,
+                tiled=True,
+            )
+            kernel = jax.lax.psum(
+                score_by_parameter @ score_by_parameter.T,
+                axis_name=axis_name,
+            )
+            kernel = (kernel + kernel.T) / 2.0
+            if local_kernel_null_vectors is not None:
+                null_vectors = jax.lax.all_gather(
+                    jnp.asarray(local_kernel_null_vectors, dtype=solve_dtype),
+                    axis_name=axis_name,
+                    axis=1,
+                    tiled=True,
+                )
+                null_norm = jnp.linalg.norm(null_vectors, axis=1, keepdims=True)
+                normalized_null = jnp.where(
+                    null_norm > 0.0,
+                    null_vectors
+                    / jnp.maximum(
+                        null_norm,
+                        jnp.asarray(jnp.finfo(solve_dtype).tiny, dtype=solve_dtype),
+                    ),
+                    jnp.asarray(0.0, dtype=solve_dtype),
+                )
+                kernel = kernel + jnp.asarray(
+                    kernel_projector_scale,
+                    dtype=solve_dtype,
+                ) * (normalized_null.T @ normalized_null)
+            kernel = (kernel + kernel.T) / 2.0
+            kernel = kernel + damping_solve * jnp.eye(
+                sample_count,
+                dtype=solve_dtype,
+            )
+            local_rhs = score_solve @ grad_solve
+            rhs = jax.lax.all_gather(
+                local_rhs,
+                axis_name=axis_name,
+                axis=0,
+                tiled=True,
+            )
+            chol = jsp.linalg.cho_factor(kernel, lower=True)
+            alpha = jsp.linalg.cho_solve(chol, rhs)
+            alpha_start = jax.lax.axis_index(axis_name) * local_sample_count
+            local_alpha = jax.lax.dynamic_slice_in_dim(
+                alpha,
+                alpha_start,
+                local_sample_count,
+                axis=0,
+            )
+            projected = jax.lax.psum(
+                score_solve.T @ local_alpha,
+                axis_name=axis_name,
+            )
+            direction = (grad_solve - projected) / damping_solve
+        direction = direction.astype(original_dtype)
+    return jnp.where(
+        jnp.all(jnp.isfinite(direction)),
+        direction,
+        jnp.zeros_like(direction),
     )
 
 
@@ -7155,6 +7778,7 @@ def _regularized_action_gradient(
     *,
     reverse_kl_weight: float | jnp.ndarray,
     eps: float | jnp.ndarray,
+    axis_name: str | None = None,
 ):
     """Return the PRL fidelity-minus-reverse-KL action-state gradient.
 
@@ -7179,9 +7803,22 @@ def _regularized_action_gradient(
         source_weight,
         jnp.asarray(0.0, dtype=source_weight.dtype),
     )
-    safe_weight_sum = jnp.maximum(jnp.sum(source_weight), eps_array)
+
+    def global_sum(value, *, axis=None, keepdims=False):
+        reduced = jnp.sum(value, axis=axis, keepdims=keepdims)
+        if axis_name is not None:
+            reduced = jax.lax.psum(reduced, axis_name=axis_name)
+        return reduced
+
+    def global_max(value):
+        reduced = jnp.max(value)
+        if axis_name is not None:
+            reduced = jax.lax.pmax(reduced, axis_name=axis_name)
+        return reduced
+
+    safe_weight_sum = jnp.maximum(global_sum(source_weight), eps_array)
     phi_weight = source_weight / safe_weight_sum
-    max_ratio_abs = jnp.max(jnp.where(phi_weight > 0.0, jnp.abs(ratio), 0.0))
+    max_ratio_abs = global_max(jnp.where(phi_weight > 0.0, jnp.abs(ratio), 0.0))
     ratio_scale = jnp.where(
         max_ratio_abs > 0.0,
         max_ratio_abs,
@@ -7189,15 +7826,19 @@ def _regularized_action_gradient(
     )
     scaled_ratio = ratio / jax.lax.stop_gradient(ratio_scale)
     ratio_abs2 = jnp.abs(scaled_ratio) ** 2
-    ratio_norm = jnp.sum(phi_weight * ratio_abs2)
+    ratio_norm = global_sum(phi_weight * ratio_abs2)
     safe_ratio_norm = jnp.maximum(ratio_norm, eps_array)
     has_action_mass = jnp.isfinite(ratio_norm) & (ratio_norm > 0.0)
     psi_weight = phi_weight * ratio_abs2 / safe_ratio_norm
 
-    score_mean = jnp.sum(psi_weight[:, None] * score, axis=0, keepdims=True)
+    score_mean = global_sum(
+        psi_weight[:, None] * score,
+        axis=0,
+        keepdims=True,
+    )
     centered_score = score - score_mean
-    amplitude = jnp.sum(phi_weight * scaled_ratio)
-    score_covariance = jnp.sum(
+    amplitude = global_sum(phi_weight * scaled_ratio)
+    score_covariance = global_sum(
         phi_weight[:, None] * scaled_ratio[:, None] * centered_score,
         axis=0,
     )
@@ -7206,10 +7847,10 @@ def _regularized_action_gradient(
     )
 
     log_ratio_abs2 = 2.0 * jnp.log(jnp.maximum(jnp.abs(scaled_ratio), eps_array))
-    log_ratio_mean = jnp.sum(psi_weight * log_ratio_abs2)
+    log_ratio_mean = global_sum(psi_weight * log_ratio_abs2)
     centered_log_ratio = log_ratio_abs2 - log_ratio_mean
     reverse_kl_gradient = 2.0 * jnp.real(
-        jnp.sum(
+        global_sum(
             psi_weight[:, None] * centered_score * centered_log_ratio[:, None],
             axis=0,
         )
@@ -7289,6 +7930,58 @@ def _spring_direction_chunked(
         rhs,
         damping,
         kernel_null_vectors=kernel_null_vectors,
+    )
+    valid_system = (
+        jnp.isfinite(qfi_trace)
+        & (qfi_trace > 0.0)
+        & jnp.isfinite(damping)
+        & jnp.all(jnp.isfinite(grad_flat))
+        & jnp.all(jnp.isfinite(state.previous_direction))
+        & jnp.all(jnp.isfinite(direction))
+    )
+    direction = jnp.where(valid_system, direction, jnp.zeros_like(direction))
+    return (
+        direction,
+        _SpringState(previous_direction=jax.lax.stop_gradient(direction)),
+        damping,
+    )
+
+
+def _spring_direction_data_parallel(
+    local_score_aug,
+    grad_flat,
+    state: _SpringState,
+    *,
+    epsilon_scale: float | jnp.ndarray,
+    damping_floor: float | jnp.ndarray,
+    decay: float | jnp.ndarray,
+    device_count: int,
+    qfi_trace,
+    local_kernel_null_vectors=None,
+    axis_name: str = parallel_jax.BATCH_AXIS_NAME,
+):
+    """Apply SPRING to a row-sharded score matrix.
+
+    Returns:
+        Replicated direction, replicated next history state, and damping.
+    """
+    parameter_count = jnp.asarray(max(int(grad_flat.shape[0]), 1), grad_flat.dtype)
+    mean_metric_diagonal = qfi_trace / parameter_count
+    damping = jnp.maximum(
+        jnp.asarray(epsilon_scale, dtype=grad_flat.dtype) * mean_metric_diagonal,
+        jnp.asarray(damping_floor, dtype=grad_flat.dtype),
+    )
+    rhs = (
+        grad_flat
+        + damping * jnp.asarray(decay, dtype=grad_flat.dtype) * state.previous_direction
+    )
+    direction = _solve_sr_direction_data_parallel(
+        local_score_aug,
+        rhs,
+        damping,
+        device_count=device_count,
+        local_kernel_null_vectors=local_kernel_null_vectors,
+        axis_name=axis_name,
     )
     valid_system = (
         jnp.isfinite(qfi_trace)

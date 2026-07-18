@@ -116,6 +116,36 @@ def test_parallel_frequency_modes_are_rejected(mode):
         workflow._validate_config()
 
 
+def test_single_frequency_data_parallel_mode_is_valid():
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(
+        nqs_data_parallel="local_devices",
+        nqs_direct_psi_train=False,
+    )
+
+    workflow._validate_config()
+
+
+@pytest.mark.parametrize("mode", ["auto", "distributed", "local_workers"])
+def test_unknown_single_frequency_data_parallel_modes_are_rejected(mode):
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(nqs_data_parallel=mode)
+
+    with pytest.raises(ValueError, match="nqs_data_parallel"):
+        workflow._validate_config()
+
+
+def test_data_parallel_direct_psi_fallback_is_rejected():
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(
+        nqs_data_parallel="local_devices",
+        nqs_direct_psi_train=True,
+    )
+
+    with pytest.raises(ValueError, match="nqs_direct_psi_train=false"):
+        workflow._validate_config()
+
+
 def test_batched_data_chunks_cover_pool_and_cycle():
     pool = BatchedData(
         data=MoleculeData(

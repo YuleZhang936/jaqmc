@@ -47,10 +47,21 @@ when needed. The nuclear article does not publish its hidden `-100` to `200 MeV`
 transfer grid; this adaptive rule makes that missing engineering choice explicit
 without pretending that one large jump is frequency continuation.
 
-Frequency blocks, local multi-GPU workers, and remote worker blocks are rejected:
-they break this predecessor chain at block boundaries. Use
-`lit.scan_parallel=off`. Source-pool evaluation can still be vectorized by JAX,
-but one global response-parameter chain is maintained.
+Frequency blocks and remote frequency workers are rejected because they break
+this predecessor chain at block boundaries. Use `lit.scan_parallel=off`.
+Within one frequency, `lit.nqs_data_parallel=local_devices` instead shards the
+unchanged global Monte Carlo batch across every GPU visible to one process. All
+normalizations and action-state gradients are reduced globally; SPRING uses a
+distributed score matrix but one replicated direction and history. Thus a
+global batch of 1024 on eight GPUs means 128 walkers per GPU, not 8192 walkers,
+and the response-parameter continuation chain remains unique. This mode
+requires source-sampled training (`nqs_direct_psi_train: false`), a batch size
+divisible by the local device count, and one JAX process on one worker. Both
+the configured global training-update and evaluation chunk sizes are checked
+at startup, before sampling. A reused held-out source pool must also have a
+total walker count divisible by the device count so its final evaluation chunk
+can be sharded; this pool-size check runs immediately after loading, before
+covariance evaluation or response training.
 
 The published stabilization objective is
 `fidelity - lambda * KL(pi_action || pi_source)`. The defaults use
@@ -208,6 +219,8 @@ lit:
   nqs_pool_stride: 4
   nqs_train_update_batch_size: 4096
   nqs_eval_batch_size: 4096
+  # Optional: shard each single-frequency batch across all locally visible GPUs.
+  nqs_data_parallel: "off"
   nqs_reuse_source_pool: true
   nqs_save_source_pool: true
 
