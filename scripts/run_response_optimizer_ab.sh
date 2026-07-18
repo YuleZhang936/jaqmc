@@ -266,6 +266,7 @@ for residual_scale_raw in "${residual_scales[@]}"; do
       "lit.nqs_log_interval=$log_interval" \
       "lit.omega_values=[$probe_omega]" \
       lit.nqs_continuation_iterations=1 \
+      'lit.nqs_continuation_iteration_schedule=[1]' \
       lit.nqs_iterations=1 \
       2>&1 | tee -a "$log_path"
     status=${PIPESTATUS[0]}

@@ -234,6 +234,10 @@ lit:
   nqs_warm_start_omega: -3.674932217565499
   nqs_warm_start_iterations: 800
   nqs_continuation_iterations: 800
+  # Optional cumulative quality-check milestones on the same optimizer
+  # trajectory. The first entry must equal nqs_continuation_iterations.
+  # Only a pure fidelity miss extends to the next milestone.
+  nqs_continuation_iteration_schedule: null
   nqs_continuation_step_fraction: 0.2
   nqs_continuation_fidelity_retention: 0.95
   # null uses min(0.2 * eta, the reported spectrum spacing).

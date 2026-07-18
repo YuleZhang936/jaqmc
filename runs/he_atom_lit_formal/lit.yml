@@ -88,6 +88,12 @@ lit:
   # using |delta omega| sqrt(L / ||Phi||^2) <= 0.2, then verify on held-out
   # samples and bisect any step whose inherited fidelity drops too far.
   nqs_continuation_iterations: 1500
+  # Cumulative milestones on one uninterrupted optimizer trajectory.  If no
+  # selectable held-out checkpoint reaches the fidelity floor by 1500 or 3000,
+  # a pure fidelity miss keeps the live parameters, SPRING carry, and RNG and
+  # extends to the next milestone.  ESS/numerical failures fail closed.  Only
+  # exhausting 6000 iterations without a passing checkpoint triggers bisection.
+  nqs_continuation_iteration_schedule: [1500, 3000, 6000]
   nqs_continuation_step_fraction: 0.2
   # Reuse the last accepted bridge step.  Grow by at most 25% only after a
   # clean, unbisected success; a recovered step is held for the next proposal.

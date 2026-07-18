@@ -14,6 +14,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from functools import partial
+from itertools import pairwise
 from typing import Any, NamedTuple
 from zipfile import BadZipFile
 
@@ -145,6 +146,13 @@ class MolecularLITConfig:
     nqs_warm_start_omega: float | None = -3.674932217565499
     nqs_warm_start_iterations: int = 100
     nqs_continuation_iterations: int = 100
+    # Optional cumulative quality-check milestones for one uninterrupted
+    # continuation optimization.  The first milestone must equal
+    # nqs_continuation_iterations.  If no selectable held-out checkpoint has
+    # met the fidelity floor by a milestone, a pure fidelity miss extends the
+    # same parameter/SPRING/RNG trajectory; ESS or numerical failures remain
+    # fail-closed.
+    nqs_continuation_iteration_schedule: tuple[int, ...] | None = None
     nqs_continuation_step_fraction: float = 0.2
     # Cap the next proposal by the latest accepted bridge step.  A clean
     # bridge may grow that cap by this factor; any bisected/recovered bridge
@@ -1025,6 +1033,10 @@ class MoleculeLITWorkflow(Workflow):
                 dtype=np.bool_,
             ),
             nqs_continuation_iterations=self.lit_config.nqs_continuation_iterations,
+            nqs_continuation_iteration_schedule=np.asarray(
+                _continuation_iteration_schedule(self.lit_config),
+                dtype=np.int64,
+            ),
             nqs_continuation_step_fraction=(
                 self.lit_config.nqs_continuation_step_fraction
             ),
@@ -1258,6 +1270,7 @@ class MoleculeLITWorkflow(Workflow):
         if self.lit_config.nqs_continuation_iterations < 1:
             msg = "lit.nqs_continuation_iterations must be positive."
             raise ValueError(msg)
+        _continuation_iteration_schedule(self.lit_config)
         step_fraction = self.lit_config.nqs_continuation_step_fraction
         if not np.isfinite(step_fraction) or step_fraction <= 0.0:
             msg = "lit.nqs_continuation_step_fraction must be positive."
@@ -2196,7 +2209,7 @@ class MoleculeLITWorkflow(Workflow):
             source_covariance_max_loss=covariance_metrics.max_loss,
         )
 
-    def _optimize_nqs_frequency(
+    def _optimize_nqs_frequency(  # noqa: C901
         self,
         update_step,
         initial_params,
@@ -2215,8 +2228,18 @@ class MoleculeLITWorkflow(Workflow):
         omega: float,
         iterations: int,
         stage: str,
+        quality_check_iterations: tuple[int, ...] | None = None,
     ):
         """Optimize one frequency and select parameters on a fixed eval pool.
+
+        ``quality_check_iterations`` contains cumulative milestones on one
+        uninterrupted optimizer trajectory.  At an intermediate milestone,
+        when the legacy held-out model selection has found no passing checkpoint,
+        a pure fidelity miss continues with the live parameters, SPRING carry,
+        and RNG.  Every other quality failure remains fail-closed.  Numerical,
+        covariance, and ESS health are also checked on the live parameters at
+        each milestone, so an earlier selected checkpoint cannot hide an
+        unhealthy current trajectory.
 
         Returns:
             Best parameters, their held-out statistics, selected iteration,
@@ -2245,6 +2268,17 @@ class MoleculeLITWorkflow(Workflow):
                     getattr(update_step, "source_covariance_loss", None),
                 ),
             )
+
+        iteration_schedule = _nqs_quality_check_iteration_schedule(
+            iterations,
+            quality_check_iterations,
+        )
+        quality_check_indices = {
+            completed: index for index, completed in enumerate(iteration_schedule)
+        }
+        maximum_iterations = iteration_schedule[-1]
+        executed_iterations = maximum_iterations
+        staged_quality_checks = len(iteration_schedule) > 1
 
         response_params = initial_params
         update_carry = update_step.init_carry(fallback_data, rng, response_params)
@@ -2275,7 +2309,7 @@ class MoleculeLITWorkflow(Workflow):
             selected_stats = best_stats
         last_train_stats = None
         last_optimizer_diagnostics = None
-        for iteration in range(max(0, int(iterations))):
+        for iteration in range(maximum_iterations):
             response_params, last_train_stats, update_carry = update_step(
                 response_params,
                 train_pool,
@@ -2291,8 +2325,9 @@ class MoleculeLITWorkflow(Workflow):
             completed = iteration + 1
             should_select = (
                 completed % self.lit_config.nqs_selection_interval == 0
-                or completed == int(iterations)
+                or completed in quality_check_indices
             )
+            candidate_stats = None
             if should_select:
                 candidate_stats = jax.device_get(evaluate(response_params))
                 if _is_better_nqs_checkpoint(
@@ -2386,6 +2421,71 @@ class MoleculeLITWorkflow(Workflow):
                     omega=float(omega),
                     iteration=completed,
                 )
+            quality_check_index = quality_check_indices.get(completed)
+            if quality_check_index is None:
+                continue
+            if candidate_stats is None:
+                msg = (
+                    "Internal error: NQS quality milestone was not evaluated "
+                    f"at iteration {completed}."
+                )
+                raise RuntimeError(msg)
+            if staged_quality_checks:
+                _require_nqs_milestone_health(
+                    candidate_stats,
+                    max_source_covariance=maximum_covariance,
+                    min_reweight_ess_fraction=(
+                        self.lit_config.nqs_stage_reweight_ess_fraction_min
+                    ),
+                    context=(
+                        f"axis={_AXIS_NAMES[axis]} stage={stage} "
+                        f"omega={float(omega):.6f} iteration budget {completed}"
+                    ),
+                )
+            if quality_check_index == len(iteration_schedule) - 1:
+                continue
+            if selected_stats is not None and selected_params is not None:
+                executed_iterations = completed
+                break
+            _require_pure_fidelity_stage_miss(
+                best_stats,
+                max_source_covariance=maximum_covariance,
+                min_fidelity=required_fidelity,
+                min_reweight_ess_fraction=(
+                    self.lit_config.nqs_stage_reweight_ess_fraction_min
+                ),
+                eligibility_context=(
+                    f"axis={_AXIS_NAMES[axis]} stage={stage} "
+                    f"omega={float(omega):.6f} produced no eligible held-out "
+                    f"checkpoint by iteration {completed}"
+                ),
+                quality_context=(
+                    f"axis={_AXIS_NAMES[axis]} stage={stage} "
+                    f"omega={float(omega):.6f} failed its held-out quality "
+                    f"gate at iteration budget {completed} "
+                    f"(initial fidelity={initial_fidelity:.6f}, "
+                    "configured floor="
+                    f"{self.lit_config.nqs_stage_fidelity_min:.6f})"
+                ),
+                no_selection_context=(
+                    f"axis={_AXIS_NAMES[axis]} stage={stage} "
+                    f"omega={float(omega):.6f} produced no selectable "
+                    f"checkpoint by iteration {completed}"
+                ),
+            )
+            next_budget = iteration_schedule[quality_check_index + 1]
+            logger.info(
+                "axis=%s stage=%s omega=%.6f iteration_budget=%d "
+                "fidelity=%.6f ess=%.3f action=extend "
+                "next_iteration_budget=%d",
+                _AXIS_NAMES[axis],
+                stage,
+                float(omega),
+                completed,
+                float(best_stats.fidelity),
+                float(best_stats.reweight_ess_fraction),
+                next_budget,
+            )
         best_covariance_mean, best_covariance_max = _source_covariance_host_values(
             best_stats
         )
@@ -2447,7 +2547,7 @@ class MoleculeLITWorkflow(Workflow):
             stage,
             float(omega),
             best_iteration,
-            max(0, int(iterations)),
+            executed_iterations,
             float(best_stats.loss),
             float(best_stats.fidelity),
             float(best_stats.reverse_kl),
@@ -2960,6 +3060,9 @@ class MoleculeLITWorkflow(Workflow):
             ),
         )
         min_step = _continuation_min_step(self.lit_config, spectrum_omega)
+        continuation_iteration_schedule = _continuation_iteration_schedule(
+            self.lit_config
+        )
         records = list(existing_records)
         existing_optimized_count = sum(record.optimized for record in records)
         if existing_optimized_count > self.lit_config.nqs_continuation_max_points:
@@ -3124,8 +3227,9 @@ class MoleculeLITWorkflow(Workflow):
                         fallback_data,
                         rng,
                         omega=candidate_omega,
-                        iterations=self.lit_config.nqs_continuation_iterations,
+                        iterations=continuation_iteration_schedule[-1],
                         stage="continuation",
+                        quality_check_iterations=continuation_iteration_schedule,
                         **common,
                     )
                 except _NQSStageQualityError as error:
@@ -5651,6 +5755,109 @@ def _continuation_retry_step_or_raise(
     return max(min_step, 0.5 * actual_step)
 
 
+def _continuation_iteration_schedule(
+    config: MolecularLITConfig,
+) -> tuple[int, ...]:
+    """Return validated cumulative continuation quality-check milestones.
+
+    A missing schedule preserves the legacy single-budget behavior.  An
+    explicit schedule repeats the scalar first budget deliberately, so a CLI
+    override of only ``nqs_continuation_iterations`` fails instead of silently
+    inheriting stale extension budgets.
+
+    Raises:
+        ValueError: If a milestone is not a positive integer, the milestones
+            are not strictly increasing, or the first milestone disagrees
+            with ``nqs_continuation_iterations``.
+    """
+    first = config.nqs_continuation_iterations
+    if (
+        isinstance(first, (bool, np.bool_))
+        or not isinstance(
+            first,
+            (int, np.integer),
+        )
+        or int(first) < 1
+    ):
+        msg = "lit.nqs_continuation_iterations must be a positive integer."
+        raise ValueError(msg)
+    first = int(first)
+    configured = config.nqs_continuation_iteration_schedule
+    if configured is None:
+        return (first,)
+    try:
+        raw_schedule = tuple(configured)
+    except TypeError as error:
+        msg = (
+            "lit.nqs_continuation_iteration_schedule must be a nonempty "
+            "sequence of positive integers."
+        )
+        raise ValueError(msg) from error
+    if not raw_schedule:
+        msg = "lit.nqs_continuation_iteration_schedule must not be empty."
+        raise ValueError(msg)
+    if any(
+        isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))
+        for value in raw_schedule
+    ):
+        msg = (
+            "lit.nqs_continuation_iteration_schedule must contain only "
+            "positive integers."
+        )
+        raise ValueError(msg)
+    schedule = tuple(int(value) for value in raw_schedule)
+    if any(value < 1 for value in schedule):
+        msg = (
+            "lit.nqs_continuation_iteration_schedule must contain only "
+            "positive integers."
+        )
+        raise ValueError(msg)
+    if schedule[0] != first:
+        msg = (
+            "lit.nqs_continuation_iteration_schedule must start with "
+            f"lit.nqs_continuation_iterations={first}, got {schedule[0]}."
+        )
+        raise ValueError(msg)
+    if any(current >= following for current, following in pairwise(schedule)):
+        msg = "lit.nqs_continuation_iteration_schedule must be strictly increasing."
+        raise ValueError(msg)
+    return schedule
+
+
+def _nqs_quality_check_iteration_schedule(
+    iterations: int,
+    quality_check_iterations: tuple[int, ...] | None,
+) -> tuple[int, ...]:
+    """Validate optimizer-local cumulative quality-check milestones.
+
+    Returns:
+        The normalized strictly increasing milestone tuple.
+
+    Raises:
+        ValueError: If the maximum or milestones are invalid or disagree.
+    """
+    maximum = int(iterations)
+    if maximum < 1:
+        msg = "NQS optimizer iterations must be positive."
+        raise ValueError(msg)
+    if quality_check_iterations is None:
+        return (maximum,)
+    schedule = tuple(int(value) for value in quality_check_iterations)
+    if (
+        not schedule
+        or any(value < 1 for value in schedule)
+        or any(current >= following for current, following in pairwise(schedule))
+        or schedule[-1] != maximum
+    ):
+        msg = (
+            "NQS quality-check iterations must be positive, strictly "
+            "increasing cumulative milestones ending at the optimizer "
+            f"maximum {maximum}, got {schedule}."
+        )
+        raise ValueError(msg)
+    return schedule
+
+
 def _physics_continuation_step(stats, *, gap: float, fraction: float, min_step: float):
     """Choose a homotopy step from the inherited LIT residual estimate.
 
@@ -5745,6 +5952,63 @@ def _require_nqs_stage_quality(
             fidelity_failed=fidelity_failed,
             ess_failed=ess_failed,
         )
+
+
+def _require_pure_fidelity_stage_miss(
+    stats,
+    *,
+    max_source_covariance: float | None,
+    min_fidelity: float,
+    min_reweight_ess_fraction: float,
+    eligibility_context: str,
+    quality_context: str,
+    no_selection_context: str,
+) -> None:
+    """Allow extension only when an intermediate stage misses fidelity alone.
+
+    Raises:
+        _NQSStageQualityError: If ESS fails, either alone or with fidelity.
+        RuntimeError: If the checkpoint is ineligible, or unexpectedly passes
+            every quality gate despite no selectable checkpoint being stored.
+    """
+    _require_eligible_nqs_checkpoint(
+        stats,
+        max_source_covariance=max_source_covariance,
+        context=eligibility_context,
+    )
+    try:
+        _require_nqs_stage_quality(
+            stats,
+            min_fidelity=min_fidelity,
+            min_reweight_ess_fraction=min_reweight_ess_fraction,
+            context=quality_context,
+        )
+    except _NQSStageQualityError as error:
+        if error.fidelity_failed and not error.ess_failed:
+            return
+        raise
+    raise RuntimeError(f"{no_selection_context}.")
+
+
+def _require_nqs_milestone_health(
+    stats,
+    *,
+    max_source_covariance: float | None,
+    min_reweight_ess_fraction: float,
+    context: str,
+) -> None:
+    """Fail closed on numerical, covariance, or ESS milestone failures."""
+    _require_eligible_nqs_checkpoint(
+        stats,
+        max_source_covariance=max_source_covariance,
+        context=f"{context} produced an ineligible held-out checkpoint",
+    )
+    _require_nqs_stage_quality(
+        stats,
+        min_fidelity=0.0,
+        min_reweight_ess_fraction=min_reweight_ess_fraction,
+        context=f"{context} failed its held-out estimator-health gate",
+    )
 
 
 def _continuation_probe_is_acceptable(
@@ -5950,6 +6214,7 @@ _CONTINUATION_STATE_CONFIG_EXCLUSIONS = frozenset(
         "nqs_save_source_pool",
         "nqs_iterations",
         "nqs_continuation_iterations",
+        "nqs_continuation_iteration_schedule",
         "nqs_continuation_step_fraction",
         "nqs_continuation_step_growth_factor",
         "nqs_continuation_fidelity_retention",
