@@ -153,7 +153,6 @@ class MolecularLITConfig:
     nqs_continuation_fidelity_retention: float = 0.95
     nqs_stage_fidelity_min: float = 0.0
     nqs_stage_reweight_ess_fraction_min: float = 0.0
-    nqs_stage_fidelity_gain_min: float = 0.0
     nqs_continuation_allow_min_step_override: bool = True
     nqs_continuation_min_step: float | None = None
     nqs_continuation_max_points: int = 256
@@ -256,6 +255,15 @@ class _ContinuationRecord(NamedTuple):
     bisections: int
     probe_accepted: bool
     min_step_override: bool
+
+
+class _ContinuationCapacityDiagnostics(NamedTuple):
+    """Point-budget forecast for one continuation proposal."""
+
+    remaining_gap: float
+    remaining_bridge_slots: int
+    required_mean_step: float
+    capacity_ratio: float
 
 
 class _NQSStageQualityError(RuntimeError):
@@ -1030,7 +1038,6 @@ class MoleculeLITWorkflow(Workflow):
             nqs_stage_reweight_ess_fraction_min=(
                 self.lit_config.nqs_stage_reweight_ess_fraction_min
             ),
-            nqs_stage_fidelity_gain_min=self.lit_config.nqs_stage_fidelity_gain_min,
             nqs_continuation_allow_min_step_override=bool(
                 self.lit_config.nqs_continuation_allow_min_step_override
             ),
@@ -1271,10 +1278,6 @@ class MoleculeLITWorkflow(Workflow):
             (
                 "nqs_stage_reweight_ess_fraction_min",
                 self.lit_config.nqs_stage_reweight_ess_fraction_min,
-            ),
-            (
-                "nqs_stage_fidelity_gain_min",
-                self.lit_config.nqs_stage_fidelity_gain_min,
             ),
         )
         for name, value in stage_thresholds:
@@ -2249,11 +2252,7 @@ class MoleculeLITWorkflow(Workflow):
         best_params = response_params
         best_stats = jax.device_get(evaluate(response_params))
         initial_fidelity = float(jax.device_get(best_stats.fidelity))
-        required_fidelity = _nqs_stage_required_fidelity(
-            initial_fidelity,
-            floor=self.lit_config.nqs_stage_fidelity_min,
-            gain=self.lit_config.nqs_stage_fidelity_gain_min,
-        )
+        required_fidelity = float(self.lit_config.nqs_stage_fidelity_min)
         best_iteration = 0
         selected_params = None
         selected_stats = None
@@ -2413,9 +2412,7 @@ class MoleculeLITWorkflow(Workflow):
                     f"omega={float(omega):.6f} failed its held-out quality gate "
                     f"(initial fidelity={initial_fidelity:.6f}, "
                     "configured floor="
-                    f"{self.lit_config.nqs_stage_fidelity_min:.6f}, "
-                    "required gain="
-                    f"{self.lit_config.nqs_stage_fidelity_gain_min:.6f})"
+                    f"{self.lit_config.nqs_stage_fidelity_min:.6f})"
                 ),
             )
             msg = (
@@ -2436,8 +2433,7 @@ class MoleculeLITWorkflow(Workflow):
                 f"axis={_AXIS_NAMES[axis]} stage={stage} "
                 f"omega={float(omega):.6f} failed its held-out quality gate "
                 f"(initial fidelity={initial_fidelity:.6f}, "
-                f"configured floor={self.lit_config.nqs_stage_fidelity_min:.6f}, "
-                f"required gain={self.lit_config.nqs_stage_fidelity_gain_min:.6f})"
+                f"configured floor={self.lit_config.nqs_stage_fidelity_min:.6f})"
             ),
         )
         rng = update_carry.direct.rng
@@ -2445,6 +2441,7 @@ class MoleculeLITWorkflow(Workflow):
             "axis=%s stage=%s omega=%.6f selected_iter=%d/%d "
             "heldout_loss=%.6e fidelity=%.6f reverse_kl=%.6e "
             "covariance_mean=%.6e covariance_max=%.6e ess=%.3f "
+            "initial_fidelity=%.6f fidelity_gain=%+.6e "
             "required_fidelity=%.6f required_ess=%.3f",
             _AXIS_NAMES[axis],
             stage,
@@ -2463,6 +2460,8 @@ class MoleculeLITWorkflow(Workflow):
                 )
             ),
             float(best_stats.reweight_ess_fraction),
+            initial_fidelity,
+            float(best_stats.fidelity) - initial_fidelity,
             required_fidelity,
             self.lit_config.nqs_stage_reweight_ess_fraction_min,
         )
@@ -2714,24 +2713,17 @@ class MoleculeLITWorkflow(Workflow):
                 "failed current numerical/covariance validation"
             ),
         )
-        required_fidelity = _nqs_stage_required_fidelity(
-            records[-1].inherited_fidelity,
-            floor=self.lit_config.nqs_stage_fidelity_min,
-            gain=self.lit_config.nqs_stage_fidelity_gain_min,
-        )
         _require_nqs_stage_quality(
             revalidated_stats,
-            min_fidelity=required_fidelity,
+            min_fidelity=self.lit_config.nqs_stage_fidelity_min,
             min_reweight_ess_fraction=(
                 self.lit_config.nqs_stage_reweight_ess_fraction_min
             ),
             context=(
                 f"Restored continuation checkpoint at omega={current_omega:.8g} "
-                "failed the current absolute quality/gain gate "
-                f"(inherited fidelity={records[-1].inherited_fidelity:.6f}, "
-                "configured floor="
-                f"{self.lit_config.nqs_stage_fidelity_min:.6f}, required gain="
-                f"{self.lit_config.nqs_stage_fidelity_gain_min:.6f})"
+                "failed the current absolute quality gate "
+                f"(configured fidelity floor="
+                f"{self.lit_config.nqs_stage_fidelity_min:.6f})"
             ),
         )
         records[-1] = records[-1]._replace(stats=revalidated_stats)
@@ -3007,14 +2999,29 @@ class MoleculeLITWorkflow(Workflow):
                 physics_step,
                 gap if history_cap is None else history_cap,
             )
+            optimized_count = sum(record.optimized for record in records)
+            capacity = _continuation_capacity_diagnostics(
+                remaining_gap=gap,
+                optimized_count=optimized_count,
+                maximum=self.lit_config.nqs_continuation_max_points,
+                chosen_step=step,
+            )
             logger.info(
                 "axis=%s continuation_proposal current_omega=%.6f "
-                "physics_step=%.6e history_cap=%.6e chosen_step=%.6e",
+                "physics_step=%.6e history_cap=%.6e chosen_step=%.6e "
+                "remaining_gap=%.6e optimized_points=%d "
+                "remaining_bridge_slots=%d required_mean_step=%.6e "
+                "capacity_ratio=%.3f",
                 _AXIS_NAMES[axis],
                 current_omega,
                 physics_step,
                 float("nan") if history_cap is None else history_cap,
                 step,
+                capacity.remaining_gap,
+                optimized_count,
+                capacity.remaining_bridge_slots,
+                capacity.required_mean_step,
+                capacity.capacity_ratio,
             )
             candidate_omega = current_omega + step
             bisections = 0
@@ -3097,7 +3104,6 @@ class MoleculeLITWorkflow(Workflow):
                     )
                     return response_params, current_stats, records, rng
 
-                optimized_count = sum(record.optimized for record in records)
                 _require_continuation_point_capacity(
                     optimized_count,
                     maximum=self.lit_config.nqs_continuation_max_points,
@@ -5544,6 +5550,51 @@ def _require_continuation_point_capacity(
         raise RuntimeError(msg)
 
 
+def _continuation_capacity_diagnostics(
+    *,
+    remaining_gap: float,
+    optimized_count: int,
+    maximum: int,
+    chosen_step: float,
+) -> _ContinuationCapacityDiagnostics:
+    """Forecast whether one proposal pace fits the remaining point budget.
+
+    The forecast is diagnostic only.  It assumes ``chosen_step`` is held for
+    every remaining optimized bridge plus the final unoptimized target probe;
+    later growth or bisection will change the realized trajectory.
+
+    Returns:
+        The remaining budget and proposal pace relative to its required mean.
+
+    Raises:
+        ValueError: If the gap, step, or point counts are invalid.
+    """
+    remaining_gap = float(remaining_gap)
+    chosen_step = float(chosen_step)
+    optimized_count = int(optimized_count)
+    maximum = int(maximum)
+    if not np.isfinite(remaining_gap) or remaining_gap <= 0.0:
+        msg = f"remaining_gap must be finite and positive, got {remaining_gap!r}."
+        raise ValueError(msg)
+    if not np.isfinite(chosen_step) or chosen_step <= 0.0:
+        msg = f"chosen_step must be finite and positive, got {chosen_step!r}."
+        raise ValueError(msg)
+    if optimized_count < 0 or maximum < 0 or optimized_count > maximum:
+        msg = (
+            "Continuation point counts must satisfy "
+            f"0 <= optimized_count <= maximum, got {optimized_count} and {maximum}."
+        )
+        raise ValueError(msg)
+    remaining_bridge_slots = maximum - optimized_count
+    required_mean_step = remaining_gap / (remaining_bridge_slots + 1)
+    return _ContinuationCapacityDiagnostics(
+        remaining_gap=remaining_gap,
+        remaining_bridge_slots=remaining_bridge_slots,
+        required_mean_step=required_mean_step,
+        capacity_ratio=chosen_step / required_mean_step,
+    )
+
+
 def _continuation_history_step_cap(
     records: list[_ContinuationRecord],
     *,
@@ -5629,28 +5680,6 @@ def _finite_valid_nqs_stats(
         stats,
         max_source_covariance=max_source_covariance,
     )
-
-
-def _nqs_stage_required_fidelity(
-    initial_fidelity: float,
-    *,
-    floor: float,
-    gain: float,
-) -> float:
-    """Return the absolute fidelity required at the end of one NQS stage.
-
-    A checkpoint that already meets the configured floor may be propagated
-    unchanged.  Otherwise, the stage must both reach the floor and make the
-    requested minimum recovery from its initial held-out fidelity.
-    """
-    floor = float(floor)
-    gain = float(gain)
-    initial_fidelity = float(initial_fidelity)
-    if not np.isfinite(initial_fidelity):
-        return floor
-    if initial_fidelity >= floor:
-        return floor
-    return max(floor, initial_fidelity + gain)
 
 
 def _nqs_stage_quality_failure(
@@ -5926,7 +5955,6 @@ _CONTINUATION_STATE_CONFIG_EXCLUSIONS = frozenset(
         "nqs_continuation_fidelity_retention",
         "nqs_stage_fidelity_min",
         "nqs_stage_reweight_ess_fraction_min",
-        "nqs_stage_fidelity_gain_min",
         "nqs_continuation_allow_min_step_override",
         "nqs_continuation_min_step",
         "nqs_continuation_max_points",

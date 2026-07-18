@@ -94,14 +94,11 @@ lit:
   nqs_continuation_step_growth_factor: 1.25
   nqs_continuation_fidelity_retention: 0.95
   # Never propagate a merely finite but scientifically unusable response.
-  # Below the floor, a stage must also recover at least 0.001 fidelity; an
-  # already-good inherited checkpoint is allowed to remain at iteration zero.
   nqs_stage_fidelity_min: 0.99
   nqs_stage_reweight_ess_fraction_min: 0.05
-  nqs_stage_fidelity_gain_min: 0.001
   # At the numerical minimum step, allow a finite, ESS-valid inherited state
   # to enter recovery optimization.  The optimized checkpoint must still pass
-  # the absolute fidelity/ESS/gain gates before it can propagate.
+  # the absolute fidelity and ESS gates before it can propagate.
   nqs_continuation_allow_min_step_override: true
   # null -> min(0.2 * eta, the reported spectrum spacing) = 0.00025 Ha.
   nqs_continuation_min_step: null

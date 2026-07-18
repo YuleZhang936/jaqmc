@@ -212,7 +212,6 @@ echo "RESPONSE_AB_START,output_root=$output_root,warm_omega=$warm_omega,probe_om
 diagnostic_override_args=(
   lit.nqs_stage_fidelity_min=0
   lit.nqs_stage_reweight_ess_fraction_min=0
-  lit.nqs_stage_fidelity_gain_min=0
   lit.nqs_continuation_allow_min_step_override=true
 )
 if [[ -n "$source_norm" ]]; then
