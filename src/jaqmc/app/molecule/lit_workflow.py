@@ -146,6 +146,10 @@ class MolecularLITConfig:
     nqs_warm_start_iterations: int = 100
     nqs_continuation_iterations: int = 100
     nqs_continuation_step_fraction: float = 0.2
+    # Cap the next proposal by the latest accepted bridge step.  A clean
+    # bridge may grow that cap by this factor; any bisected/recovered bridge
+    # holds its actual successful step for the next proposal.
+    nqs_continuation_step_growth_factor: float = 1.25
     nqs_continuation_fidelity_retention: float = 0.95
     nqs_stage_fidelity_min: float = 0.0
     nqs_stage_reweight_ess_fraction_min: float = 0.0
@@ -1016,6 +1020,9 @@ class MoleculeLITWorkflow(Workflow):
             nqs_continuation_step_fraction=(
                 self.lit_config.nqs_continuation_step_fraction
             ),
+            nqs_continuation_step_growth_factor=(
+                self.lit_config.nqs_continuation_step_growth_factor
+            ),
             nqs_continuation_fidelity_retention=(
                 self.lit_config.nqs_continuation_fidelity_retention
             ),
@@ -1247,6 +1254,13 @@ class MoleculeLITWorkflow(Workflow):
         step_fraction = self.lit_config.nqs_continuation_step_fraction
         if not np.isfinite(step_fraction) or step_fraction <= 0.0:
             msg = "lit.nqs_continuation_step_fraction must be positive."
+            raise ValueError(msg)
+        growth = self.lit_config.nqs_continuation_step_growth_factor
+        if not np.isfinite(growth) or not 1.0 <= float(growth) <= 2.0:
+            msg = (
+                "lit.nqs_continuation_step_growth_factor must be finite and "
+                "satisfy 1 <= value <= 2."
+            )
             raise ValueError(msg)
         retention = self.lit_config.nqs_continuation_fidelity_retention
         if not 0.0 < retention <= 1.0:
@@ -2978,11 +2992,29 @@ class MoleculeLITWorkflow(Workflow):
 
         while target_omega - current_omega > tolerance:
             gap = float(target_omega - current_omega)
-            step = _physics_continuation_step(
+            physics_step = _physics_continuation_step(
                 current_stats,
                 gap=gap,
                 fraction=self.lit_config.nqs_continuation_step_fraction,
                 min_step=min_step,
+            )
+            history_cap = _continuation_history_step_cap(
+                records,
+                growth_factor=(self.lit_config.nqs_continuation_step_growth_factor),
+                min_step=min_step,
+            )
+            step = min(
+                physics_step,
+                gap if history_cap is None else history_cap,
+            )
+            logger.info(
+                "axis=%s continuation_proposal current_omega=%.6f "
+                "physics_step=%.6e history_cap=%.6e chosen_step=%.6e",
+                _AXIS_NAMES[axis],
+                current_omega,
+                physics_step,
+                float("nan") if history_cap is None else history_cap,
+                step,
             )
             candidate_omega = current_omega + step
             bisections = 0
@@ -5512,6 +5544,46 @@ def _require_continuation_point_capacity(
         raise RuntimeError(msg)
 
 
+def _continuation_history_step_cap(
+    records: list[_ContinuationRecord],
+    *,
+    growth_factor: float,
+    min_step: float,
+) -> float | None:
+    """Recover a conservative next-step cap from accepted bridge history.
+
+    A bridge that needed any bisection, failed its inherited probe, or used a
+    minimum-step override holds its actual accepted step.  Only a completely
+    clean bridge may grow the cap.  Because the accepted record is already in
+    the durable checkpoint history, interrupted and uninterrupted runs make
+    the same next proposal without adding controller state to the schema.
+
+    Returns:
+        The next history-derived step cap, or ``None`` without an accepted
+        bridge.
+
+    Raises:
+        RuntimeError: If the latest accepted record contains an invalid step.
+    """
+    latest = next((record for record in reversed(records) if record.optimized), None)
+    if latest is None:
+        return None
+    accepted_step = float(latest.step)
+    if not np.isfinite(accepted_step) or accepted_step <= 0.0:
+        msg = (
+            "Latest optimized continuation record has an invalid accepted "
+            f"step {accepted_step!r} at omega={float(latest.omega):.8g}."
+        )
+        raise RuntimeError(msg)
+    clean_success = (
+        int(latest.bisections) == 0
+        and bool(latest.probe_accepted)
+        and not bool(latest.min_step_override)
+    )
+    multiplier = float(growth_factor) if clean_success else 1.0
+    return max(float(min_step), multiplier * accepted_step)
+
+
 def _continuation_retry_step_or_raise(
     error: _NQSStageQualityError,
     *,
@@ -5850,6 +5922,7 @@ _CONTINUATION_STATE_CONFIG_EXCLUSIONS = frozenset(
         "nqs_iterations",
         "nqs_continuation_iterations",
         "nqs_continuation_step_fraction",
+        "nqs_continuation_step_growth_factor",
         "nqs_continuation_fidelity_retention",
         "nqs_stage_fidelity_min",
         "nqs_stage_reweight_ess_fraction_min",

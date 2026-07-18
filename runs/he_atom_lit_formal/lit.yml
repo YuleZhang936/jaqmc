@@ -89,6 +89,9 @@ lit:
   # samples and bisect any step whose inherited fidelity drops too far.
   nqs_continuation_iterations: 1500
   nqs_continuation_step_fraction: 0.2
+  # Reuse the last accepted bridge step.  Grow by at most 25% only after a
+  # clean, unbisected success; a recovered step is held for the next proposal.
+  nqs_continuation_step_growth_factor: 1.25
   nqs_continuation_fidelity_retention: 0.95
   # Never propagate a merely finite but scientifically unusable response.
   # Below the floor, a stage must also recover at least 0.001 fidelity; an
