@@ -210,7 +210,7 @@ mkdir -p "$output_root"
 echo "RESPONSE_AB_START,output_root=$output_root,warm_omega=$warm_omega,probe_omega=$probe_omega,warm_iterations=$warm_iterations"
 
 diagnostic_override_args=(
-  lit.nqs_stage_fidelity_min=0
+  lit.nqs_fidelity_plateau_patience_iterations=0
   lit.nqs_stage_reweight_ess_fraction_min=0
   lit.nqs_continuation_allow_min_step_override=true
 )
@@ -266,7 +266,6 @@ for residual_scale_raw in "${residual_scales[@]}"; do
       "lit.nqs_log_interval=$log_interval" \
       "lit.omega_values=[$probe_omega]" \
       lit.nqs_continuation_iterations=1 \
-      'lit.nqs_continuation_iteration_schedule=[1]' \
       lit.nqs_iterations=1 \
       2>&1 | tee -a "$log_path"
     status=${PIPESTATUS[0]}

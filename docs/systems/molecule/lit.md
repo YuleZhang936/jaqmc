@@ -246,11 +246,13 @@ lit:
   nqs_sr_score_eps: 1.0e-10
   nqs_warm_start_omega: -3.674932217565499
   nqs_warm_start_iterations: 800
-  nqs_continuation_iterations: 800
-  # Optional cumulative quality-check milestones on the same optimizer
-  # trajectory. The first entry must equal nqs_continuation_iterations.
-  # Only a pure fidelity miss extends to the next milestone.
-  nqs_continuation_iteration_schedule: null
+  # Optional paper-style early stopping on the cumulative best held-out
+  # fidelity. Zero patience disables plateau stopping.
+  nqs_fidelity_plateau_start_iteration: 800
+  nqs_fidelity_plateau_patience_iterations: 400
+  nqs_fidelity_plateau_min_delta: 1.0e-5
+  # Maximum optimizer budget for each continuation bridge.
+  nqs_continuation_iterations: 2000
   nqs_continuation_step_fraction: 0.2
   nqs_continuation_fidelity_retention: 0.95
   # null uses min(0.2 * eta, the reported spectrum spacing).

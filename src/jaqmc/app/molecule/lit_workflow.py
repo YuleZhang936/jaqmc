@@ -14,7 +14,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from functools import partial
-from itertools import pairwise
 from typing import Any, NamedTuple
 from zipfile import BadZipFile
 
@@ -151,21 +150,21 @@ class MolecularLITConfig:
     nqs_sr_score_eps: float = 1e-10
     nqs_warm_start_omega: float | None = -3.674932217565499
     nqs_warm_start_iterations: int = 100
+    # Stop an NQS optimization only after its best held-out fidelity has
+    # plateaued.  A zero patience disables early stopping.  The baseline is
+    # established no earlier than ``start_iteration``; subsequent cumulative
+    # improvements must exceed ``min_delta`` to reset the patience clock.
+    nqs_fidelity_plateau_start_iteration: int = 0
+    nqs_fidelity_plateau_patience_iterations: int = 0
+    nqs_fidelity_plateau_min_delta: float = 1e-5
+    # Maximum optimization budget for each adaptive continuation bridge.
     nqs_continuation_iterations: int = 100
-    # Optional cumulative quality-check milestones for one uninterrupted
-    # continuation optimization.  The first milestone must equal
-    # nqs_continuation_iterations.  If no selectable held-out checkpoint has
-    # met the fidelity floor by a milestone, a pure fidelity miss extends the
-    # same parameter/SPRING/RNG trajectory; ESS or numerical failures remain
-    # fail-closed.
-    nqs_continuation_iteration_schedule: tuple[int, ...] | None = None
     nqs_continuation_step_fraction: float = 0.2
     # Cap the next proposal by the latest accepted bridge step.  A clean
     # bridge may grow that cap by this factor; any bisected/recovered bridge
     # holds its actual successful step for the next proposal.
     nqs_continuation_step_growth_factor: float = 1.25
     nqs_continuation_fidelity_retention: float = 0.95
-    nqs_stage_fidelity_min: float = 0.0
     nqs_stage_reweight_ess_fraction_min: float = 0.0
     nqs_continuation_allow_min_step_override: bool = True
     nqs_continuation_min_step: float | None = None
@@ -280,19 +279,51 @@ class _ContinuationCapacityDiagnostics(NamedTuple):
     capacity_ratio: float
 
 
-class _NQSStageQualityError(RuntimeError):
-    """Held-out stage-quality failure with machine-readable gate causes."""
+@dataclass
+class _FidelityPlateauTracker:
+    """Host-side early stopping on cumulative best held-out fidelity."""
 
-    def __init__(
-        self,
-        message: str,
-        *,
-        fidelity_failed: bool,
-        ess_failed: bool,
-    ) -> None:
-        super().__init__(message)
-        self.fidelity_failed = bool(fidelity_failed)
-        self.ess_failed = bool(ess_failed)
+    start_iteration: int
+    patience_iterations: int
+    min_delta: float
+    reference_fidelity: float | None = None
+    last_significant_iteration: int | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.patience_iterations > 0
+
+    def observe(self, iteration: int, best_fidelity: float) -> bool:
+        """Record the best fidelity and report whether it has plateaued.
+
+        Returns:
+            Whether the patience window has elapsed without a significant
+            cumulative improvement.
+        """
+        if not self.enabled or iteration < self.start_iteration:
+            return False
+        if not np.isfinite(best_fidelity):
+            return False
+        if self.reference_fidelity is None:
+            self.reference_fidelity = float(best_fidelity)
+            self.last_significant_iteration = int(iteration)
+            return False
+        if best_fidelity > self.reference_fidelity + self.min_delta:
+            self.reference_fidelity = float(best_fidelity)
+            self.last_significant_iteration = int(iteration)
+            return False
+        if self.last_significant_iteration is None:
+            return False
+        return iteration - self.last_significant_iteration >= self.patience_iterations
+
+    def defer(self, iteration: int) -> None:
+        """Restart patience after an unhealthy held-out observation."""
+        if (
+            self.enabled
+            and self.reference_fidelity is not None
+            and iteration >= self.start_iteration
+        ):
+            self.last_significant_iteration = int(iteration)
 
 
 class _ContinuationCheckpoint(NamedTuple):
@@ -992,6 +1023,15 @@ class MoleculeLITWorkflow(Workflow):
             nqs_warm_start_omega=_optional_float(self.lit_config.nqs_warm_start_omega),
             nqs_warm_start_iterations=self.lit_config.nqs_warm_start_iterations,
             warm_start_selected_iteration=warm_start_selected_iteration,
+            nqs_fidelity_plateau_start_iteration=(
+                self.lit_config.nqs_fidelity_plateau_start_iteration
+            ),
+            nqs_fidelity_plateau_patience_iterations=(
+                self.lit_config.nqs_fidelity_plateau_patience_iterations
+            ),
+            nqs_fidelity_plateau_min_delta=(
+                self.lit_config.nqs_fidelity_plateau_min_delta
+            ),
             continuation_axis=np.asarray(continuation_axis, dtype=np.int64),
             continuation_omega=np.asarray(continuation_omega, dtype=np.float64),
             continuation_optimized=np.asarray(
@@ -1040,10 +1080,6 @@ class MoleculeLITWorkflow(Workflow):
                 dtype=np.bool_,
             ),
             nqs_continuation_iterations=self.lit_config.nqs_continuation_iterations,
-            nqs_continuation_iteration_schedule=np.asarray(
-                _continuation_iteration_schedule(self.lit_config),
-                dtype=np.int64,
-            ),
             nqs_continuation_step_fraction=(
                 self.lit_config.nqs_continuation_step_fraction
             ),
@@ -1053,7 +1089,6 @@ class MoleculeLITWorkflow(Workflow):
             nqs_continuation_fidelity_retention=(
                 self.lit_config.nqs_continuation_fidelity_retention
             ),
-            nqs_stage_fidelity_min=self.lit_config.nqs_stage_fidelity_min,
             nqs_stage_reweight_ess_fraction_min=(
                 self.lit_config.nqs_stage_reweight_ess_fraction_min
             ),
@@ -1194,6 +1229,28 @@ class MoleculeLITWorkflow(Workflow):
         if self.lit_config.nqs_iterations < 1:
             msg = "lit.nqs_iterations must be positive."
             raise ValueError(msg)
+        plateau_integers = (
+            (
+                "nqs_fidelity_plateau_start_iteration",
+                self.lit_config.nqs_fidelity_plateau_start_iteration,
+            ),
+            (
+                "nqs_fidelity_plateau_patience_iterations",
+                self.lit_config.nqs_fidelity_plateau_patience_iterations,
+            ),
+        )
+        for name, value in plateau_integers:
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, np.integer))
+                or int(value) < 0
+            ):
+                raise ValueError(f"lit.{name} must be a nonnegative integer.")
+        plateau_delta = self.lit_config.nqs_fidelity_plateau_min_delta
+        if not np.isfinite(plateau_delta) or not 0.0 <= float(plateau_delta) <= 1.0:
+            raise ValueError(
+                "lit.nqs_fidelity_plateau_min_delta must be finite and between 0 and 1."
+            )
 
     def _validate_source_sector_config(self) -> None:
         _three_component_override(
@@ -1275,10 +1332,14 @@ class MoleculeLITWorkflow(Workflow):
             raise ValueError(msg)
 
     def _validate_continuation_config(self) -> None:
-        if self.lit_config.nqs_continuation_iterations < 1:
-            msg = "lit.nqs_continuation_iterations must be positive."
+        continuation_iterations = self.lit_config.nqs_continuation_iterations
+        if (
+            isinstance(continuation_iterations, (bool, np.bool_))
+            or not isinstance(continuation_iterations, (int, np.integer))
+            or int(continuation_iterations) < 1
+        ):
+            msg = "lit.nqs_continuation_iterations must be a positive integer."
             raise ValueError(msg)
-        _continuation_iteration_schedule(self.lit_config)
         step_fraction = self.lit_config.nqs_continuation_step_fraction
         if not np.isfinite(step_fraction) or step_fraction <= 0.0:
             msg = "lit.nqs_continuation_step_fraction must be positive."
@@ -1294,17 +1355,13 @@ class MoleculeLITWorkflow(Workflow):
         if not 0.0 < retention <= 1.0:
             msg = "lit.nqs_continuation_fidelity_retention must satisfy 0 < value <= 1."
             raise ValueError(msg)
-        stage_thresholds = (
-            ("nqs_stage_fidelity_min", self.lit_config.nqs_stage_fidelity_min),
-            (
-                "nqs_stage_reweight_ess_fraction_min",
-                self.lit_config.nqs_stage_reweight_ess_fraction_min,
-            ),
-        )
-        for name, value in stage_thresholds:
-            if not np.isfinite(value) or not 0.0 <= float(value) <= 1.0:
-                msg = f"lit.{name} must be finite and between 0 and 1."
-                raise ValueError(msg)
+        stage_ess = self.lit_config.nqs_stage_reweight_ess_fraction_min
+        if not np.isfinite(stage_ess) or not 0.0 <= float(stage_ess) <= 1.0:
+            msg = (
+                "lit.nqs_stage_reweight_ess_fraction_min must be finite and "
+                "between 0 and 1."
+            )
+            raise ValueError(msg)
         min_step = self.lit_config.nqs_continuation_min_step
         if min_step is not None and (
             not np.isfinite(min_step) or float(min_step) <= 0.0
@@ -2284,26 +2341,25 @@ class MoleculeLITWorkflow(Workflow):
         omega: float,
         iterations: int,
         stage: str,
-        quality_check_iterations: tuple[int, ...] | None = None,
     ):
-        """Optimize one frequency and select parameters on a fixed eval pool.
+        """Optimize one frequency until its best held-out fidelity plateaus.
 
-        ``quality_check_iterations`` contains cumulative milestones on one
-        uninterrupted optimizer trajectory.  At an intermediate milestone,
-        when the legacy held-out model selection has found no passing checkpoint,
-        a pure fidelity miss continues with the live parameters, SPRING carry,
-        and RNG.  Every other quality failure remains fail-closed.  Numerical,
-        covariance, and ESS health are also checked on the live parameters at
-        each milestone, so an earlier selected checkpoint cannot hide an
-        unhealthy current trajectory.
+        Model selection and early stopping use one fixed evaluation pool.  The
+        plateau clock starts only after the configured baseline iteration and
+        resets when the cumulative best fidelity improves by more than the
+        configured tolerance.  An unhealthy observation cannot be selected
+        and restarts the patience clock.  The best numerically healthy,
+        ESS-qualified checkpoint is returned even when the maximum budget is
+        exhausted.
 
         Returns:
             Best parameters, their held-out statistics, selected iteration,
             and the next random key.
 
         Raises:
-            RuntimeError: If no held-out checkpoint satisfies the configured
-                numerical, source-covariance, and stage-quality requirements.
+            ValueError: If the iteration budget is not positive.
+            RuntimeError: If no held-out checkpoint satisfies numerical,
+                source-covariance, and estimator-health requirements.
         """
 
         def evaluate(params):
@@ -2325,44 +2381,42 @@ class MoleculeLITWorkflow(Workflow):
                 ),
             )
 
-        iteration_schedule = _nqs_quality_check_iteration_schedule(
-            iterations,
-            quality_check_iterations,
+        maximum_iterations = int(iterations)
+        if maximum_iterations < 1:
+            raise ValueError("NQS optimizer iterations must be positive.")
+        plateau = _FidelityPlateauTracker(
+            start_iteration=(self.lit_config.nqs_fidelity_plateau_start_iteration),
+            patience_iterations=(
+                self.lit_config.nqs_fidelity_plateau_patience_iterations
+            ),
+            min_delta=self.lit_config.nqs_fidelity_plateau_min_delta,
         )
-        quality_check_indices = {
-            completed: index for index, completed in enumerate(iteration_schedule)
-        }
-        maximum_iterations = iteration_schedule[-1]
+        forced_evaluations = {maximum_iterations}
+        if plateau.enabled and 0 < plateau.start_iteration <= maximum_iterations:
+            forced_evaluations.add(plateau.start_iteration)
         executed_iterations = maximum_iterations
-        staged_quality_checks = len(iteration_schedule) > 1
+        stop_reason = "max_budget"
 
         response_params = initial_params
         update_carry = update_step.init_carry(fallback_data, rng, response_params)
         maximum_covariance = self.lit_config.nqs_source_symmetry_max_covariance
-        best_params = response_params
-        best_stats = jax.device_get(evaluate(response_params))
-        initial_fidelity = float(jax.device_get(best_stats.fidelity))
-        required_fidelity = float(self.lit_config.nqs_stage_fidelity_min)
-        best_iteration = 0
-        selected_params = None
-        selected_stats = None
-        selected_iteration = 0
-        if (
-            _is_eligible_nqs_checkpoint(
-                best_stats,
-                max_source_covariance=maximum_covariance,
-            )
-            and _nqs_stage_quality_failure(
-                best_stats,
-                min_fidelity=required_fidelity,
-                min_reweight_ess_fraction=(
-                    self.lit_config.nqs_stage_reweight_ess_fraction_min
-                ),
-            )
-            is None
+        minimum_ess = self.lit_config.nqs_stage_reweight_ess_fraction_min
+        initial_stats = jax.device_get(evaluate(response_params))
+        latest_stats = initial_stats
+        initial_fidelity = float(jax.device_get(initial_stats.fidelity))
+        best_params = None
+        best_stats = None
+        best_iteration = -1
+        if _is_selectable_nqs_checkpoint(
+            initial_stats,
+            max_source_covariance=maximum_covariance,
+            min_reweight_ess_fraction=minimum_ess,
         ):
-            selected_params = best_params
-            selected_stats = best_stats
+            best_params = response_params
+            best_stats = initial_stats
+            best_iteration = 0
+            if plateau.start_iteration == 0:
+                plateau.observe(0, initial_fidelity)
         last_train_stats = None
         last_optimizer_diagnostics = None
         for iteration in range(maximum_iterations):
@@ -2381,56 +2435,38 @@ class MoleculeLITWorkflow(Workflow):
             completed = iteration + 1
             should_select = (
                 completed % self.lit_config.nqs_selection_interval == 0
-                or completed in quality_check_indices
+                or completed in forced_evaluations
             )
             candidate_stats = None
             if should_select:
                 candidate_stats = jax.device_get(evaluate(response_params))
-                if _is_better_nqs_checkpoint(
+                latest_stats = candidate_stats
+                candidate_selectable = _is_selectable_nqs_checkpoint(
                     candidate_stats,
-                    best_stats,
                     max_source_covariance=(
                         self.lit_config.nqs_source_symmetry_max_covariance
                     ),
+                    min_reweight_ess_fraction=minimum_ess,
+                )
+                if not candidate_selectable:
+                    plateau.defer(completed)
+                if candidate_selectable and (
+                    best_stats is None
+                    or _is_better_nqs_checkpoint(
+                        candidate_stats,
+                        best_stats,
+                        max_source_covariance=maximum_covariance,
+                        min_reweight_ess_fraction=minimum_ess,
+                    )
                 ):
                     best_params = response_params
                     best_stats = candidate_stats
                     best_iteration = completed
-                if (
-                    _is_eligible_nqs_checkpoint(
-                        candidate_stats,
-                        max_source_covariance=maximum_covariance,
-                    )
-                    and _nqs_stage_quality_failure(
-                        candidate_stats,
-                        min_fidelity=required_fidelity,
-                        min_reweight_ess_fraction=(
-                            self.lit_config.nqs_stage_reweight_ess_fraction_min
-                        ),
-                    )
-                    is None
-                    and (
-                        selected_stats is None
-                        or _is_better_nqs_checkpoint(
-                            candidate_stats,
-                            selected_stats,
-                            max_source_covariance=maximum_covariance,
-                        )
-                    )
-                ):
-                    selected_params = response_params
-                    selected_stats = candidate_stats
-                    selected_iteration = completed
             if (
                 self.lit_config.nqs_log_interval > 0
                 and completed % self.lit_config.nqs_log_interval == 0
             ):
-                reported_stats = (
-                    selected_stats if selected_stats is not None else best_stats
-                )
-                reported_iteration = (
-                    selected_iteration if selected_stats is not None else best_iteration
-                )
+                reported_stats = best_stats if best_stats is not None else latest_stats
                 host_train_stats, host_optimizer_diagnostics = jax.device_get(
                     (last_train_stats, last_optimizer_diagnostics)
                 )
@@ -2448,7 +2484,7 @@ class MoleculeLITWorkflow(Workflow):
                     float(host_train_stats.fidelity),
                     float(host_train_stats.reverse_kl),
                     float(getattr(host_train_stats, "source_covariance_loss", 0.0)),
-                    reported_iteration,
+                    best_iteration,
                     float(reported_stats.fidelity),
                     float(reported_stats.reverse_kl),
                     float(
@@ -2477,119 +2513,63 @@ class MoleculeLITWorkflow(Workflow):
                     omega=float(omega),
                     iteration=completed,
                 )
-            quality_check_index = quality_check_indices.get(completed)
-            if quality_check_index is None:
-                continue
-            if candidate_stats is None:
-                msg = (
-                    "Internal error: NQS quality milestone was not evaluated "
-                    f"at iteration {completed}."
-                )
-                raise RuntimeError(msg)
-            if staged_quality_checks:
-                _require_nqs_milestone_health(
+            if (
+                candidate_stats is not None
+                and best_stats is not None
+                and _is_selectable_nqs_checkpoint(
                     candidate_stats,
                     max_source_covariance=maximum_covariance,
-                    min_reweight_ess_fraction=(
-                        self.lit_config.nqs_stage_reweight_ess_fraction_min
-                    ),
-                    context=(
-                        f"axis={_AXIS_NAMES[axis]} stage={stage} "
-                        f"omega={float(omega):.6f} iteration budget {completed}"
-                    ),
+                    min_reweight_ess_fraction=minimum_ess,
                 )
-            if quality_check_index == len(iteration_schedule) - 1:
-                continue
-            if selected_stats is not None and selected_params is not None:
+                and plateau.observe(
+                    completed,
+                    float(jax.device_get(best_stats.fidelity)),
+                )
+            ):
                 executed_iterations = completed
+                stop_reason = "fidelity_plateau"
+                plateau_reference_fidelity = plateau.reference_fidelity
+                plateau_last_significant_iteration = plateau.last_significant_iteration
+                if (
+                    plateau_reference_fidelity is None
+                    or plateau_last_significant_iteration is None
+                ):
+                    msg = "plateau stop requires an initialized fidelity reference"
+                    raise RuntimeError(msg)
+                logger.info(
+                    "axis=%s stage=%s omega=%.6f iter=%d action=plateau_stop "
+                    "best_fidelity=%.6f reference_fidelity=%.6f "
+                    "last_significant_iter=%d patience=%d min_delta=%.3e",
+                    _AXIS_NAMES[axis],
+                    stage,
+                    float(omega),
+                    completed,
+                    float(best_stats.fidelity),
+                    plateau_reference_fidelity,
+                    plateau_last_significant_iteration,
+                    plateau.patience_iterations,
+                    plateau.min_delta,
+                )
                 break
-            _require_pure_fidelity_stage_miss(
-                best_stats,
-                max_source_covariance=maximum_covariance,
-                min_fidelity=required_fidelity,
-                min_reweight_ess_fraction=(
-                    self.lit_config.nqs_stage_reweight_ess_fraction_min
-                ),
-                eligibility_context=(
-                    f"axis={_AXIS_NAMES[axis]} stage={stage} "
-                    f"omega={float(omega):.6f} produced no eligible held-out "
-                    f"checkpoint by iteration {completed}"
-                ),
-                quality_context=(
-                    f"axis={_AXIS_NAMES[axis]} stage={stage} "
-                    f"omega={float(omega):.6f} failed its held-out quality "
-                    f"gate at iteration budget {completed} "
-                    f"(initial fidelity={initial_fidelity:.6f}, "
-                    "configured floor="
-                    f"{self.lit_config.nqs_stage_fidelity_min:.6f})"
-                ),
-                no_selection_context=(
-                    f"axis={_AXIS_NAMES[axis]} stage={stage} "
-                    f"omega={float(omega):.6f} produced no selectable "
-                    f"checkpoint by iteration {completed}"
-                ),
+        if best_stats is None or best_params is None:
+            best_covariance_mean, best_covariance_max = _source_covariance_host_values(
+                latest_stats
             )
-            next_budget = iteration_schedule[quality_check_index + 1]
-            logger.info(
-                "axis=%s stage=%s omega=%.6f iteration_budget=%d "
-                "fidelity=%.6f ess=%.3f action=extend "
-                "next_iteration_budget=%d",
-                _AXIS_NAMES[axis],
-                stage,
-                float(omega),
-                completed,
-                float(best_stats.fidelity),
-                float(best_stats.reweight_ess_fraction),
-                next_budget,
-            )
-        best_covariance_mean, best_covariance_max = _source_covariance_host_values(
-            best_stats
-        )
-        if not _is_eligible_nqs_checkpoint(
-            best_stats,
-            max_source_covariance=maximum_covariance,
-        ):
             msg = (
                 f"axis={_AXIS_NAMES[axis]} stage={stage} omega={float(omega):.6f} "
-                "produced no eligible held-out checkpoint; best covariance "
+                "produced no healthy held-out checkpoint; latest covariance "
                 f"mean={best_covariance_mean:.6e}, max={best_covariance_max:.6e}, "
-                f"maximum={maximum_covariance!r}."
+                f"maximum={maximum_covariance!r}, ESS="
+                f"{float(latest_stats.reweight_ess_fraction):.6f}, required ESS="
+                f"{minimum_ess:.6f}."
             )
             raise RuntimeError(msg)
-        if selected_stats is None or selected_params is None:
-            _require_nqs_stage_quality(
-                best_stats,
-                min_fidelity=required_fidelity,
-                min_reweight_ess_fraction=(
-                    self.lit_config.nqs_stage_reweight_ess_fraction_min
-                ),
-                context=(
-                    f"axis={_AXIS_NAMES[axis]} stage={stage} "
-                    f"omega={float(omega):.6f} failed its held-out quality gate "
-                    f"(initial fidelity={initial_fidelity:.6f}, "
-                    "configured floor="
-                    f"{self.lit_config.nqs_stage_fidelity_min:.6f})"
-                ),
-            )
-            msg = (
-                f"axis={_AXIS_NAMES[axis]} stage={stage} "
-                f"omega={float(omega):.6f} produced no selectable checkpoint."
-            )
-            raise RuntimeError(msg)
-        best_params = selected_params
-        best_stats = selected_stats
-        best_iteration = selected_iteration
-        _require_nqs_stage_quality(
+        _require_nqs_stage_health(
             best_stats,
-            min_fidelity=required_fidelity,
-            min_reweight_ess_fraction=(
-                self.lit_config.nqs_stage_reweight_ess_fraction_min
-            ),
+            min_reweight_ess_fraction=minimum_ess,
             context=(
                 f"axis={_AXIS_NAMES[axis]} stage={stage} "
-                f"omega={float(omega):.6f} failed its held-out quality gate "
-                f"(initial fidelity={initial_fidelity:.6f}, "
-                f"configured floor={self.lit_config.nqs_stage_fidelity_min:.6f})"
+                f"omega={float(omega):.6f} failed held-out estimator health"
             ),
         )
         rng = update_carry.direct.rng
@@ -2598,7 +2578,7 @@ class MoleculeLITWorkflow(Workflow):
             "heldout_loss=%.6e fidelity=%.6f reverse_kl=%.6e "
             "covariance_mean=%.6e covariance_max=%.6e ess=%.3f "
             "initial_fidelity=%.6f fidelity_gain=%+.6e "
-            "required_fidelity=%.6f required_ess=%.3f",
+            "stop_reason=%s required_ess=%.3f",
             _AXIS_NAMES[axis],
             stage,
             float(omega),
@@ -2618,8 +2598,8 @@ class MoleculeLITWorkflow(Workflow):
             float(best_stats.reweight_ess_fraction),
             initial_fidelity,
             float(best_stats.fidelity) - initial_fidelity,
-            required_fidelity,
-            self.lit_config.nqs_stage_reweight_ess_fraction_min,
+            stop_reason,
+            minimum_ess,
         )
         return best_params, best_stats, best_iteration, rng
 
@@ -2869,17 +2849,14 @@ class MoleculeLITWorkflow(Workflow):
                 "failed current numerical/covariance validation"
             ),
         )
-        _require_nqs_stage_quality(
+        _require_nqs_stage_health(
             revalidated_stats,
-            min_fidelity=self.lit_config.nqs_stage_fidelity_min,
             min_reweight_ess_fraction=(
                 self.lit_config.nqs_stage_reweight_ess_fraction_min
             ),
             context=(
                 f"Restored continuation checkpoint at omega={current_omega:.8g} "
-                "failed the current absolute quality gate "
-                f"(configured fidelity floor="
-                f"{self.lit_config.nqs_stage_fidelity_min:.6f})"
+                "failed current estimator-health validation"
             ),
         )
         records[-1] = records[-1]._replace(stats=revalidated_stats)
@@ -2923,7 +2900,7 @@ class MoleculeLITWorkflow(Workflow):
         full_config_digest: str,
         warm_start_selected_iteration: int,
     ) -> None:
-        """Atomically persist one optimized and fully gate-qualified bridge."""
+        """Atomically persist one optimized, numerically healthy bridge."""
         if jax.process_index() != 0:
             return
         save_dir = self._continuation_checkpoint_save_dir(axis)
@@ -2983,9 +2960,8 @@ class MoleculeLITWorkflow(Workflow):
         """
         if not min_step_override:
             return
-        probe_ess_failure = _nqs_stage_quality_failure(
+        probe_ess_failure = _nqs_stage_ess_failure(
             probe_stats,
-            min_fidelity=0.0,
             min_reweight_ess_fraction=(
                 self.lit_config.nqs_stage_reweight_ess_fraction_min
             ),
@@ -3104,21 +3080,17 @@ class MoleculeLITWorkflow(Workflow):
                 f"checkpoint at omega={current_omega:.8g}"
             ),
         )
-        _require_nqs_stage_quality(
+        _require_nqs_stage_health(
             current_stats,
-            min_fidelity=self.lit_config.nqs_stage_fidelity_min,
             min_reweight_ess_fraction=(
                 self.lit_config.nqs_stage_reweight_ess_fraction_min
             ),
             context=(
-                "Frequency continuation received a starting checkpoint below "
-                f"the absolute quality floor at omega={current_omega:.8g}"
+                "Frequency continuation received an estimator-unhealthy "
+                f"starting checkpoint at omega={current_omega:.8g}"
             ),
         )
         min_step = _continuation_min_step(self.lit_config, spectrum_omega)
-        continuation_iteration_schedule = _continuation_iteration_schedule(
-            self.lit_config
-        )
         records = list(existing_records)
         existing_optimized_count = sum(record.optimized for record in records)
         if existing_optimized_count > self.lit_config.nqs_continuation_max_points:
@@ -3183,153 +3155,100 @@ class MoleculeLITWorkflow(Workflow):
                 capacity.capacity_ratio,
             )
             candidate_omega = current_omega + step
-            bisections = 0
-            while True:
-                probe_stats, candidate_omega, probe_ok, probe_bisections = (
-                    _bisect_continuation_probe(
-                        evaluate_probe,
-                        current_stats,
-                        current_omega=current_omega,
-                        candidate_omega=candidate_omega,
-                        target_omega=target_omega,
-                        min_step=min_step,
-                        retention=(self.lit_config.nqs_continuation_fidelity_retention),
-                        max_source_covariance=maximum_covariance,
-                        min_reweight_ess_fraction=(
-                            self.lit_config.nqs_stage_reweight_ess_fraction_min
-                        ),
-                    )
-                )
-                bisections += probe_bisections
-
-                _require_eligible_nqs_checkpoint(
-                    probe_stats,
-                    max_source_covariance=maximum_covariance,
-                    context=(
-                        "Frequency continuation produced non-finite/invalid "
-                        "held-out statistics at "
-                        f"omega={candidate_omega:.8g}; refusing to propagate "
-                        "a corrupted checkpoint"
-                    ),
-                )
-                actual_step = float(candidate_omega - current_omega)
-                min_step_override = not probe_ok and actual_step <= min_step * (
-                    1.0 + 1e-12
-                )
-                self._require_continuation_probe_recovery_allowed(
+            probe_stats, candidate_omega, probe_ok, bisections = (
+                _bisect_continuation_probe(
+                    evaluate_probe,
                     current_stats,
-                    probe_stats,
+                    current_omega=current_omega,
                     candidate_omega=candidate_omega,
-                    min_step_override=min_step_override,
-                )
-                if target_omega - candidate_omega <= tolerance:
-                    records.append(
-                        _ContinuationRecord(
-                            omega=float(candidate_omega),
-                            optimized=False,
-                            selected_iteration=-1,
-                            stats=probe_stats,
-                            inherited_fidelity=float(probe_stats.fidelity),
-                            step=actual_step,
-                            bisections=bisections,
-                            probe_accepted=probe_ok,
-                            min_step_override=min_step_override,
-                        )
-                    )
-                    logger.info(
-                        "axis=%s continuation_probe target=%.6f "
-                        "inherited_fidelity=%.6f covariance_mean=%.6e "
-                        "covariance_max=%.6e step=%.6e bisections=%d "
-                        "accepted=%s min_step_override=%s",
-                        _AXIS_NAMES[axis],
-                        target_omega,
-                        float(probe_stats.fidelity),
-                        float(getattr(probe_stats, "source_covariance_loss", 0.0)),
-                        float(
-                            getattr(
-                                probe_stats,
-                                "source_covariance_max_loss",
-                                getattr(
-                                    probe_stats,
-                                    "source_covariance_loss",
-                                    0.0,
-                                ),
-                            )
-                        ),
-                        actual_step,
-                        bisections,
-                        probe_ok,
-                        min_step_override,
-                    )
-                    return response_params, current_stats, records, rng
-
-                _require_continuation_point_capacity(
-                    optimized_count,
-                    maximum=self.lit_config.nqs_continuation_max_points,
                     target_omega=target_omega,
-                )
-                inherited_fidelity = float(probe_stats.fidelity)
-                try:
-                    (
-                        candidate_params,
-                        candidate_stats,
-                        selected_iteration,
-                        candidate_rng,
-                    ) = self._optimize_nqs_frequency(
-                        update_step,
-                        response_params,
-                        train_pool,
-                        eval_pool,
-                        fallback_data,
-                        rng,
-                        omega=candidate_omega,
-                        iterations=continuation_iteration_schedule[-1],
-                        stage="continuation",
-                        quality_check_iterations=continuation_iteration_schedule,
-                        **common,
-                    )
-                except _NQSStageQualityError as error:
-                    # Only a pure fidelity miss is evidence that the homotopy
-                    # jump was too large.  ESS failures remain fail-closed:
-                    # retrying the same estimator at another frequency could
-                    # hide an unreliable held-out sample.
-                    retry_step = _continuation_retry_step_or_raise(
-                        error,
-                        actual_step=actual_step,
-                        min_step=min_step,
-                    )
-                    retry_omega = min(target_omega, current_omega + retry_step)
-                    logger.warning(
-                        "axis=%s continuation_backtrack failed_omega=%.6f "
-                        "failed_step=%.6e retry_omega=%.6f retry_step=%.6e "
-                        "reason=%s",
-                        _AXIS_NAMES[axis],
-                        candidate_omega,
-                        actual_step,
-                        retry_omega,
-                        retry_step,
-                        error,
-                    )
-                    candidate_omega = retry_omega
-                    bisections += 1
-                    continue
-
-                _require_eligible_nqs_checkpoint(
-                    candidate_stats,
+                    min_step=min_step,
+                    retention=(self.lit_config.nqs_continuation_fidelity_retention),
                     max_source_covariance=maximum_covariance,
-                    context=(
-                        "Frequency continuation failed to obtain a finite "
-                        "held-out checkpoint at "
-                        f"omega={candidate_omega:.8g}"
+                    min_reweight_ess_fraction=(
+                        self.lit_config.nqs_stage_reweight_ess_fraction_min
                     ),
                 )
-                # Commit the candidate only after every post-optimization gate
-                # has passed.  Failed attempts leave params, RNG, stats, and
-                # checkpoint history at the last accepted frequency.
-                response_params = candidate_params
-                current_stats = candidate_stats
-                rng = candidate_rng
-                break
+            )
+
+            _require_eligible_nqs_checkpoint(
+                probe_stats,
+                max_source_covariance=maximum_covariance,
+                context=(
+                    "Frequency continuation produced non-finite/invalid "
+                    "held-out statistics at "
+                    f"omega={candidate_omega:.8g}; refusing to propagate "
+                    "a corrupted checkpoint"
+                ),
+            )
+            actual_step = float(candidate_omega - current_omega)
+            min_step_override = not probe_ok and actual_step <= min_step * (1.0 + 1e-12)
+            self._require_continuation_probe_recovery_allowed(
+                current_stats,
+                probe_stats,
+                candidate_omega=candidate_omega,
+                min_step_override=min_step_override,
+            )
+            if target_omega - candidate_omega <= tolerance:
+                records.append(
+                    _ContinuationRecord(
+                        omega=float(candidate_omega),
+                        optimized=False,
+                        selected_iteration=-1,
+                        stats=probe_stats,
+                        inherited_fidelity=float(probe_stats.fidelity),
+                        step=actual_step,
+                        bisections=bisections,
+                        probe_accepted=probe_ok,
+                        min_step_override=min_step_override,
+                    )
+                )
+                logger.info(
+                    "axis=%s continuation_probe target=%.6f "
+                    "inherited_fidelity=%.6f covariance_mean=%.6e "
+                    "covariance_max=%.6e step=%.6e bisections=%d "
+                    "accepted=%s min_step_override=%s",
+                    _AXIS_NAMES[axis],
+                    target_omega,
+                    float(probe_stats.fidelity),
+                    float(getattr(probe_stats, "source_covariance_loss", 0.0)),
+                    float(
+                        getattr(
+                            probe_stats,
+                            "source_covariance_max_loss",
+                            getattr(probe_stats, "source_covariance_loss", 0.0),
+                        )
+                    ),
+                    actual_step,
+                    bisections,
+                    probe_ok,
+                    min_step_override,
+                )
+                return response_params, current_stats, records, rng
+
+            _require_continuation_point_capacity(
+                optimized_count,
+                maximum=self.lit_config.nqs_continuation_max_points,
+                target_omega=target_omega,
+            )
+            inherited_fidelity = float(probe_stats.fidelity)
+            (
+                response_params,
+                current_stats,
+                selected_iteration,
+                rng,
+            ) = self._optimize_nqs_frequency(
+                update_step,
+                response_params,
+                train_pool,
+                eval_pool,
+                fallback_data,
+                rng,
+                omega=candidate_omega,
+                iterations=self.lit_config.nqs_continuation_iterations,
+                stage="continuation",
+                **common,
+            )
 
             records.append(
                 _ContinuationRecord(
@@ -6145,125 +6064,6 @@ def _continuation_history_step_cap(
     return max(float(min_step), multiplier * accepted_step)
 
 
-def _continuation_retry_step_or_raise(
-    error: _NQSStageQualityError,
-    *,
-    actual_step: float,
-    min_step: float,
-) -> float:
-    """Return a smaller step for a pure fidelity miss, or re-raise it."""
-    if (
-        not error.fidelity_failed
-        or error.ess_failed
-        or actual_step <= min_step * (1.0 + 1e-12)
-    ):
-        raise error
-    return max(min_step, 0.5 * actual_step)
-
-
-def _continuation_iteration_schedule(
-    config: MolecularLITConfig,
-) -> tuple[int, ...]:
-    """Return validated cumulative continuation quality-check milestones.
-
-    A missing schedule preserves the legacy single-budget behavior.  An
-    explicit schedule repeats the scalar first budget deliberately, so a CLI
-    override of only ``nqs_continuation_iterations`` fails instead of silently
-    inheriting stale extension budgets.
-
-    Raises:
-        ValueError: If a milestone is not a positive integer, the milestones
-            are not strictly increasing, or the first milestone disagrees
-            with ``nqs_continuation_iterations``.
-    """
-    first = config.nqs_continuation_iterations
-    if (
-        isinstance(first, (bool, np.bool_))
-        or not isinstance(
-            first,
-            (int, np.integer),
-        )
-        or int(first) < 1
-    ):
-        msg = "lit.nqs_continuation_iterations must be a positive integer."
-        raise ValueError(msg)
-    first = int(first)
-    configured = config.nqs_continuation_iteration_schedule
-    if configured is None:
-        return (first,)
-    try:
-        raw_schedule = tuple(configured)
-    except TypeError as error:
-        msg = (
-            "lit.nqs_continuation_iteration_schedule must be a nonempty "
-            "sequence of positive integers."
-        )
-        raise ValueError(msg) from error
-    if not raw_schedule:
-        msg = "lit.nqs_continuation_iteration_schedule must not be empty."
-        raise ValueError(msg)
-    if any(
-        isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))
-        for value in raw_schedule
-    ):
-        msg = (
-            "lit.nqs_continuation_iteration_schedule must contain only "
-            "positive integers."
-        )
-        raise ValueError(msg)
-    schedule = tuple(int(value) for value in raw_schedule)
-    if any(value < 1 for value in schedule):
-        msg = (
-            "lit.nqs_continuation_iteration_schedule must contain only "
-            "positive integers."
-        )
-        raise ValueError(msg)
-    if schedule[0] != first:
-        msg = (
-            "lit.nqs_continuation_iteration_schedule must start with "
-            f"lit.nqs_continuation_iterations={first}, got {schedule[0]}."
-        )
-        raise ValueError(msg)
-    if any(current >= following for current, following in pairwise(schedule)):
-        msg = "lit.nqs_continuation_iteration_schedule must be strictly increasing."
-        raise ValueError(msg)
-    return schedule
-
-
-def _nqs_quality_check_iteration_schedule(
-    iterations: int,
-    quality_check_iterations: tuple[int, ...] | None,
-) -> tuple[int, ...]:
-    """Validate optimizer-local cumulative quality-check milestones.
-
-    Returns:
-        The normalized strictly increasing milestone tuple.
-
-    Raises:
-        ValueError: If the maximum or milestones are invalid or disagree.
-    """
-    maximum = int(iterations)
-    if maximum < 1:
-        msg = "NQS optimizer iterations must be positive."
-        raise ValueError(msg)
-    if quality_check_iterations is None:
-        return (maximum,)
-    schedule = tuple(int(value) for value in quality_check_iterations)
-    if (
-        not schedule
-        or any(value < 1 for value in schedule)
-        or any(current >= following for current, following in pairwise(schedule))
-        or schedule[-1] != maximum
-    ):
-        msg = (
-            "NQS quality-check iterations must be positive, strictly "
-            "increasing cumulative milestones ending at the optimizer "
-            f"maximum {maximum}, got {schedule}."
-        )
-        raise ValueError(msg)
-    return schedule
-
-
 def _physics_continuation_step(stats, *, gap: float, fraction: float, min_step: float):
     """Choose a homotopy step from the inherited LIT residual estimate.
 
@@ -6295,126 +6095,46 @@ def _finite_valid_nqs_stats(
     )
 
 
-def _nqs_stage_quality_failure(
+def _nqs_stage_ess_failure(
     stats,
     *,
-    min_fidelity: float,
     min_reweight_ess_fraction: float,
 ) -> str | None:
-    """Describe an absolute held-out quality-gate failure, if any.
+    """Describe a held-out importance-sampling ESS failure, if any.
 
     Returns:
-        A human-readable failure description, or ``None`` when both active
-        thresholds pass.
+        A human-readable failure description, or ``None`` when the active
+        estimator-health threshold passes.
     """
-    fidelity = float(jax.device_get(stats.fidelity))
     ess_fraction = float(jax.device_get(stats.reweight_ess_fraction))
-    failures = []
-    if min_fidelity > 0.0 and (
-        not np.isfinite(fidelity) or fidelity < float(min_fidelity)
-    ):
-        failures.append(f"fidelity={fidelity:.6f} < required={float(min_fidelity):.6f}")
     if min_reweight_ess_fraction > 0.0 and (
         not np.isfinite(ess_fraction) or ess_fraction < float(min_reweight_ess_fraction)
     ):
-        failures.append(
+        return (
             "ESS fraction="
             f"{ess_fraction:.6f} < required="
             f"{float(min_reweight_ess_fraction):.6f}"
         )
-    return "; ".join(failures) if failures else None
+    return None
 
 
-def _require_nqs_stage_quality(
+def _require_nqs_stage_health(
     stats,
     *,
-    min_fidelity: float,
     min_reweight_ess_fraction: float,
     context: str,
 ) -> None:
-    """Raise when a finite checkpoint misses an absolute science gate.
+    """Raise when a finite checkpoint misses the held-out ESS guard.
 
     Raises:
-        _NQSStageQualityError: If an active fidelity or ESS threshold is
-            missed.
+        RuntimeError: If the active ESS threshold is missed.
     """
-    failure = _nqs_stage_quality_failure(
+    failure = _nqs_stage_ess_failure(
         stats,
-        min_fidelity=min_fidelity,
         min_reweight_ess_fraction=min_reweight_ess_fraction,
     )
     if failure is not None:
-        fidelity = float(jax.device_get(stats.fidelity))
-        ess_fraction = float(jax.device_get(stats.reweight_ess_fraction))
-        fidelity_failed = min_fidelity > 0.0 and (
-            not np.isfinite(fidelity) or fidelity < float(min_fidelity)
-        )
-        ess_failed = min_reweight_ess_fraction > 0.0 and (
-            not np.isfinite(ess_fraction)
-            or ess_fraction < float(min_reweight_ess_fraction)
-        )
-        raise _NQSStageQualityError(
-            f"{context}; {failure}.",
-            fidelity_failed=fidelity_failed,
-            ess_failed=ess_failed,
-        )
-
-
-def _require_pure_fidelity_stage_miss(
-    stats,
-    *,
-    max_source_covariance: float | None,
-    min_fidelity: float,
-    min_reweight_ess_fraction: float,
-    eligibility_context: str,
-    quality_context: str,
-    no_selection_context: str,
-) -> None:
-    """Allow extension only when an intermediate stage misses fidelity alone.
-
-    Raises:
-        _NQSStageQualityError: If ESS fails, either alone or with fidelity.
-        RuntimeError: If the checkpoint is ineligible, or unexpectedly passes
-            every quality gate despite no selectable checkpoint being stored.
-    """
-    _require_eligible_nqs_checkpoint(
-        stats,
-        max_source_covariance=max_source_covariance,
-        context=eligibility_context,
-    )
-    try:
-        _require_nqs_stage_quality(
-            stats,
-            min_fidelity=min_fidelity,
-            min_reweight_ess_fraction=min_reweight_ess_fraction,
-            context=quality_context,
-        )
-    except _NQSStageQualityError as error:
-        if error.fidelity_failed and not error.ess_failed:
-            return
-        raise
-    raise RuntimeError(f"{no_selection_context}.")
-
-
-def _require_nqs_milestone_health(
-    stats,
-    *,
-    max_source_covariance: float | None,
-    min_reweight_ess_fraction: float,
-    context: str,
-) -> None:
-    """Fail closed on numerical, covariance, or ESS milestone failures."""
-    _require_eligible_nqs_checkpoint(
-        stats,
-        max_source_covariance=max_source_covariance,
-        context=f"{context} produced an ineligible held-out checkpoint",
-    )
-    _require_nqs_stage_quality(
-        stats,
-        min_fidelity=0.0,
-        min_reweight_ess_fraction=min_reweight_ess_fraction,
-        context=f"{context} failed its held-out estimator-health gate",
-    )
+        raise RuntimeError(f"{context}; {failure}.")
 
 
 def _continuation_probe_is_acceptable(
@@ -6427,10 +6147,8 @@ def _continuation_probe_is_acceptable(
 ) -> bool:
     """Return whether an inherited checkpoint is safe enough to optimize.
 
-    The absolute fidelity floor is deliberately not a probe requirement.  It
-    applies to the optimized stage result; requiring it before optimization
-    conflates initialization quality with final scientific quality and can
-    force arbitrarily small continuation steps near a response pole.
+    This relative check protects initialization quality without imposing an
+    arbitrary absolute fidelity threshold on the optimized result.
     """
     if not _finite_valid_nqs_stats(
         candidate,
@@ -6438,9 +6156,8 @@ def _continuation_probe_is_acceptable(
     ):
         return False
     if (
-        _nqs_stage_quality_failure(
+        _nqs_stage_ess_failure(
             candidate,
-            min_fidelity=0.0,
             min_reweight_ess_fraction=min_reweight_ess_fraction,
         )
         is not None
@@ -6620,12 +6337,13 @@ _CONTINUATION_STATE_CONFIG_EXCLUSIONS = frozenset(
         "nqs_save_source_pool",
         "nqs_data_parallel",
         "nqs_iterations",
+        "nqs_fidelity_plateau_start_iteration",
+        "nqs_fidelity_plateau_patience_iterations",
+        "nqs_fidelity_plateau_min_delta",
         "nqs_continuation_iterations",
-        "nqs_continuation_iteration_schedule",
         "nqs_continuation_step_fraction",
         "nqs_continuation_step_growth_factor",
         "nqs_continuation_fidelity_retention",
-        "nqs_stage_fidelity_min",
         "nqs_stage_reweight_ess_fraction_min",
         "nqs_continuation_allow_min_step_override",
         "nqs_continuation_min_step",
@@ -8282,13 +8000,34 @@ def _is_eligible_nqs_checkpoint(
     return finite and invalid <= 0.0 and within_covariance
 
 
+def _is_selectable_nqs_checkpoint(
+    stats,
+    *,
+    max_source_covariance: float | None = None,
+    min_reweight_ess_fraction: float = 0.0,
+) -> bool:
+    """Return whether a checkpoint is safe for selection and propagation."""
+    return (
+        _is_eligible_nqs_checkpoint(
+            stats,
+            max_source_covariance=max_source_covariance,
+        )
+        and _nqs_stage_ess_failure(
+            stats,
+            min_reweight_ess_fraction=min_reweight_ess_fraction,
+        )
+        is None
+    )
+
+
 def _is_better_nqs_checkpoint(
     candidate,
     incumbent,
     *,
     max_source_covariance: float | None = None,
+    min_reweight_ess_fraction: float = 0.0,
 ) -> bool:
-    """Compare held-out checkpoints, rejecting non-finite/invalid estimates.
+    """Prefer the highest-fidelity healthy held-out checkpoint.
 
     Returns:
         Whether the candidate should replace the incumbent.
@@ -8298,11 +8037,12 @@ def _is_better_nqs_checkpoint(
         loss = float(jax.device_get(stats.loss))
         fidelity = float(jax.device_get(stats.fidelity))
         reverse_kl = float(jax.device_get(stats.reverse_kl))
-        valid = _is_eligible_nqs_checkpoint(
+        valid = _is_selectable_nqs_checkpoint(
             stats,
             max_source_covariance=max_source_covariance,
+            min_reweight_ess_fraction=min_reweight_ess_fraction,
         )
-        return valid, -loss, fidelity, -reverse_kl
+        return valid, fidelity, -loss, -reverse_kl
 
     candidate_score = score(candidate)
     incumbent_score = score(incumbent)

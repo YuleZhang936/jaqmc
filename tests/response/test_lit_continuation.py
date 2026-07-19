@@ -19,6 +19,7 @@ from jaqmc.app.molecule.lit_workflow import (
     _continuation_probe_is_acceptable,
     _ContinuationRecord,
     _empty_nqs_lit_stats,
+    _FidelityPlateauTracker,
     _physics_continuation_step,
 )
 
@@ -119,7 +120,7 @@ def _run_bridge(
     )
 
 
-def _post_gate_bridge_workflow(
+def _post_optimization_bridge_workflow(
     config,
     *,
     large_optimized_fidelity=0.978273,
@@ -167,50 +168,6 @@ def _post_gate_bridge_workflow(
 
     workflow._nqs_stats_chunked = evaluate
     return workflow, update, starts, rng_starts, attempts
-
-
-def _staged_post_gate_bridge_workflow(config, *, first_large_stats):
-    workflow = object.__new__(MoleculeLITWorkflow)
-    workflow.lit_config = config
-    starts = []
-    rng_starts = []
-    updates = []
-    attempts_by_omega = {}
-
-    def init_carry(_data, rng, params):
-        starts.append(float(params))
-        rng_starts.append(np.asarray(rng).copy())
-        return SimpleNamespace(direct=SimpleNamespace(rng=rng))
-
-    def optimized_stats(omega, attempt):
-        if omega > 0.3 and attempt == 1:
-            return first_large_stats
-        return _bridge_stats(0.995, ess=0.8)
-
-    def update(params, _pool, omega, carry, iteration):
-        omega_value = float(omega)
-        omega_key = round(omega_value, 12)
-        if iteration == 0:
-            attempts_by_omega[omega_key] = attempts_by_omega.get(omega_key, 0) + 1
-        attempt = attempts_by_omega[omega_key]
-        updates.append((omega_value, float(params), iteration, attempt))
-        next_rng = jax.random.fold_in(
-            carry.direct.rng,
-            round(1000.0 * omega_value) + iteration,
-        )
-        next_carry = SimpleNamespace(direct=SimpleNamespace(rng=next_rng))
-        return params + 1.0, optimized_stats(omega_value, attempt), next_carry
-
-    update.init_carry = init_carry
-
-    def evaluate(_response_apply, _params, *_args, **kwargs):
-        omega = float(kwargs["omega"])
-        if updates and np.isclose(updates[-1][0], omega):
-            return optimized_stats(omega, updates[-1][3])
-        return _bridge_stats(0.985, ess=0.8)
-
-    workflow._nqs_stats_chunked = evaluate
-    return workflow, update, starts, rng_starts, updates
 
 
 def test_continuation_default_min_step_uses_finer_spectrum_spacing():
@@ -324,20 +281,22 @@ def test_adaptive_continuation_bisects_and_propagates_bridge_best():
     assert probes[-1] == pytest.approx(1.0)
 
 
-def test_post_optimizer_fidelity_failure_backtracks_from_last_good_state():
+def test_post_optimizer_fidelity_has_no_absolute_gate_or_backtrack():
     config = MolecularLITConfig(
         nqs_warm_start_omega=0.0,
         nqs_continuation_iterations=1,
         nqs_continuation_step_fraction=0.4,
         nqs_continuation_fidelity_retention=0.95,
-        nqs_stage_fidelity_min=0.99,
         nqs_stage_reweight_ess_fraction_min=0.05,
         nqs_continuation_min_step=0.1,
         nqs_continuation_max_points=10,
         nqs_selection_interval=1,
         nqs_log_interval=0,
     )
-    workflow, update, starts, rng_starts, attempts = _post_gate_bridge_workflow(config)
+    workflow, update, starts, rng_starts, attempts = _post_optimization_bridge_workflow(
+        config,
+        large_optimized_fidelity=0.989996,
+    )
     initial_rng = jax.random.PRNGKey(17)
     checkpoints = []
 
@@ -352,145 +311,53 @@ def test_post_optimizer_fidelity_failure_backtracks_from_last_good_state():
         ),
     )
 
-    # This reproduces the formal failure shape: the relative probe accepts the
-    # inherited F=0.974661 at the large step, but optimization only reaches
-    # F=0.978273.  The failed state is discarded and the half-step succeeds.
-    assert attempts == pytest.approx([0.4, 0.2, 0.4])
-    assert starts == pytest.approx([0.0, 0.0, 0.2])
-    assert len(rng_starts) == 3
+    # This is the formal-run boundary that used to fail the arbitrary 0.99
+    # floor.  It is a healthy best held-out checkpoint and is committed without
+    # retrying a smaller frequency step.
+    assert attempts == pytest.approx([0.4])
+    assert starts == pytest.approx([0.0])
+    assert len(rng_starts) == 1
     np.testing.assert_array_equal(rng_starts[0], initial_rng)
-    np.testing.assert_array_equal(rng_starts[1], initial_rng)
-    rng_after_first_success = jax.random.fold_in(initial_rng, 200)
-    np.testing.assert_array_equal(rng_starts[2], rng_after_first_success)
     assert float(params) == pytest.approx(0.4)
-    assert float(stats.fidelity) == pytest.approx(0.995)
-    np.testing.assert_array_equal(rng, jax.random.fold_in(rng_after_first_success, 400))
+    assert float(stats.fidelity) == pytest.approx(0.989996)
+    np.testing.assert_array_equal(rng, jax.random.fold_in(initial_rng, 400))
 
     optimized_records = [record for record in records if record.optimized]
-    assert [record.omega for record in optimized_records] == pytest.approx([0.2, 0.4])
-    assert [record.bisections for record in optimized_records] == [1, 0]
+    assert [record.omega for record in optimized_records] == pytest.approx([0.4])
+    assert [record.bisections for record in optimized_records] == [0]
+    assert float(optimized_records[0].stats.fidelity) == pytest.approx(0.989996)
     assert records[-1].omega == pytest.approx(0.6)
     assert not records[-1].optimized
 
-    # A failed trial is never committed to the durable continuation chain.
-    assert len(checkpoints) == 2
+    assert len(checkpoints) == 1
     checkpoint_params, _, checkpoint_rng, checkpoint_omega, checkpoint_records = (
         checkpoints[0]
     )
-    assert float(checkpoint_params) == pytest.approx(0.2)
-    assert checkpoint_omega == pytest.approx(0.2)
+    assert float(checkpoint_params) == pytest.approx(0.4)
+    assert checkpoint_omega == pytest.approx(0.4)
     np.testing.assert_array_equal(
         checkpoint_rng,
-        jax.random.fold_in(initial_rng, 200),
+        jax.random.fold_in(initial_rng, 400),
     )
-    assert checkpoint_records[-1].omega == pytest.approx(0.2)
+    assert checkpoint_records[-1].omega == pytest.approx(0.4)
     assert checkpoint_records[-1].optimized
 
 
-def test_staged_continuation_backtracks_only_after_final_fidelity_milestone():
-    config = MolecularLITConfig(
-        nqs_warm_start_omega=0.0,
-        nqs_continuation_iterations=1,
-        nqs_continuation_iteration_schedule=(1, 2, 3),
-        nqs_continuation_step_fraction=0.4,
-        nqs_continuation_fidelity_retention=0.95,
-        nqs_stage_fidelity_min=0.99,
-        nqs_stage_reweight_ess_fraction_min=0.05,
-        nqs_continuation_min_step=0.1,
-        nqs_continuation_max_points=10,
-        nqs_selection_interval=1,
-        nqs_log_interval=0,
-    )
-    workflow, update, starts, rng_starts, updates = _staged_post_gate_bridge_workflow(
-        config,
-        first_large_stats=_bridge_stats(0.989, ess=0.8),
-    )
-    initial_rng = jax.random.PRNGKey(29)
-
-    _, _, records, _ = _run_bridge(
-        workflow,
-        update,
-        target=0.6,
-        current_stats=_bridge_stats(0.995, ess=0.8),
-        rng=initial_rng,
-    )
-
-    # The first proposal stays on one params/SPRING/RNG trajectory through all
-    # three cumulative milestones.  Only the final pure-fidelity miss permits
-    # a rollback and half-step retry from the last committed state.
-    assert [omega for omega, *_ in updates] == pytest.approx([0.4, 0.4, 0.4, 0.2, 0.4])
-    assert [params for _, params, *_ in updates[:3]] == pytest.approx([0.0, 1.0, 2.0])
-    assert [iteration for *_, iteration, _ in updates[:3]] == [0, 1, 2]
-    assert starts == pytest.approx([0.0, 0.0, 1.0])
-    np.testing.assert_array_equal(rng_starts[0], initial_rng)
-    np.testing.assert_array_equal(rng_starts[1], initial_rng)
-    optimized_records = [record for record in records if record.optimized]
-    assert [record.omega for record in optimized_records] == pytest.approx([0.2, 0.4])
-    assert [record.bisections for record in optimized_records] == [1, 0]
-
-
-@pytest.mark.parametrize(
-    ("first_stage_stats", "message"),
-    [
-        (_bridge_stats(0.995, ess=0.01), "ESS fraction"),
-        (_bridge_stats(0.995, invalid=1.0), "eligible|invalid|numerical"),
-    ],
-    ids=["low_ess", "invalid"],
-)
-def test_staged_continuation_non_fidelity_failure_is_immediately_fail_closed(
-    first_stage_stats,
-    message,
-):
-    config = MolecularLITConfig(
-        nqs_warm_start_omega=0.0,
-        nqs_continuation_iterations=1,
-        nqs_continuation_iteration_schedule=(1, 2, 3),
-        nqs_continuation_step_fraction=0.4,
-        nqs_continuation_fidelity_retention=0.95,
-        nqs_stage_fidelity_min=0.99,
-        nqs_stage_reweight_ess_fraction_min=0.05,
-        nqs_continuation_min_step=0.1,
-        nqs_continuation_max_points=10,
-        nqs_selection_interval=1,
-        nqs_log_interval=0,
-    )
-    workflow, update, starts, _, updates = _staged_post_gate_bridge_workflow(
-        config,
-        first_large_stats=first_stage_stats,
-    )
-    checkpoints = []
-
-    with pytest.raises(RuntimeError, match=message):
-        _run_bridge(
-            workflow,
-            update,
-            target=0.6,
-            current_stats=_bridge_stats(0.995, ess=0.8),
-            checkpoint_callback=lambda *args: checkpoints.append(args),
-        )
-
-    assert [omega for omega, *_ in updates] == pytest.approx([0.4])
-    assert starts == pytest.approx([0.0])
-    assert checkpoints == []
-
-
-def test_continuation_single_integer_runs_once_to_legacy_iteration_limit():
+def test_continuation_runs_configured_maximum_without_plateau():
     config = MolecularLITConfig(
         nqs_warm_start_omega=0.0,
         nqs_continuation_iterations=2,
-        nqs_continuation_iteration_schedule=None,
         nqs_continuation_step_fraction=0.4,
         nqs_continuation_fidelity_retention=0.95,
-        nqs_stage_fidelity_min=0.99,
         nqs_stage_reweight_ess_fraction_min=0.05,
         nqs_continuation_min_step=0.1,
         nqs_continuation_max_points=10,
         nqs_selection_interval=1,
         nqs_log_interval=0,
     )
-    workflow, update, starts, _, updates = _staged_post_gate_bridge_workflow(
+    workflow, update, starts, _, updates = _post_optimization_bridge_workflow(
         config,
-        first_large_stats=_bridge_stats(0.995, ess=0.8),
+        large_optimized_fidelity=0.995,
     )
 
     _, _, records, _ = _run_bridge(
@@ -500,40 +367,36 @@ def test_continuation_single_integer_runs_once_to_legacy_iteration_limit():
         current_stats=_bridge_stats(0.995, ess=0.8),
     )
 
-    assert [omega for omega, *_ in updates] == pytest.approx([0.4, 0.4])
-    assert [iteration for *_, iteration, _ in updates] == [0, 1]
+    assert updates == pytest.approx([0.4, 0.4])
     assert starts == pytest.approx([0.0])
     optimized_records = [record for record in records if record.optimized]
     assert len(optimized_records) == 1
     assert optimized_records[0].omega == pytest.approx(0.4)
 
 
-def test_backtracked_step_is_held_then_clean_success_grows_cautiously():
+def test_inherited_probe_bisection_is_held_then_clean_success_grows_cautiously():
     config = MolecularLITConfig(
         nqs_warm_start_omega=0.0,
         nqs_continuation_iterations=1,
         nqs_continuation_step_fraction=0.4,
         nqs_continuation_step_growth_factor=1.25,
         nqs_continuation_fidelity_retention=0.95,
-        nqs_stage_fidelity_min=0.99,
         nqs_stage_reweight_ess_fraction_min=0.05,
         nqs_continuation_min_step=0.1,
         nqs_continuation_max_points=10,
         nqs_selection_interval=1,
         nqs_log_interval=0,
     )
-    workflow, update, starts, _, attempts = _post_gate_bridge_workflow(config)
+    workflow, update, starts, _, attempts = _post_optimization_bridge_workflow(config)
     checkpoints = []
 
     def evaluate(_response_apply, params, *_args, **kwargs):
         omega = float(kwargs["omega"])
         optimized = np.isclose(float(params), omega)
-        first_large_trial = (
-            optimized
-            and np.isclose(omega, 0.4)
-            and sum(np.isclose(attempt, 0.4) for attempt in attempts) == 1
+        first_probe_too_large = (
+            not optimized and np.isclose(float(params), 0.0) and omega > 0.3
         )
-        fidelity = 0.986 if first_large_trial else (0.995 if optimized else 0.985)
+        fidelity = 0.90 if first_probe_too_large else (0.995 if optimized else 0.985)
         return _bridge_stats(fidelity, ess=0.8)
 
     workflow._nqs_stats_chunked = evaluate
@@ -546,11 +409,10 @@ def test_backtracked_step_is_held_then_clean_success_grows_cautiously():
         checkpoint_callback=lambda *args: checkpoints.append(args),
     )
 
-    # The first 0.4 trial fails and recovers at 0.2.  That recovered 0.2 step
-    # is held for the next outer proposal; only its clean success grows the
-    # following step to 0.25.  The physics proposal remains 0.4 throughout.
-    assert attempts == pytest.approx([0.4, 0.2, 0.4, 0.65])
-    assert starts == pytest.approx([0.0, 0.0, 0.2, 0.4])
+    # The inherited 0.4 probe fails relative retention and bisects to 0.2.
+    # That recovered step is held once; only the next clean success grows it.
+    assert attempts == pytest.approx([0.2, 0.4, 0.65])
+    assert starts == pytest.approx([0.0, 0.2, 0.4])
     optimized_records = [record for record in records if record.optimized]
     assert [record.step for record in optimized_records] == pytest.approx(
         [0.2, 0.2, 0.25]
@@ -680,69 +542,41 @@ def test_history_step_cap_ignores_unoptimized_tail_record():
     ) == pytest.approx(0.2)
 
 
-def test_post_optimizer_fidelity_failure_at_min_step_fails_closed():
+def test_post_optimizer_low_ess_candidate_returns_inherited_healthy_checkpoint():
     config = MolecularLITConfig(
         nqs_warm_start_omega=0.0,
         nqs_continuation_iterations=1,
         nqs_continuation_step_fraction=0.4,
         nqs_continuation_fidelity_retention=0.95,
-        nqs_stage_fidelity_min=0.99,
-        nqs_stage_reweight_ess_fraction_min=0.05,
-        nqs_continuation_allow_min_step_override=True,
-        nqs_continuation_min_step=0.4,
-        nqs_continuation_max_points=10,
-        nqs_selection_interval=1,
-        nqs_log_interval=0,
-    )
-    workflow, update, starts, _, attempts = _post_gate_bridge_workflow(config)
-    checkpoints = []
-
-    with pytest.raises(RuntimeError, match=r"quality gate.*required=0\.990000"):
-        _run_bridge(
-            workflow,
-            update,
-            target=0.6,
-            current_stats=_bridge_stats(0.990259, ess=0.971),
-            checkpoint_callback=lambda *args: checkpoints.append(args),
-        )
-
-    assert attempts == pytest.approx([0.4])
-    assert starts == pytest.approx([0.0])
-    assert checkpoints == []
-
-
-def test_post_optimizer_ess_failure_is_not_backtracked():
-    config = MolecularLITConfig(
-        nqs_warm_start_omega=0.0,
-        nqs_continuation_iterations=1,
-        nqs_continuation_step_fraction=0.4,
-        nqs_continuation_fidelity_retention=0.95,
-        nqs_stage_fidelity_min=0.99,
         nqs_stage_reweight_ess_fraction_min=0.05,
         nqs_continuation_min_step=0.1,
         nqs_continuation_max_points=10,
         nqs_selection_interval=1,
         nqs_log_interval=0,
     )
-    workflow, update, starts, _, attempts = _post_gate_bridge_workflow(
+    workflow, update, starts, _, attempts = _post_optimization_bridge_workflow(
         config,
         large_optimized_fidelity=0.995,
         optimized_ess=0.01,
     )
     checkpoints = []
 
-    with pytest.raises(RuntimeError, match=r"ESS fraction=.*required=0\.050000"):
-        _run_bridge(
-            workflow,
-            update,
-            target=0.6,
-            current_stats=_bridge_stats(0.990259, ess=0.971),
-            checkpoint_callback=lambda *args: checkpoints.append(args),
-        )
+    params, stats, records, _ = _run_bridge(
+        workflow,
+        update,
+        target=0.6,
+        current_stats=_bridge_stats(0.990259, ess=0.971),
+        checkpoint_callback=lambda *args: checkpoints.append(args),
+    )
 
     assert attempts == pytest.approx([0.4])
     assert starts == pytest.approx([0.0])
-    assert checkpoints == []
+    assert float(params) == pytest.approx(0.0)
+    assert float(stats.fidelity) == pytest.approx(0.974661)
+    optimized_records = [record for record in records if record.optimized]
+    assert len(optimized_records) == 1
+    assert float(optimized_records[0].stats.reweight_ess_fraction) == pytest.approx(0.8)
+    assert len(checkpoints) == 1
 
 
 def test_post_optimizer_runtime_error_is_not_backtracked():
@@ -751,13 +585,12 @@ def test_post_optimizer_runtime_error_is_not_backtracked():
         nqs_continuation_iterations=1,
         nqs_continuation_step_fraction=0.4,
         nqs_continuation_fidelity_retention=0.95,
-        nqs_stage_fidelity_min=0.99,
         nqs_continuation_min_step=0.1,
         nqs_continuation_max_points=10,
         nqs_selection_interval=1,
         nqs_log_interval=0,
     )
-    workflow, update, starts, _, _ = _post_gate_bridge_workflow(config)
+    workflow, update, starts, _, _ = _post_optimization_bridge_workflow(config)
     checkpoints = []
 
     def fail_update(*_args, **_kwargs):
@@ -822,39 +655,19 @@ def test_adaptive_continuation_rejects_invalid_probe_at_min_step():
         _run_bridge(workflow, update, target=0.4)
 
 
-@pytest.mark.parametrize(
-    ("field_name", "value"),
-    [
-        ("nqs_stage_fidelity_min", -1e-6),
-        ("nqs_stage_fidelity_min", 1.0 + 1e-6),
-        ("nqs_stage_fidelity_min", np.nan),
-        ("nqs_stage_reweight_ess_fraction_min", -1e-6),
-        ("nqs_stage_reweight_ess_fraction_min", 1.0 + 1e-6),
-        ("nqs_stage_reweight_ess_fraction_min", np.nan),
-    ],
-)
-def test_stage_gate_config_rejects_values_outside_unit_interval(
-    field_name,
-    value,
-):
+@pytest.mark.parametrize("value", [-1e-6, 1.0 + 1e-6, np.nan])
+def test_stage_ess_config_rejects_values_outside_unit_interval(value):
     workflow = object.__new__(MoleculeLITWorkflow)
-    workflow.lit_config = MolecularLITConfig(**{field_name: value})
+    workflow.lit_config = MolecularLITConfig(nqs_stage_reweight_ess_fraction_min=value)
 
-    with pytest.raises(ValueError, match=field_name):
+    with pytest.raises(ValueError, match="nqs_stage_reweight_ess_fraction_min"):
         workflow._validate_continuation_config()
 
 
 @pytest.mark.parametrize("value", [0.0, 1.0])
-@pytest.mark.parametrize(
-    "field_name",
-    [
-        "nqs_stage_fidelity_min",
-        "nqs_stage_reweight_ess_fraction_min",
-    ],
-)
-def test_stage_gate_config_accepts_unit_interval_boundaries(field_name, value):
+def test_stage_ess_config_accepts_unit_interval_boundaries(value):
     workflow = object.__new__(MoleculeLITWorkflow)
-    workflow.lit_config = MolecularLITConfig(**{field_name: value})
+    workflow.lit_config = MolecularLITConfig(nqs_stage_reweight_ess_fraction_min=value)
 
     workflow._validate_continuation_config()
 
@@ -876,45 +689,52 @@ def test_continuation_step_growth_accepts_safe_boundaries(value):
     workflow._validate_continuation_config()
 
 
-def test_continuation_iteration_schedule_accepts_formal_cumulative_milestones():
-    workflow = object.__new__(MoleculeLITWorkflow)
-    workflow.lit_config = MolecularLITConfig(
-        nqs_continuation_iterations=1500,
-        nqs_continuation_iteration_schedule=(1500, 3000, 6000),
-    )
-
-    workflow._validate_continuation_config()
-
-
 @pytest.mark.parametrize(
-    "schedule",
+    ("field_name", "value"),
     [
-        (),
-        (0,),
-        (1500, 1500),
-        (1500, 1499),
-        (3000, 6000),
-        (1500, 3000.5),
+        ("nqs_fidelity_plateau_start_iteration", -1),
+        ("nqs_fidelity_plateau_start_iteration", 1.5),
+        ("nqs_fidelity_plateau_start_iteration", True),
+        ("nqs_fidelity_plateau_patience_iterations", -1),
+        ("nqs_fidelity_plateau_patience_iterations", 1.5),
+        ("nqs_fidelity_plateau_patience_iterations", True),
     ],
 )
-def test_continuation_iteration_schedule_rejects_invalid_milestones(schedule):
+def test_fidelity_plateau_integer_config_rejects_invalid_values(field_name, value):
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(**{field_name: value})
+
+    with pytest.raises(ValueError, match=field_name):
+        workflow._validate_nqs_iteration_config()
+
+
+@pytest.mark.parametrize("value", [-1e-6, 1.0 + 1e-6, np.nan, np.inf])
+def test_fidelity_plateau_min_delta_rejects_invalid_values(value):
     workflow = object.__new__(MoleculeLITWorkflow)
     workflow.lit_config = MolecularLITConfig(
-        nqs_continuation_iterations=1500,
-        nqs_continuation_iteration_schedule=schedule,
+        nqs_fidelity_plateau_min_delta=value,
     )
 
-    with pytest.raises(ValueError, match="iteration_schedule"):
-        workflow._validate_continuation_config()
+    with pytest.raises(ValueError, match="nqs_fidelity_plateau_min_delta"):
+        workflow._validate_nqs_iteration_config()
 
 
-def test_continuation_probe_uses_relative_fidelity_not_stage_floor():
+@pytest.mark.parametrize("value", [0.0, 1.0])
+def test_fidelity_plateau_min_delta_accepts_unit_interval_boundaries(value):
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(
+        nqs_fidelity_plateau_min_delta=value,
+    )
+
+    workflow._validate_nqs_iteration_config()
+
+
+def test_continuation_probe_uses_relative_fidelity_only():
     current = _bridge_stats(0.990063, ess=0.708)
     candidate = _bridge_stats(0.989922, ess=0.704427)
 
-    # This is the exact failed formal-run boundary.  The inherited parameters
-    # are an excellent initialization even though they have not yet recovered
-    # the absolute post-optimization science floor.
+    # This is the exact old formal-run boundary.  There is deliberately no
+    # absolute post-optimization fidelity floor.
     assert candidate.fidelity >= 0.95 * current.fidelity
     assert _continuation_probe_is_acceptable(
         current,
@@ -943,13 +763,12 @@ def test_continuation_probe_requires_absolute_ess_floor():
     )
 
 
-def test_target_probe_below_stage_floor_is_kept_for_spectrum_recovery():
+def test_target_probe_below_previous_absolute_floor_is_kept_for_spectrum():
     config = MolecularLITConfig(
         nqs_warm_start_omega=0.0,
         nqs_continuation_iterations=1,
         nqs_continuation_step_fraction=10.0,
         nqs_continuation_fidelity_retention=0.95,
-        nqs_stage_fidelity_min=0.99,
         nqs_stage_reweight_ess_fraction_min=0.05,
         nqs_continuation_min_step=0.01,
         nqs_selection_interval=1,
@@ -982,7 +801,6 @@ def test_min_step_relative_retention_failure_respects_disabled_recovery():
         nqs_continuation_iterations=1,
         nqs_continuation_step_fraction=0.1,
         nqs_continuation_fidelity_retention=0.99,
-        nqs_stage_fidelity_min=0.99,
         nqs_continuation_allow_min_step_override=False,
         nqs_continuation_min_step=0.1,
         nqs_continuation_max_points=10,
@@ -1004,7 +822,6 @@ def test_default_min_step_override_preserves_legacy_propagation():
         nqs_continuation_iterations=1,
         nqs_continuation_step_fraction=0.1,
         nqs_continuation_fidelity_retention=0.99,
-        nqs_stage_fidelity_min=0.99,
         nqs_continuation_min_step=0.1,
         nqs_continuation_max_points=10,
         nqs_selection_interval=1,
@@ -1098,7 +915,6 @@ def test_continuation_checkpoint_round_trip_across_run_directories(tmp_path):
     new_run = tmp_path / "new"
     config = MolecularLITConfig(
         nqs_warm_start_omega=0.0,
-        nqs_stage_fidelity_min=0.99,
         nqs_stage_reweight_ess_fraction_min=0.05,
     )
     response_params = {"w": jnp.asarray([1.0 + 2.0j])}
@@ -1161,15 +977,14 @@ def test_continuation_checkpoint_round_trip_across_run_directories(tmp_path):
         source_norm=1.0,
         response_parity=-1,
         state_fingerprint=state_fingerprint,
-        # The removed gain gate was excluded from the physical-state
-        # fingerprint, so its legacy full-config digest must remain resumable.
+        # Execution-only policy changes are excluded from the physical-state
+        # fingerprint, so a legacy full-config digest remains resumable.
         full_config_digest=f"legacy-gain-config-{full_digest}",
         warm_start_selected_iteration=1500,
     )
 
     restore_config = MolecularLITConfig(
         nqs_warm_start_omega=0.0,
-        nqs_stage_fidelity_min=0.99,
         nqs_stage_reweight_ess_fraction_min=0.05,
         nqs_continuation_restore_path=str(old_run),
     )
@@ -1221,13 +1036,18 @@ def test_continuation_checkpoint_round_trip_across_run_directories(tmp_path):
     assert restore().current_stats.fidelity == pytest.approx(0.990001)
 
     workflow._evaluate_nqs_checkpoint = lambda **_kwargs: stats._replace(
-        fidelity=jnp.asarray(0.989999)
+        fidelity=jnp.asarray(0.989996)
     )
-    with pytest.raises(RuntimeError, match=r"required=0\.990000"):
+    assert restore().current_stats.fidelity == pytest.approx(0.989996)
+
+    workflow._evaluate_nqs_checkpoint = lambda **_kwargs: stats._replace(
+        reweight_ess_fraction=jnp.asarray(0.049)
+    )
+    with pytest.raises(RuntimeError, match=r"ESS fraction=.*required=0\.050000"):
         restore()
 
 
-def test_continuation_state_fingerprint_allows_new_gates_but_not_new_ansatz():
+def test_continuation_state_fingerprint_allows_new_execution_policy_not_ansatz():
     params = {"w": jnp.asarray([1.0])}
     ground = {"g": jnp.asarray([2.0])}
     digest_args = dict(
@@ -1245,16 +1065,19 @@ def test_continuation_state_fingerprint_allows_new_gates_but_not_new_ansatz():
         spectrum_omega=np.asarray([0.4, 0.5]),
     )
     old_config = MolecularLITConfig(
-        nqs_stage_fidelity_min=0.99,
+        nqs_fidelity_plateau_start_iteration=1500,
+        nqs_fidelity_plateau_patience_iterations=1000,
+        nqs_fidelity_plateau_min_delta=1e-5,
         nqs_continuation_allow_min_step_override=False,
     )
     recovered_config = MolecularLITConfig(
-        nqs_stage_fidelity_min=0.995,
+        nqs_fidelity_plateau_start_iteration=1200,
+        nqs_fidelity_plateau_patience_iterations=500,
+        nqs_fidelity_plateau_min_delta=2e-5,
         nqs_continuation_allow_min_step_override=True,
     )
     changed_ansatz = MolecularLITConfig(nqs_response_ndets=32)
     relocated_inputs = MolecularLITConfig(
-        nqs_stage_fidelity_min=0.99,
         nqs_continuation_allow_min_step_override=False,
         nqs_checkpoint_path="/moved/ground",
         nqs_source_pool_dir="/moved/source_pools",
@@ -1262,17 +1085,16 @@ def test_continuation_state_fingerprint_allows_new_gates_but_not_new_ansatz():
         nqs_save_source_pool=False,
     )
     changed_controller = MolecularLITConfig(
-        nqs_stage_fidelity_min=0.99,
         nqs_continuation_allow_min_step_override=False,
         nqs_continuation_step_growth_factor=1.5,
     )
-    changed_iteration_schedule = MolecularLITConfig(
-        nqs_stage_fidelity_min=0.99,
+    changed_plateau_policy = MolecularLITConfig(
+        nqs_fidelity_plateau_start_iteration=100,
+        nqs_fidelity_plateau_patience_iterations=200,
+        nqs_fidelity_plateau_min_delta=5e-5,
         nqs_continuation_allow_min_step_override=False,
-        nqs_continuation_iteration_schedule=(100, 200, 400),
     )
     changed_execution_layout = MolecularLITConfig(
-        nqs_stage_fidelity_min=0.99,
         nqs_continuation_allow_min_step_override=False,
         nqs_data_parallel="local_devices",
     )
@@ -1297,8 +1119,8 @@ def test_continuation_state_fingerprint_allows_new_gates_but_not_new_ansatz():
         changed_controller,
         **digest_args,
     )
-    schedule_state, schedule_full = _continuation_checkpoint_digests(
-        changed_iteration_schedule,
+    plateau_state, plateau_full = _continuation_checkpoint_digests(
+        changed_plateau_policy,
         **digest_args,
     )
     execution_state, execution_full = _continuation_checkpoint_digests(
@@ -1313,8 +1135,8 @@ def test_continuation_state_fingerprint_allows_new_gates_but_not_new_ansatz():
     assert relocated_full != old_full
     assert controller_state == old_state
     assert controller_full != old_full
-    assert schedule_state == old_state
-    assert schedule_full != old_full
+    assert plateau_state == old_state
+    assert plateau_full != old_full
     assert execution_state == old_state
     assert execution_full != old_full
 
@@ -1365,7 +1187,6 @@ def _run_stage_optimizer(
     update,
     *,
     iterations=1,
-    quality_check_iterations=None,
 ):
     return workflow._optimize_nqs_frequency(
         update,
@@ -1384,7 +1205,6 @@ def _run_stage_optimizer(
         omega=-1.0,
         iterations=iterations,
         stage="test",
-        quality_check_iterations=quality_check_iterations,
     )
 
 
@@ -1407,7 +1227,7 @@ def _mock_stage_optimizer_with_stats(config, initial_stats, candidate_stats):
     return workflow, update
 
 
-def _mock_staged_optimizer(config, stats_by_iteration):
+def _mock_optimizer_trajectory(config, stats_by_iteration):
     workflow = object.__new__(MoleculeLITWorkflow)
     workflow.lit_config = config
     init_calls = []
@@ -1436,197 +1256,95 @@ def _mock_staged_optimizer(config, stats_by_iteration):
     return workflow, update, init_calls, updates
 
 
-@pytest.mark.parametrize(
-    "passing_milestone",
-    [1, 2, 3],
-    ids=["pass_at_1500", "extend_to_3000", "extend_to_6000"],
-)
-def test_staged_optimizer_extends_one_trajectory_until_fidelity_passes(
-    passing_milestone,
-):
+def test_plateau_tracker_establishes_baseline_before_counting_patience():
+    tracker = _FidelityPlateauTracker(
+        start_iteration=1500,
+        patience_iterations=1000,
+        min_delta=1e-5,
+    )
+
+    assert not tracker.observe(1499, 0.99)
+    assert tracker.reference_fidelity is None
+    assert not tracker.observe(1500, 0.99)
+    assert not tracker.observe(2499, 0.99 + 1e-5)
+    assert tracker.observe(2500, 0.99 + 1e-5)
+
+
+def test_plateau_tracker_resets_only_after_cumulative_significant_gain():
+    tracker = _FidelityPlateauTracker(
+        start_iteration=2,
+        patience_iterations=2,
+        min_delta=0.01,
+    )
+
+    assert not tracker.observe(2, 0.80)
+    assert not tracker.observe(3, 0.805)
+    assert not tracker.observe(4, 0.811)
+    assert tracker.last_significant_iteration == 4
+    assert not tracker.observe(5, 0.811)
+    assert tracker.observe(6, 0.811)
+
+
+def test_optimizer_plateau_cannot_stop_at_baseline_iteration():
     config = MolecularLITConfig(
-        nqs_stage_fidelity_min=0.99,
-        nqs_stage_reweight_ess_fraction_min=0.05,
-        # Milestones must force held-out evaluation even when they do not
-        # coincide with the ordinary model-selection interval.
-        nqs_selection_interval=10,
-        nqs_log_interval=0,
-    )
-    stats_by_iteration = {
-        0: _bridge_stats(0.9898, ess=0.8),
-        **{
-            iteration: _bridge_stats(
-                0.995 if iteration >= passing_milestone else 0.9899,
-                ess=0.8,
-            )
-            for iteration in range(1, 4)
-        },
-    }
-    workflow, update, init_calls, updates = _mock_staged_optimizer(
-        config,
-        stats_by_iteration,
-    )
-    initial_rng = jax.random.PRNGKey(23)
-
-    params, stats, selected_iteration, rng = workflow._optimize_nqs_frequency(
-        update,
-        initial_params=jnp.asarray(0.0),
-        train_pool=None,
-        eval_pool=None,
-        fallback_data=None,
-        rng=initial_rng,
-        response_apply=None,
-        ground_logpsi=None,
-        ground_params=None,
-        axis=0,
-        source_center=0.0,
-        source_norm=1.0,
-        ground_energy=0.0,
-        omega=-1.0,
-        iterations=3,
-        stage="continuation",
-        quality_check_iterations=(1, 2, 3),
-    )
-
-    assert len(init_calls) == 1
-    assert [start for start, _ in init_calls] == pytest.approx([0.0])
-    assert [start for start, _ in updates] == pytest.approx(
-        list(range(passing_milestone))
-    )
-    assert [iteration for _, iteration in updates] == list(range(passing_milestone))
-    assert float(params) == pytest.approx(passing_milestone)
-    assert float(stats.fidelity) == pytest.approx(0.995)
-    assert selected_iteration == passing_milestone
-    expected_rng = initial_rng
-    for iteration in range(passing_milestone):
-        expected_rng = jax.random.fold_in(expected_rng, iteration + 1)
-    np.testing.assert_array_equal(rng, expected_rng)
-
-
-def test_staged_optimizer_preserves_heldout_selection_at_milestone():
-    config = MolecularLITConfig(
-        nqs_stage_fidelity_min=0.99,
+        nqs_fidelity_plateau_start_iteration=2,
+        nqs_fidelity_plateau_patience_iterations=2,
+        nqs_fidelity_plateau_min_delta=1e-5,
         nqs_stage_reweight_ess_fraction_min=0.05,
         nqs_selection_interval=1,
         nqs_log_interval=0,
     )
-    workflow, update, init_calls, updates = _mock_staged_optimizer(
+    workflow, update, init_calls, updates = _mock_optimizer_trajectory(
         config,
-        {
-            0: _bridge_stats(0.989, ess=0.8),
-            1: _bridge_stats(0.995, ess=0.8),
-            # A healthy live milestone may fluctuate below the fidelity floor.
-            # Preserve the passing held-out checkpoint exactly as a legacy
-            # two-iteration optimization would, rather than discarding it.
-            2: _bridge_stats(0.989, ess=0.8),
-            3: _bridge_stats(0.989, ess=0.8),
-        },
+        {iteration: _bridge_stats(0.989996, ess=0.8) for iteration in range(6)},
     )
 
     params, stats, selected_iteration, _ = _run_stage_optimizer(
         workflow,
         update,
-        iterations=3,
-        quality_check_iterations=(2, 3),
+        iterations=5,
     )
 
     assert len(init_calls) == 1
-    assert len(updates) == 2
-    assert float(params) == pytest.approx(1.0)
-    assert float(stats.fidelity) == pytest.approx(0.995)
-    assert selected_iteration == 1
-
-
-def test_stage_optimizer_single_integer_keeps_legacy_full_run_behavior():
-    config = MolecularLITConfig(
-        nqs_stage_fidelity_min=0.99,
-        nqs_stage_reweight_ess_fraction_min=0.05,
-        nqs_selection_interval=1,
-        nqs_log_interval=0,
-    )
-    workflow, update, init_calls, updates = _mock_staged_optimizer(
-        config,
-        {
-            0: _bridge_stats(0.989, ess=0.8),
-            1: _bridge_stats(0.995, ess=0.8),
-            2: _bridge_stats(0.994, ess=0.8),
-        },
-    )
-
-    params, stats, selected_iteration, _ = _run_stage_optimizer(
-        workflow,
-        update,
-        iterations=2,
-    )
-
-    assert len(init_calls) == 1
-    assert len(updates) == 2
-    assert float(params) == pytest.approx(1.0)
-    assert float(stats.fidelity) == pytest.approx(0.995)
-    assert selected_iteration == 1
-
-
-@pytest.mark.parametrize("candidate_fidelity", [0.99, 0.990001])
-def test_stage_optimizer_accepts_absolute_floor_crossing_without_gain_gate(
-    candidate_fidelity,
-):
-    config = MolecularLITConfig(
-        nqs_stage_fidelity_min=0.99,
-        nqs_stage_reweight_ess_fraction_min=0.05,
-        nqs_selection_interval=1,
-        nqs_log_interval=0,
-    )
-    initial = _bridge_stats(0.989999, ess=0.704427)
-    candidate = _bridge_stats(candidate_fidelity, ess=0.70)
-    workflow, update = _mock_stage_optimizer_with_stats(config, initial, candidate)
-
-    params, stats, selected_iteration, _ = _run_stage_optimizer(workflow, update)
-
-    assert float(params) == pytest.approx(1.0)
-    assert float(stats.fidelity) == pytest.approx(candidate_fidelity)
-    assert selected_iteration == 1
-
-
-def test_stage_optimizer_rejects_checkpoint_below_absolute_floor():
-    config = MolecularLITConfig(
-        nqs_stage_fidelity_min=0.99,
-        nqs_stage_reweight_ess_fraction_min=0.05,
-        nqs_selection_interval=1,
-        nqs_log_interval=0,
-    )
-    initial = _bridge_stats(0.989998, ess=0.704427)
-    candidate = _bridge_stats(0.989999, ess=0.70)
-    workflow, update = _mock_stage_optimizer_with_stats(config, initial, candidate)
-
-    with pytest.raises(RuntimeError, match=r"quality gate.*required=0\.990000"):
-        _run_stage_optimizer(workflow, update)
-
-
-def test_gate_eligible_initial_is_not_displaced_by_lower_loss_ineligible_candidate():
-    config = MolecularLITConfig(
-        nqs_reverse_kl_weight=1.0,
-        nqs_stage_fidelity_min=0.99,
-        nqs_stage_reweight_ess_fraction_min=0.05,
-        nqs_selection_interval=1,
-        nqs_log_interval=0,
-    )
-    initial = _bridge_stats(0.995, ess=0.5, reverse_kl=0.2)
-    candidate = _bridge_stats(0.98, ess=0.5, reverse_kl=0.0)
-    workflow, update = _mock_stage_optimizer_with_stats(config, initial, candidate)
-
-    # The candidate has the lower regularized loss (0.02 versus 0.205), but it
-    # must not displace an iteration-zero checkpoint that passes every gate.
-    params, stats, selected_iteration, _ = _run_stage_optimizer(workflow, update)
-
+    assert len(updates) == 4
+    assert [iteration for _, iteration in updates] == [0, 1, 2, 3]
     assert float(params) == pytest.approx(0.0)
-    assert float(stats.fidelity) == pytest.approx(0.995)
+    assert float(stats.fidelity) == pytest.approx(0.989996)
     assert selected_iteration == 0
 
 
-def test_gate_eligible_candidate_is_saved_despite_worse_regularized_loss():
+def test_optimizer_significant_gain_resets_plateau_patience():
+    config = MolecularLITConfig(
+        nqs_fidelity_plateau_start_iteration=1,
+        nqs_fidelity_plateau_patience_iterations=2,
+        nqs_fidelity_plateau_min_delta=0.01,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    fidelities = (0.80, 0.80, 0.805, 0.811, 0.811, 0.811, 0.811)
+    workflow, update, _, updates = _mock_optimizer_trajectory(
+        config,
+        {
+            iteration: _bridge_stats(fidelity, ess=0.8)
+            for iteration, fidelity in enumerate(fidelities)
+        },
+    )
+
+    params, stats, selected_iteration, _ = _run_stage_optimizer(
+        workflow,
+        update,
+        iterations=6,
+    )
+
+    assert len(updates) == 5
+    assert float(params) == pytest.approx(3.0)
+    assert float(stats.fidelity) == pytest.approx(0.811)
+    assert selected_iteration == 3
+
+
+def test_optimizer_returns_highest_fidelity_despite_worse_regularized_loss():
     config = MolecularLITConfig(
         nqs_reverse_kl_weight=1.0,
-        nqs_stage_fidelity_min=0.99,
         nqs_stage_reweight_ess_fraction_min=0.05,
         nqs_selection_interval=1,
         nqs_log_interval=0,
@@ -1635,10 +1353,114 @@ def test_gate_eligible_candidate_is_saved_despite_worse_regularized_loss():
     candidate = _bridge_stats(0.995, ess=0.5, reverse_kl=0.5)
     workflow, update = _mock_stage_optimizer_with_stats(config, initial, candidate)
 
-    # The candidate has the worse regularized loss (0.505 versus 0.2), but it
-    # is the only gate-eligible checkpoint and therefore must be propagated.
     params, stats, selected_iteration, _ = _run_stage_optimizer(workflow, update)
 
+    # Candidate loss is 0.505 versus 0.2, but held-out fidelity is the primary
+    # transfer-learning selection criterion.
     assert float(params) == pytest.approx(1.0)
     assert float(stats.fidelity) == pytest.approx(0.995)
     assert selected_iteration == 1
+
+
+def test_optimizer_keeps_higher_fidelity_initial_checkpoint():
+    config = MolecularLITConfig(
+        nqs_reverse_kl_weight=1.0,
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    initial = _bridge_stats(0.995, ess=0.5, reverse_kl=0.2)
+    candidate = _bridge_stats(0.98, ess=0.5, reverse_kl=0.0)
+    workflow, update = _mock_stage_optimizer_with_stats(config, initial, candidate)
+
+    params, stats, selected_iteration, _ = _run_stage_optimizer(workflow, update)
+
+    assert float(params) == pytest.approx(0.0)
+    assert float(stats.fidelity) == pytest.approx(0.995)
+    assert selected_iteration == 0
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        _bridge_stats(0.995, ess=0.01),
+        _bridge_stats(0.995, invalid=1.0),
+    ],
+    ids=["low_ess", "invalid"],
+)
+def test_optimizer_unhealthy_live_checkpoint_returns_earlier_healthy_best(candidate):
+    config = MolecularLITConfig(
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    initial = _bridge_stats(0.99, ess=0.8)
+    workflow, update = _mock_stage_optimizer_with_stats(
+        config,
+        initial,
+        candidate,
+    )
+
+    params, stats, selected_iteration, _ = _run_stage_optimizer(workflow, update)
+
+    assert float(params) == pytest.approx(0.0)
+    assert float(stats.fidelity) == pytest.approx(0.99)
+    assert selected_iteration == 0
+
+
+@pytest.mark.parametrize(
+    ("stats", "message"),
+    [
+        (_bridge_stats(0.995, ess=0.01), "ESS"),
+        (_bridge_stats(0.995, invalid=1.0), "healthy"),
+    ],
+    ids=["low_ess", "invalid"],
+)
+def test_optimizer_fails_when_entire_trajectory_has_no_healthy_checkpoint(
+    stats,
+    message,
+):
+    config = MolecularLITConfig(
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    workflow, update = _mock_stage_optimizer_with_stats(config, stats, stats)
+
+    with pytest.raises(RuntimeError, match=message):
+        _run_stage_optimizer(workflow, update)
+
+
+def test_unhealthy_candidate_resets_plateau_patience():
+    config = MolecularLITConfig(
+        nqs_fidelity_plateau_start_iteration=1,
+        nqs_fidelity_plateau_patience_iterations=2,
+        nqs_fidelity_plateau_min_delta=1e-5,
+        nqs_stage_reweight_ess_fraction_min=0.05,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+    )
+    workflow, update, _, updates = _mock_optimizer_trajectory(
+        config,
+        {
+            0: _bridge_stats(0.99, ess=0.8),
+            1: _bridge_stats(0.99, ess=0.8),
+            2: _bridge_stats(0.995, ess=0.01),
+            3: _bridge_stats(0.99, ess=0.8),
+            4: _bridge_stats(0.99, ess=0.8),
+            5: _bridge_stats(0.99, ess=0.8),
+        },
+    )
+
+    params, stats, selected_iteration, _ = _run_stage_optimizer(
+        workflow,
+        update,
+        iterations=5,
+    )
+
+    # Without a reset the iteration-2 unhealthy sample would be skipped and
+    # the stale iteration-1 baseline would stop at iteration 3.
+    assert len(updates) == 4
+    assert float(params) == pytest.approx(0.0)
+    assert float(stats.fidelity) == pytest.approx(0.99)
+    assert selected_iteration == 0
