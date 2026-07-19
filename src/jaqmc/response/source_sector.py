@@ -3,24 +3,16 @@
 
 # ruff: noqa: DOC201,DOC501
 
-r"""Low-cost molecular source-sector covariance utilities.
+r"""Host-side discovery of clamped-nuclei spatial symmetry operations.
 
-The dipole source transforms as a Cartesian vector.  This module discovers a
-finite subgroup of the clamped-nuclei symmetry group and supplies the small
-piece of geometry needed to regularize a vector-valued response according to
-
-.. math::
-
-    \boldsymbol\psi(gX) = g\,\boldsymbol\psi(X).
-
-Group discovery is a host-side setup operation.  A :class:`SourceSector` stores
-only immutable Python tuples, so it can safely be captured by JAX-compiled
-training closures without introducing NumPy work into the compiled path.
+A :class:`SourceSector` stores only immutable Python tuples, so the discovered
+geometry can safely be captured by JAX-compiled parity checks without
+introducing NumPy work into the compiled path.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import permutations, product
 
@@ -35,7 +27,6 @@ type OrthogonalOperation = tuple[
     tuple[float, float, float],
     tuple[float, float, float],
 ]
-type VectorLogAmplitude = Callable[[MoleculeData], jnp.ndarray]
 
 
 @dataclass(frozen=True)
@@ -193,125 +184,6 @@ def transform_molecule_data(
         + center_array
     )
     return data.merge({"electrons": transformed})
-
-
-def vector_log_covariance_loss(
-    log_psi: jnp.ndarray,
-    transformed_log_psi: jnp.ndarray,
-    operation: Sequence[Sequence[float]] | np.ndarray | jnp.ndarray,
-    *,
-    epsilon: float | jnp.ndarray | None = None,
-) -> jnp.ndarray:
-    r"""Return a stable scale-invariant vector covariance residual.
-
-    ``log_psi`` represents ``log(psi(X))`` component by component and
-    ``transformed_log_psi`` represents ``log(psi(gX))``.  Both arrays must have
-    shape ``(..., 3)``.  The loss is
-
-    .. math::
-
-        \frac{\|\boldsymbol\psi(gX)-g\boldsymbol\psi(X)\|^2}
-        {\|\boldsymbol\psi(gX)\|^2+\|g\boldsymbol\psi(X)\|^2}.
-
-    A common per-sample log scale is removed before exponentiation.  Consequently
-    the result is invariant to an arbitrary common complex rescaling of the
-    vector response, remains finite for very large log amplitudes, and supports
-    zero components encoded by a non-finite log amplitude.  Leading dimensions
-    are treated as a batch and averaged; an unbatched input returns one scalar.
-    """
-    log_psi_array = jnp.asarray(log_psi)
-    transformed_array = jnp.asarray(transformed_log_psi)
-    if log_psi_array.shape != transformed_array.shape:
-        msg = (
-            "log_psi and transformed_log_psi must have identical shapes, got "
-            f"{log_psi_array.shape} and {transformed_array.shape}."
-        )
-        raise ValueError(msg)
-    if log_psi_array.ndim < 1 or log_psi_array.shape[-1] != 3:
-        msg = (
-            "vector log amplitudes must have shape (..., 3), got "
-            f"{log_psi_array.shape}."
-        )
-        raise ValueError(msg)
-
-    complex_dtype = jnp.result_type(log_psi_array.dtype, jnp.complex64)
-    paired_logs = jnp.stack(
-        (
-            log_psi_array.astype(complex_dtype),
-            transformed_array.astype(complex_dtype),
-        ),
-        axis=-2,
-    )
-    real_logs = jnp.real(paired_logs)
-    imag_logs = jnp.imag(paired_logs)
-    finite = jnp.isfinite(real_logs) & jnp.isfinite(imag_logs)
-    encoded_zero = jnp.isneginf(real_logs) & jnp.isfinite(imag_logs)
-    invalid = ~(finite | encoded_zero)
-    masked_real = jnp.where(finite, real_logs, -jnp.inf)
-    log_scale = jnp.max(masked_real, axis=(-2, -1), keepdims=True)
-    log_scale = jnp.where(jnp.isfinite(log_scale), log_scale, 0.0)
-    log_scale = jax.lax.stop_gradient(log_scale)
-    safe_delta = jnp.where(finite, paired_logs - log_scale, 0.0 + 0.0j)
-    amplitudes = jnp.where(finite, jnp.exp(safe_delta), 0.0 + 0.0j)
-    psi = amplitudes[..., 0, :]
-    psi_at_transformed = amplitudes[..., 1, :]
-
-    matrix = jnp.asarray(operation, dtype=jnp.real(psi).dtype)
-    transformed_target = jnp.einsum(
-        "ij,...j->...i",
-        matrix,
-        psi,
-        precision=jax.lax.Precision.HIGHEST,
-    )
-    numerator = jnp.sum(
-        jnp.abs(psi_at_transformed - transformed_target) ** 2,
-        axis=-1,
-    )
-    denominator = jnp.sum(jnp.abs(psi_at_transformed) ** 2, axis=-1) + jnp.sum(
-        jnp.abs(transformed_target) ** 2,
-        axis=-1,
-    )
-    if epsilon is None:
-        epsilon_array = jnp.asarray(
-            16.0 * jnp.finfo(jnp.real(psi).dtype).eps,
-            dtype=denominator.dtype,
-        )
-    else:
-        epsilon_array = jnp.asarray(epsilon, dtype=denominator.dtype)
-    per_sample = numerator / jnp.maximum(denominator, epsilon_array)
-    loss = jnp.mean(per_sample)
-    return jnp.where(jnp.any(invalid), jnp.asarray(jnp.nan, loss.dtype), loss)
-
-
-def source_sector_covariance_loss(
-    vector_log_amplitude: VectorLogAmplitude,
-    data: MoleculeData,
-    sector: SourceSector,
-    operation: int | Sequence[Sequence[float]] | np.ndarray | jnp.ndarray,
-    *,
-    epsilon: float | jnp.ndarray | None = None,
-) -> jnp.ndarray:
-    """Evaluate one source-sector covariance loss directly from a model callback.
-
-    ``vector_log_amplitude(data)`` must return componentwise complex log
-    amplitudes with shape ``(..., 3)``.  Both batched and unbatched
-    :class:`MoleculeData` are supported when the callback itself supports that
-    input layout.  ``operation`` may be a matrix or an index into
-    ``sector.operations``; stochastic training can therefore select one cheap
-    operation per step without projecting over the complete group.
-    """
-    selected = (
-        sector.operations[int(operation)]
-        if isinstance(operation, (int, np.integer))
-        else operation
-    )
-    transformed_data = transform_molecule_data(data, selected, sector.center)
-    return vector_log_covariance_loss(
-        vector_log_amplitude(data),
-        vector_log_amplitude(transformed_data),
-        selected,
-        epsilon=epsilon,
-    )
 
 
 def _discover_finite_operations(

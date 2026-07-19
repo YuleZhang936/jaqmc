@@ -36,10 +36,6 @@ lit:
   omega_points: 61
   axes: x
   output_filename: lit_spectrum.npz
-  peak_min_height_fraction: 0.02
-  preview_roots: 12
-  # The published transfer-learning protocol is one global predecessor chain.
-  scan_parallel: "off"
 
   nqs_allow_untrained_ground: false
   nqs_ground_energy: null
@@ -53,29 +49,29 @@ lit:
   nqs_source_norm_override: null
   nqs_source_burn_in: 150
   nqs_source_floor: 0.0001
-  nqs_train_pool_batches: 64
-  nqs_eval_pool_batches: 16
+  # The response has about 5.3e4 parameters.  The old 64-batch pool supplied
+  # only about one effective walker per parameter after reweighting and
+  # overfit every minibatch while held-out fidelity stayed flat.  Use a much
+  # larger fixed training population and a separate 32-block evaluation pool.
+  nqs_train_pool_batches: 512
+  nqs_eval_pool_batches: 64
   nqs_pool_stride: 4
-  # Hard parity evaluates the ansatz at X and IX.  Batch 1024 uses about
-  # 61 GiB on one 80-GiB A100; the previous 4096 setting is not viable.
-  nqs_train_update_batch_size: 1024
-  nqs_eval_batch_size: 1024
-  # Keep omega continuation serial, but split each 1024-walker update/eval
-  # batch over every GPU visible to this single process.
+  # Hard parity evaluates the ansatz at X and IX.  Keep the measured safe
+  # 1024 walkers per 80-GiB A100; on eight cards this becomes one global 8192
+  # walker update/evaluation while frequency continuation remains serial.
+  nqs_train_update_batch_size_per_device: 1024
+  nqs_eval_batch_size_per_device: 1024
   nqs_data_parallel: local_devices
   nqs_source_pool_dir: ''
-  # Metadata rejects the old nonzero-center pools.  Reuse the newly generated
-  # centered pools so a continuation checkpoint can resume on the same held-out set.
+  # Metadata binds the exact walker count, ground-checkpoint content, and
+  # nuclear geometry, rejecting every old or cross-system pool. Reuse the newly
+  # generated centered 512/64 pools so multi-eta calculations can share
+  # identical held-out jackknife blocks.
   nqs_reuse_source_pool: true
   nqs_save_source_pool: true
-  # The PRL uses pi_Phi samples with action-state importance reweighting.
-  nqs_reweight_ess_fraction_min: 0.0
-  nqs_direct_psi_train: false
-  nqs_direct_psi_burn_in: 10
-  nqs_direct_psi_batches: 1
-  nqs_direct_psi_train_batches: 2
-  nqs_direct_psi_eval_batches: 8
-  nqs_direct_psi_stride: 2
+  # Fit the independent opposite-parity response NQS to Phi on the fixed
+  # source pools before applying the resolvent action.
+  nqs_source_distillation_iterations: 3000
 
   nqs_learning_rate: 0.002
   nqs_reverse_kl_weight: 1.0
@@ -123,15 +119,10 @@ lit:
   nqs_response_use_last_layer: false
   nqs_response_envelope: abs_isotropic
   nqs_response_orbitals_spin_split: true
-  # Initialize at the large-negative-frequency source solution.  For an atom,
-  # diagnose the checkpoint's inversion parity and hard-project the scalar
-  # response into the opposite parity.  A genuinely C1 molecule remains
-  # unconstrained.
-  nqs_source_aligned: true
-  nqs_source_aligned_residual_scale: 1.0e-2
-  nqs_source_symmetry_mode: atom_c1
-  nqs_source_symmetry_weight: 0.0
-  # This is now only a diagnostic inversion guard on the sampled atomic source;
-  # the response parity itself is exact by construction and has no soft loss.
-  nqs_source_symmetry_max_covariance: 1.0e-3
+  # For an atom, diagnose the checkpoint's inversion parity and hard-project
+  # the independent scalar response into the opposite parity. A genuinely C1
+  # molecule remains unconstrained.
+  # The response parity is exact by construction. Reject a sampled atomic
+  # source that is inconsistent with the diagnosed opposite-parity sector.
+  nqs_atomic_source_parity_max_loss: 1.0e-3
   nqs_atomic_ground_parity_max_loss: 1.0e-3

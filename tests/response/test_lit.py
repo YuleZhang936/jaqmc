@@ -9,21 +9,26 @@ import numpy as np
 import pytest
 from jax import numpy as jnp
 from jax.flatten_util import ravel_pytree
+from upath import UPath
 
 from jaqmc.app.molecule.data import MoleculeData
 from jaqmc.app.molecule.lit_workflow import (
     MolecularLITConfig,
     MoleculeLITWorkflow,
+    _axis_indices,
     _batched_data_chunks,
-    _continuation_probe_is_acceptable,
     _cyclic_batched_data_chunk,
     _is_better_nqs_checkpoint,
-    _is_eligible_nqs_checkpoint,
+    _lit_error_monitor,
     _lit_omega_grid,
     _regularized_action_gradient,
+    _save_batched_pool,
     _scaled_direction_updates,
+    _shuffled_batched_data_chunk,
+    _shuffled_batched_data_chunk_index,
     _solve_sr_direction_chunked,
-    _SourceCovarianceMetrics,
+    _source_distillation_stats_from_log_ratios,
+    _source_pool_target_digest,
     _spring_direction_chunked,
     _spring_optimizer_diagnostics,
     _SpringState,
@@ -82,6 +87,58 @@ def test_hydrogen_bound_lit_matches_hardcoded_lorentzian_sum():
     np.testing.assert_allclose(actual, expected, rtol=1e-14)
 
 
+def test_lit_error_monitor_divides_by_normalization_once_and_is_scale_invariant():
+    fidelity = 0.91
+    source_norm = 2.25
+    eta = 0.03
+    normalization = 0.3 - 0.4j
+    raw_d = 0.125
+    expected = (
+        raw_d
+        * np.sqrt(source_norm)
+        / (eta * abs(normalization))
+        * np.sqrt((1.0 - fidelity) / fidelity)
+    )
+
+    for magnitude in (1.0, 1e-15, 1e-8, 1e8, 1e15):
+        scale = magnitude * np.exp(0.37j)
+        actual = _lit_error_monitor(
+            fidelity=fidelity,
+            source_norm=source_norm,
+            normalization=scale * normalization,
+            eta=eta,
+            error_d=abs(scale) * raw_d,
+            error_d_valid=True,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=2e-14)
+
+
+@pytest.mark.parametrize(
+    ("normalization", "error_d", "error_d_valid"),
+    [
+        (0.0 + 0.0j, 0.2, True),
+        (np.nan + 0.0j, 0.2, True),
+        (np.inf + 0.0j, 0.2, True),
+        (0.5 + 0.0j, np.nan, True),
+        (0.5 + 0.0j, 0.2, False),
+    ],
+)
+def test_lit_error_monitor_marks_invalid_normalization_or_d_as_nan(
+    normalization,
+    error_d,
+    error_d_valid,
+):
+    actual = _lit_error_monitor(
+        fidelity=0.9,
+        source_norm=1.0,
+        normalization=normalization,
+        eta=0.02,
+        error_d=error_d,
+        error_d_valid=error_d_valid,
+    )
+    assert np.isnan(actual)
+
+
 def test_lit_omega_values_override_linspace():
     config = MolecularLITConfig(
         omega_min=0.0,
@@ -107,21 +164,20 @@ def test_lit_linspace_grid_must_be_strictly_increasing():
         _lit_omega_grid(config)
 
 
-@pytest.mark.parametrize("mode", ["auto", "local_devices", "distributed"])
-def test_parallel_frequency_modes_are_rejected(mode):
+def test_warm_start_must_precede_first_serial_frequency():
     workflow = object.__new__(MoleculeLITWorkflow)
-    workflow.lit_config = MolecularLITConfig(scan_parallel=mode)
+    workflow.lit_config = MolecularLITConfig(
+        omega_values=(0.1, 0.2),
+        nqs_warm_start_omega=0.1,
+    )
 
-    with pytest.raises(ValueError, match="serial continuation"):
+    with pytest.raises(ValueError, match="below the first spectrum frequency"):
         workflow._validate_config()
 
 
 def test_single_frequency_data_parallel_mode_is_valid():
     workflow = object.__new__(MoleculeLITWorkflow)
-    workflow.lit_config = MolecularLITConfig(
-        nqs_data_parallel="local_devices",
-        nqs_direct_psi_train=False,
-    )
+    workflow.lit_config = MolecularLITConfig(nqs_data_parallel="local_devices")
 
     workflow._validate_config()
 
@@ -132,17 +188,6 @@ def test_unknown_single_frequency_data_parallel_modes_are_rejected(mode):
     workflow.lit_config = MolecularLITConfig(nqs_data_parallel=mode)
 
     with pytest.raises(ValueError, match="nqs_data_parallel"):
-        workflow._validate_config()
-
-
-def test_data_parallel_direct_psi_fallback_is_rejected():
-    workflow = object.__new__(MoleculeLITWorkflow)
-    workflow.lit_config = MolecularLITConfig(
-        nqs_data_parallel="local_devices",
-        nqs_direct_psi_train=True,
-    )
-
-    with pytest.raises(ValueError, match="nqs_direct_psi_train=false"):
         workflow._validate_config()
 
 
@@ -168,6 +213,154 @@ def test_batched_data_chunks_cover_pool_and_cycle():
         np.concatenate([np.asarray(chunk.data.electrons[:, 0, 0]) for chunk in chunks]),
         np.arange(0, 30, 3),
     )
+
+
+def test_training_chunks_shuffle_reproducibly_and_cover_every_epoch():
+    pool = BatchedData(
+        data=MoleculeData(
+            electrons=jnp.arange(36, dtype=jnp.float32).reshape(12, 1, 3),
+            atoms=jnp.zeros((1, 3), dtype=jnp.float32),
+            charges=jnp.ones((1,), dtype=jnp.float32),
+        ),
+        fields_with_batch=("electrons",),
+    )
+    first_indices = [
+        _shuffled_batched_data_chunk_index(12, 3, step, seed=1701) for step in range(4)
+    ]
+    repeated_indices = [
+        _shuffled_batched_data_chunk_index(12, 3, step, seed=1701) for step in range(4)
+    ]
+    second_epoch = [
+        _shuffled_batched_data_chunk_index(12, 3, step, seed=1701)
+        for step in range(4, 8)
+    ]
+
+    assert first_indices == repeated_indices
+    assert sorted(first_indices) == [0, 1, 2, 3]
+    assert sorted(second_epoch) == [0, 1, 2, 3]
+    selected = _shuffled_batched_data_chunk(pool, 3, 0, seed=1701)
+    expected_start = first_indices[0] * 9
+    np.testing.assert_array_equal(
+        np.asarray(selected.data.electrons[:, 0, 0]),
+        np.arange(expected_start, expected_start + 9, 3),
+    )
+
+
+def test_training_chunk_shuffle_rejects_partial_tail():
+    with pytest.raises(ValueError, match="must be divisible"):
+        _shuffled_batched_data_chunk_index(10, 4, 0, seed=9)
+
+
+def test_reused_source_pool_is_bound_to_exact_configured_walker_count(tmp_path):
+    def pool(walkers):
+        return BatchedData(
+            data=MoleculeData(
+                electrons=jnp.zeros((walkers, 1, 3), dtype=jnp.float32),
+                atoms=jnp.zeros((1, 3), dtype=jnp.float32),
+                charges=jnp.ones((1,), dtype=jnp.float32),
+            ),
+            fields_with_batch=("electrons",),
+        )
+
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.config = SimpleNamespace(batch_size=4, seed=3)
+    workflow.save_path = UPath(str(tmp_path))
+    workflow.lit_config = MolecularLITConfig(
+        nqs_train_pool_batches=2,
+        nqs_eval_pool_batches=1,
+    )
+    reference = pool(4)
+    train_path = workflow._source_pool_path(0, "train")
+    eval_path = workflow._source_pool_path(0, "eval")
+    old_metadata = {
+        "axis": 0.0,
+        "source_center": 0.0,
+        "source_floor": workflow.lit_config.nqs_source_floor,
+    }
+    _save_batched_pool(train_path, pool(8), metadata=old_metadata)
+    _save_batched_pool(eval_path, pool(4), metadata=old_metadata)
+
+    assert (
+        workflow._try_load_source_pools(
+            reference,
+            axis=0,
+            source_center=0.0,
+            target_sha256="ground-and-geometry-a",
+        )
+        is None
+    )
+
+    train_metadata = workflow._source_pool_metadata(
+        0,
+        0.0,
+        target_sha256="ground-and-geometry-a",
+        expected_walkers=8,
+    )
+    eval_metadata = workflow._source_pool_metadata(
+        0,
+        0.0,
+        target_sha256="ground-and-geometry-a",
+        expected_walkers=4,
+    )
+    _save_batched_pool(train_path, pool(4), metadata=train_metadata)
+    _save_batched_pool(eval_path, pool(4), metadata=eval_metadata)
+    assert (
+        workflow._try_load_source_pools(
+            reference,
+            axis=0,
+            source_center=0.0,
+            target_sha256="ground-and-geometry-a",
+        )
+        is None
+    )
+
+    _save_batched_pool(train_path, pool(8), metadata=train_metadata)
+    loaded = workflow._try_load_source_pools(
+        reference,
+        axis=0,
+        source_center=0.0,
+        target_sha256="ground-and-geometry-a",
+    )
+    assert loaded is not None
+    assert [item.batch_size for item in loaded] == [8, 4]
+    assert (
+        workflow._try_load_source_pools(
+            reference,
+            axis=0,
+            source_center=0.0,
+            target_sha256="ground-and-geometry-b",
+        )
+        is None
+    )
+
+
+def test_source_pool_target_digest_binds_ground_and_static_system_only():
+    data = MoleculeData(
+        electrons=jnp.zeros((4, 2, 3)),
+        atoms=jnp.asarray([[0.0, 0.0, -0.7], [0.0, 0.0, 0.7]]),
+        charges=jnp.asarray([1.0, 1.0]),
+    )
+    params = {"orbital": jnp.asarray([1.0, 2.0])}
+    reference = _source_pool_target_digest(params, data)
+
+    assert reference == _source_pool_target_digest(
+        params,
+        data.merge({"electrons": jnp.ones_like(data.electrons)}),
+    )
+    assert reference != _source_pool_target_digest(
+        {"orbital": jnp.asarray([1.0, 2.1])},
+        data,
+    )
+    assert reference != _source_pool_target_digest(
+        params,
+        data.merge({"atoms": data.atoms.at[1, 2].set(0.8)}),
+    )
+
+
+@pytest.mark.parametrize("axes", ["xx", "xzx", "YY"])
+def test_axis_indices_reject_duplicate_axes(axes):
+    with pytest.raises(ValueError, match="Duplicate dipole axes"):
+        _axis_indices(axes)
 
 
 def test_chunked_sr_solve_matches_full_metric_branch():
@@ -266,26 +459,120 @@ def test_reverse_kl_weights_are_finite_at_extreme_dynamic_range():
     assert all(np.all(np.isfinite(np.asarray(value))) for value in result)
 
 
-def test_spring_optimizer_diagnostics_report_clipping_and_parameter_groups():
-    params = {
-        "raw": {"weights": jnp.zeros(2, dtype=jnp.float32)},
-        "source_coefficient": jnp.zeros(2, dtype=jnp.float32),
-        "residual_log_scale": jnp.asarray(0.0, dtype=jnp.float32),
+def test_source_distillation_stats_are_scale_invariant_and_exact_for_source():
+    source_weight = jnp.asarray([1.0, 1.0, 1.0, 1.0], dtype=jnp.float32)
+    exact = _source_distillation_stats_from_log_ratios(
+        jnp.full(4, 37.0 + 0.6j, dtype=jnp.complex64),
+        source_weight,
+        reverse_kl_weight=1.0,
+    )
+    shifted = _source_distillation_stats_from_log_ratios(
+        jnp.full(4, -51.0 - 2.2j, dtype=jnp.complex64),
+        source_weight,
+        reverse_kl_weight=1.0,
+    )
+
+    np.testing.assert_allclose(float(exact.fidelity), 1.0, rtol=2e-6)
+    np.testing.assert_allclose(float(exact.reverse_kl), 0.0, atol=2e-6)
+    np.testing.assert_allclose(float(exact.reweight_ess_fraction), 1.0, rtol=2e-6)
+    np.testing.assert_allclose(np.asarray(shifted), np.asarray(exact), atol=2e-6)
+
+
+def test_source_distillation_selects_improved_independent_heldout_state():
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.config = SimpleNamespace(batch_size=8)
+    workflow.lit_config = MolecularLITConfig(
+        nqs_data_parallel="off",
+        nqs_source_distillation_iterations=20,
+        nqs_train_update_batch_size=8,
+        nqs_eval_batch_size=8,
+        nqs_selection_interval=1,
+        nqs_log_interval=0,
+        nqs_reverse_kl_weight=0.1,
+        nqs_learning_rate=0.05,
+        nqs_spring_epsilon=0.01,
+        nqs_spring_decay=0.0,
+        nqs_spring_damping_floor=1e-6,
+        nqs_sr_max_norm=0.1,
+    )
+
+    def pool(source_coordinates):
+        electrons = jnp.stack(
+            (
+                -jnp.asarray(source_coordinates, dtype=jnp.float32),
+                jnp.zeros(len(source_coordinates), dtype=jnp.float32),
+                jnp.zeros(len(source_coordinates), dtype=jnp.float32),
+            ),
+            axis=1,
+        )[:, None, :]
+        return BatchedData(
+            data=MoleculeData(
+                electrons=electrons,
+                atoms=jnp.zeros((1, 3), dtype=jnp.float32),
+                charges=jnp.ones(1, dtype=jnp.float32),
+            ),
+            fields_with_batch=("electrons",),
+        )
+
+    train_pool = pool([-0.9, -0.7, -0.5, -0.3, 0.3, 0.5, 0.7, 0.9])
+    eval_pool = pool([-0.85, -0.65, -0.45, -0.25, 0.25, 0.45, 0.65, 0.85])
+
+    def ground_logpsi(_params, _data):
+        return jnp.asarray(0.0, dtype=jnp.float32)
+
+    def response_apply(params, data):
+        source = -data.electrons[0, 0]
+        amplitude = params["bias"] + params["slope"] * source
+        return jnp.log(amplitude.astype(jnp.complex64))
+
+    initial_params = {
+        "bias": jnp.asarray(1.0, dtype=jnp.float32),
+        "slope": jnp.asarray(0.2, dtype=jnp.float32),
     }
+    initial_stats = workflow._evaluate_source_distillation(
+        response_apply,
+        initial_params,
+        ground_logpsi,
+        {},
+        eval_pool,
+        axis=0,
+        source_center=0.0,
+    )
+    selected_params, _ = workflow._distill_response_from_source(
+        response_apply,
+        initial_params,
+        ground_logpsi,
+        {},
+        train_pool,
+        eval_pool,
+        jax.random.PRNGKey(3),
+        axis=0,
+        source_center=0.0,
+    )
+    selected_stats = workflow._evaluate_source_distillation(
+        response_apply,
+        selected_params,
+        ground_logpsi,
+        {},
+        eval_pool,
+        axis=0,
+        source_center=0.0,
+    )
+
+    assert float(selected_stats.loss) < float(initial_stats.loss)
+    assert float(selected_stats.fidelity) > float(initial_stats.fidelity) + 0.1
+
+
+def test_spring_optimizer_diagnostics_report_clipping_and_parameter_groups():
+    params = {"weights": jnp.zeros(5, dtype=jnp.float32)}
     fidelity_tree = {
-        "raw": {"weights": jnp.asarray([3.0, 4.0], dtype=jnp.float32)},
-        "source_coefficient": jnp.asarray([1.0, -2.0], dtype=jnp.float32),
-        "residual_log_scale": jnp.asarray(2.0, dtype=jnp.float32),
+        "weights": jnp.asarray([3.0, 4.0, 1.0, -2.0, 2.0], dtype=jnp.float32)
     }
     reverse_kl_tree = {
-        "raw": {"weights": jnp.asarray([2.0, 0.0], dtype=jnp.float32)},
-        "source_coefficient": jnp.asarray([0.0, 2.0], dtype=jnp.float32),
-        "residual_log_scale": jnp.asarray(-2.0, dtype=jnp.float32),
+        "weights": jnp.asarray([2.0, 0.0, 0.0, 2.0, -2.0], dtype=jnp.float32)
     }
     direction_tree = {
-        "raw": {"weights": jnp.asarray([3.0, 4.0], dtype=jnp.float32)},
-        "source_coefficient": jnp.asarray([0.0, 12.0], dtype=jnp.float32),
-        "residual_log_scale": jnp.asarray(-5.0, dtype=jnp.float32),
+        "weights": jnp.asarray([3.0, 4.0, 0.0, 12.0, -5.0], dtype=jnp.float32)
     }
     fidelity_gradient, _ = ravel_pytree(fidelity_tree)
     reverse_kl_gradient, _ = ravel_pytree(reverse_kl_tree)
@@ -356,22 +643,18 @@ def test_spring_optimizer_diagnostics_report_clipping_and_parameter_groups():
     )
     np.testing.assert_allclose(
         np.asarray(diagnostics.parameter_group_gradient_rms),
-        [np.sqrt(10.0), np.sqrt(5.0), 3.0],
+        [combined_norm / np.sqrt(direction.size)],
         rtol=2e-6,
     )
     np.testing.assert_allclose(
         np.asarray(diagnostics.parameter_group_update_norm),
-        np.asarray([5.0, 12.0, 5.0]) * update_scale,
+        [direction_norm * update_scale],
         rtol=2e-6,
     )
 
 
 def test_spring_optimizer_diagnostics_detect_exact_fidelity_kl_cancellation():
-    params = {
-        "raw": {"weight": jnp.asarray(0.0, dtype=jnp.float32)},
-        "source_coefficient": jnp.zeros(2, dtype=jnp.float32),
-        "residual_log_scale": jnp.asarray(0.0, dtype=jnp.float32),
-    }
+    params = {"weights": jnp.zeros(4, dtype=jnp.float32)}
     fidelity_gradient = jnp.asarray([1.0, -2.0, 0.5, 3.0], dtype=jnp.float32)
     reverse_kl_gradient = fidelity_gradient
     combined_gradient = jnp.zeros_like(fidelity_gradient)
@@ -461,9 +744,7 @@ class _SelectionStats(NamedTuple):
     reverse_kl: jnp.ndarray
     invalid_sample_fraction: jnp.ndarray
     reweight_ess_fraction: jnp.ndarray
-    source_covariance_loss: jnp.ndarray
-    source_covariance_max_loss: jnp.ndarray
-    lit: jnp.ndarray
+    signed_lit: jnp.ndarray
     source_norm: jnp.ndarray
 
 
@@ -474,16 +755,14 @@ def _selection_stats(fidelity):
         reverse_kl=jnp.asarray(0.0),
         invalid_sample_fraction=jnp.asarray(0.0),
         reweight_ess_fraction=jnp.asarray(1.0),
-        source_covariance_loss=jnp.asarray(0.0),
-        source_covariance_max_loss=jnp.asarray(0.0),
-        lit=jnp.asarray(1.0),
+        signed_lit=jnp.asarray(1.0),
         source_norm=jnp.asarray(1.0),
     )
 
 
-def test_checkpoint_loss_includes_heldout_source_covariance():
+def test_checkpoint_loss_is_physical_regularized_loss():
     workflow = object.__new__(MoleculeLITWorkflow)
-    workflow.lit_config = MolecularLITConfig(nqs_source_symmetry_weight=0.5)
+    workflow.lit_config = MolecularLITConfig()
     workflow._nqs_stats_chunked = lambda *_args, **_kwargs: _selection_stats(0.8)
 
     stats = workflow._evaluate_nqs_checkpoint(
@@ -497,42 +776,9 @@ def test_checkpoint_loss_includes_heldout_source_covariance():
         source_norm=1.0,
         ground_energy=0.0,
         omega=0.1,
-        source_covariance_evaluator=lambda params, _pool: params**2,
     )
 
-    np.testing.assert_allclose(float(stats.source_covariance_loss), 4.0)
-    np.testing.assert_allclose(float(stats.source_covariance_max_loss), 4.0)
-    np.testing.assert_allclose(float(stats.loss), 2.2)
-
-
-def test_checkpoint_combined_loss_uses_mean_but_guard_uses_worst_operation():
-    workflow = object.__new__(MoleculeLITWorkflow)
-    workflow.lit_config = MolecularLITConfig(nqs_source_symmetry_weight=0.5)
-    workflow._nqs_stats_chunked = lambda *_args, **_kwargs: _selection_stats(0.8)
-
-    stats = workflow._evaluate_nqs_checkpoint(
-        None,
-        jnp.asarray(2.0),
-        None,
-        None,
-        None,
-        axis=0,
-        source_center=0.0,
-        source_norm=1.0,
-        ground_energy=0.0,
-        omega=0.1,
-        source_covariance_evaluator=lambda _params, _pool: _SourceCovarianceMetrics(
-            mean_loss=jnp.asarray(6e-4),
-            max_loss=jnp.asarray(1.2e-3),
-            worst_operation_index=jnp.asarray(1),
-        ),
-    )
-
-    np.testing.assert_allclose(float(stats.loss), 0.2003, rtol=1e-6)
-    assert not _is_eligible_nqs_checkpoint(
-        stats,
-        max_source_covariance=1e-3,
-    )
+    np.testing.assert_allclose(float(stats.loss), 0.2, rtol=1e-6)
 
 
 def test_serial_frequency_optimization_propagates_heldout_best_params():
@@ -544,9 +790,9 @@ def test_serial_frequency_optimization_propagates_heldout_best_params():
     )
     starts = []
 
-    def init_carry(_data, rng, params):
+    def init_carry(rng, params):
         starts.append(float(params))
-        return SimpleNamespace(direct=SimpleNamespace(rng=rng))
+        return SimpleNamespace(rng=rng)
 
     def update(params, _pool, _omega, carry, _iteration):
         next_params = params + 1.0
@@ -563,7 +809,6 @@ def test_serial_frequency_optimization_propagates_heldout_best_params():
         update_step=update,
         train_pool=None,
         eval_pool=None,
-        fallback_data=None,
         rng=jax.random.PRNGKey(0),
         response_apply=None,
         ground_logpsi=None,
@@ -603,96 +848,12 @@ def test_invalid_checkpoint_is_never_selected():
     assert not _is_better_nqs_checkpoint(candidate, incumbent)
 
 
-def test_checkpoint_source_covariance_limit_controls_eligibility():
-    incumbent = _selection_stats(0.8)._replace(
-        source_covariance_loss=jnp.asarray(2e-4),
-        source_covariance_max_loss=jnp.asarray(3e-4),
-    )
-    lower_loss_but_leaky = _selection_stats(0.99)._replace(
-        source_covariance_loss=jnp.asarray(5e-4),
-        source_covariance_max_loss=jnp.asarray(2e-2),
-    )
-
-    assert not _is_better_nqs_checkpoint(
-        lower_loss_but_leaky,
-        incumbent,
-        max_source_covariance=1e-3,
-    )
-    assert _is_better_nqs_checkpoint(
-        incumbent,
-        lower_loss_but_leaky,
-        max_source_covariance=1e-3,
-    )
-
-    nonfinite = _selection_stats(0.999)._replace(
-        source_covariance_loss=jnp.asarray(jnp.nan),
-        source_covariance_max_loss=jnp.asarray(jnp.nan),
-    )
-    assert not _is_better_nqs_checkpoint(nonfinite, incumbent)
-
-
-def test_continuation_probe_rejects_worst_operation_above_limit():
-    current = _selection_stats(0.9)._replace(
-        source_covariance_loss=jnp.asarray(2e-4),
-        source_covariance_max_loss=jnp.asarray(3e-4),
-    )
-    candidate = _selection_stats(0.9)._replace(
-        source_covariance_loss=jnp.asarray(6e-4),
-        source_covariance_max_loss=jnp.asarray(1.2e-3),
-    )
-
-    assert not _continuation_probe_is_acceptable(
-        current,
-        candidate,
-        retention=0.95,
-        max_source_covariance=1e-3,
-    )
-
-
-def test_continuation_min_step_cannot_propagate_worst_operation_violation():
+@pytest.mark.parametrize("maximum", [0.0, -1.0, 1.0, np.nan, np.inf])
+def test_atomic_source_parity_maximum_must_be_strict_probability(maximum):
     workflow = object.__new__(MoleculeLITWorkflow)
-    workflow.lit_config = MolecularLITConfig(
-        nqs_warm_start_omega=0.0,
-        nqs_continuation_min_step=0.1,
-        nqs_source_symmetry_weight=1.0,
-        nqs_source_symmetry_max_covariance=1e-3,
-    )
-    workflow._nqs_stats_chunked = lambda *_args, **_kwargs: _selection_stats(0.9)
-    update_step = SimpleNamespace(
-        source_covariance_metrics=lambda _params, _pool: _SourceCovarianceMetrics(
-            mean_loss=jnp.asarray(6e-4),
-            max_loss=jnp.asarray(1.2e-3),
-            worst_operation_index=jnp.asarray(1),
-        )
-    )
+    workflow.lit_config = MolecularLITConfig(nqs_atomic_source_parity_max_loss=maximum)
 
-    with pytest.raises(RuntimeError, match=r"maximum=0\.001"):
-        workflow._continue_nqs_to_spectrum(
-            update_step,
-            response_params=jnp.asarray(0.0),
-            current_stats=_selection_stats(0.9),
-            train_pool=None,
-            eval_pool=None,
-            fallback_data=None,
-            rng=jax.random.PRNGKey(0),
-            response_apply=None,
-            ground_logpsi=None,
-            ground_params=None,
-            axis=0,
-            source_center=0.0,
-            source_norm=1.0,
-            ground_energy=0.0,
-            target_omega=0.1,
-            spectrum_omega=np.asarray([0.1]),
-        )
-
-
-@pytest.mark.parametrize("maximum", [0.0, -1.0, np.nan, np.inf])
-def test_source_covariance_maximum_must_be_positive_or_null(maximum):
-    workflow = object.__new__(MoleculeLITWorkflow)
-    workflow.lit_config = MolecularLITConfig(nqs_source_symmetry_max_covariance=maximum)
-
-    with pytest.raises(ValueError, match="max_covariance"):
+    with pytest.raises(ValueError, match="atomic_source_parity_max_loss"):
         workflow._validate_source_sector_config()
 
 

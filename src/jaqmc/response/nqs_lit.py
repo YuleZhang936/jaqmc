@@ -14,6 +14,7 @@ all response energies.
 
 from __future__ import annotations
 
+import operator
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import NamedTuple
@@ -48,7 +49,6 @@ class NQSLITStats(NamedTuple):
     fidelity: jnp.ndarray
     reverse_kl: jnp.ndarray
     signed_lit: jnp.ndarray
-    lit: jnp.ndarray
     broadened: jnp.ndarray
     source_norm: jnp.ndarray
     action_norm: jnp.ndarray
@@ -61,15 +61,37 @@ class NQSLITStats(NamedTuple):
     correction_norm: jnp.ndarray
     shifted_hamiltonian_norm: jnp.ndarray
     error_d: jnp.ndarray
+    error_d_correction: jnp.ndarray
+    error_d_shifted: jnp.ndarray
+    error_d_valid: jnp.ndarray
     reweight_ess: jnp.ndarray
     reweight_ess_fraction: jnp.ndarray
+    reweight_max_fraction: jnp.ndarray
     invalid_sample_fraction: jnp.ndarray
-    estimator_mode: jnp.ndarray
-    direct_hloc_rmse: jnp.ndarray
-    direct_hloc_std: jnp.ndarray
-    direct_hloc_sem: jnp.ndarray
-    source_covariance_loss: jnp.ndarray
-    source_covariance_max_loss: jnp.ndarray
+
+
+class WeightedComplexMoments(NamedTuple):
+    """Mergeable moments with the mean stored relative to a stable origin.
+
+    Keeping ``origin`` and ``mean_offset`` separate prevents a small weighted
+    mean displacement from being rounded away when values share a large
+    complex baseline.  ``mean`` remains available as the public reconstructed
+    value, while all variance merges operate directly on the small offsets.
+    """
+
+    weight_sum: jnp.ndarray
+    origin: jnp.ndarray
+    mean_offset: jnp.ndarray
+    centered_abs2_sum: jnp.ndarray
+
+    @property
+    def mean(self) -> jnp.ndarray:
+        """Return the reconstructed weighted mean.
+
+        Returns:
+            The complex origin plus its small weighted offset.
+        """
+        return self.origin + self.mean_offset
 
 
 class NQSLITSourceSums(NamedTuple):
@@ -90,10 +112,129 @@ class NQSLITSourceSums(NamedTuple):
     psi_weight_sq_sum: jnp.ndarray
     psi_log_ratio_abs2_sum: jnp.ndarray
     response_conj_over_source_sum: jnp.ndarray
-    response_over_source_abs2_sum: jnp.ndarray
-    hbar_over_source_sum: jnp.ndarray
-    hbar_over_source_abs2_sum: jnp.ndarray
     ground_energy_sum: jnp.ndarray
+    response_over_source_moments: WeightedComplexMoments
+    hbar_over_source_moments: WeightedComplexMoments
+    psi_weight_max: jnp.ndarray
+
+
+def weighted_complex_moments(
+    values: jnp.ndarray,
+    weights: jnp.ndarray,
+) -> WeightedComplexMoments:
+    """Accumulate stable weighted moments without raw second-moment subtraction.
+
+    The first positive-weight value is used as an origin for the weighted mean.
+    This preserves small fluctuations around a large common complex value in
+    float32.  The second pass then accumulates the centered absolute-square
+    moment directly.
+    """
+    values = jnp.asarray(values)
+    weights = jnp.asarray(weights)
+    finite = (
+        jnp.isfinite(weights)
+        & (weights > 0.0)
+        & jnp.isfinite(jnp.real(values))
+        & jnp.isfinite(jnp.imag(values))
+    )
+    safe_weights = jnp.where(finite, weights, 0.0)
+    weight_sum = jnp.sum(safe_weights)
+    has_weight = weight_sum > 0.0
+    anchor_index = jnp.argmax(finite)
+    origin = jnp.where(
+        has_weight,
+        values[anchor_index],
+        jnp.asarray(0.0, dtype=values.dtype),
+    )
+    deviations = jnp.where(
+        finite,
+        values - origin,
+        jnp.asarray(0.0, dtype=values.dtype),
+    )
+    safe_weight_sum = jnp.where(
+        has_weight,
+        weight_sum,
+        jnp.asarray(1.0, dtype=weight_sum.dtype),
+    )
+    mean_offset = jnp.sum(safe_weights * deviations) / safe_weight_sum
+    mean_offset = jnp.where(
+        has_weight,
+        mean_offset,
+        jnp.asarray(0.0, dtype=values.dtype),
+    )
+    centered_deviations = jnp.where(
+        finite,
+        deviations - mean_offset,
+        jnp.asarray(0.0, dtype=values.dtype),
+    )
+    centered_abs2_sum = jnp.sum(safe_weights * jnp.abs(centered_deviations) ** 2)
+    centered_abs2_sum = jnp.where(
+        has_weight,
+        centered_abs2_sum,
+        jnp.asarray(0.0, dtype=weight_sum.dtype),
+    )
+    return WeightedComplexMoments(
+        weight_sum=weight_sum,
+        origin=origin,
+        mean_offset=mean_offset,
+        centered_abs2_sum=centered_abs2_sum,
+    )
+
+
+def merge_weighted_complex_moments(
+    left: WeightedComplexMoments,
+    right: WeightedComplexMoments,
+) -> WeightedComplexMoments:
+    """Merge two weighted complex moment accumulators with Chan's formula."""
+    left_weight = left.weight_sum
+    right_weight = right.weight_sum
+    weight_sum = left_weight + right_weight
+    has_weight = weight_sum > 0.0
+    safe_weight_sum = jnp.where(
+        has_weight,
+        weight_sum,
+        jnp.asarray(1.0, dtype=weight_sum.dtype),
+    )
+    zero_mean = jnp.asarray(0.0, dtype=left.origin.dtype)
+    origin = jnp.where(
+        left_weight > 0.0,
+        left.origin,
+        jnp.where(
+            right_weight > 0.0,
+            right.origin,
+            zero_mean,
+        ),
+    )
+    left_mean_offset = jnp.where(
+        left_weight > 0.0,
+        (left.origin - origin) + left.mean_offset,
+        zero_mean,
+    )
+    right_mean_offset = jnp.where(
+        right_weight > 0.0,
+        (right.origin - origin) + right.mean_offset,
+        zero_mean,
+    )
+    delta = right_mean_offset - left_mean_offset
+    mean_offset = left_mean_offset + delta * (right_weight / safe_weight_sum)
+    mean_offset = jnp.where(
+        has_weight,
+        mean_offset,
+        zero_mean,
+    )
+    cross = jnp.abs(delta) ** 2 * left_weight * right_weight / safe_weight_sum
+    centered_abs2_sum = left.centered_abs2_sum + right.centered_abs2_sum + cross
+    centered_abs2_sum = jnp.where(
+        has_weight,
+        centered_abs2_sum,
+        jnp.asarray(0.0, dtype=weight_sum.dtype),
+    )
+    return WeightedComplexMoments(
+        weight_sum=weight_sum,
+        origin=origin,
+        mean_offset=mean_offset,
+        centered_abs2_sum=centered_abs2_sum,
+    )
 
 
 class MolecularResponseFermiNet(nn.Module):
@@ -143,59 +284,6 @@ class MolecularResponseFermiNet(nn.Module):
         return self.logdet_layer(orbitals)["logpsi"]
 
 
-class MolecularVectorResponseFermiNet(nn.Module):
-    """Three-component complex FermiNet response in Cartesian axis order.
-
-    The feature layer, FermiNet backbone, and envelope are evaluated once and
-    shared by the ``x``, ``y``, and ``z`` response components.  A single
-    vector-valued orbital projection supplies independent complex determinant
-    heads for the three components.
-    """
-
-    nspins: tuple[int, int]
-    ndets: int = 16
-    hidden_dims_single: tuple[int, ...] = (256, 256, 256, 256)
-    hidden_dims_double: tuple[int, ...] = (32, 32, 32, 32)
-    use_last_layer: bool = False
-    envelope: EnvelopeType = EnvelopeType.abs_isotropic
-    orbitals_spin_split: bool = True
-
-    def setup(self) -> None:
-        self.feature_layer = MoleculeFeatures()
-        hidden_dims = list(zip(self.hidden_dims_single, self.hidden_dims_double))
-        self.backbone_layer = FermiLayers(
-            self.nspins,
-            hidden_dims,
-            use_last_layer=self.use_last_layer,
-        )
-        self.orbital_layer = _ComplexVectorOrbitalProjection(
-            nspins=self.nspins,
-            ndets=self.ndets,
-            orbitals_spin_split=self.orbitals_spin_split,
-            use_bias=False,
-        )
-        self.envelope_layer = Envelope(
-            envelope_type=self.envelope,
-            ndets=self.ndets,
-            nspins=self.nspins,
-            orbitals_spin_split=self.orbitals_spin_split,
-        )
-
-    def __call__(self, data: MoleculeData) -> jnp.ndarray:
-        embedding = self.feature_layer(data.electrons, data.atoms)
-        h_one, _ = self.backbone_layer(
-            embedding["ae_features"],
-            embedding["ee_features"],
-        )
-        orbitals = self.orbital_layer(h_one)
-        envelope = self.envelope_layer(
-            embedding["ae_vec"],
-            embedding["r_ae"],
-        )
-        orbitals = orbitals * envelope[None, ...]
-        return _complex_logdet_sum(orbitals)
-
-
 class _ComplexOrbitalProjection(nn.Module):
     """Project FermiNet electron features to complex orbital matrices."""
 
@@ -215,38 +303,6 @@ class _ComplexOrbitalProjection(nn.Module):
             orbitals = nn.DenseGeneral(features, use_bias=self.use_bias)(h_one)
         orbitals = jnp.transpose(orbitals, (1, 0, 2, 3))
         return orbitals[..., 0] + 1j * orbitals[..., 1]
-
-
-class _ComplexVectorOrbitalProjection(nn.Module):
-    """Project electron features to three complex orbital-matrix heads."""
-
-    nspins: tuple[int, int]
-    ndets: int
-    orbitals_spin_split: bool = True
-    use_bias: bool = False
-
-    @nn.compact
-    def __call__(self, h_one: jnp.ndarray) -> jnp.ndarray:
-        n_electrons = sum(self.nspins)
-        features = [3, self.ndets, n_electrons, 2]
-        active_spins = [spin for spin in self.nspins if spin > 0]
-        if self.orbitals_spin_split and len(active_spins) > 1:
-            orbitals = SplitChannelDense(self.nspins, features, self.use_bias)(h_one)
-        else:
-            orbitals = nn.DenseGeneral(features, use_bias=self.use_bias)(h_one)
-        orbitals = jnp.transpose(orbitals, (1, 2, 0, 3, 4))
-        return orbitals[..., 0] + 1j * orbitals[..., 1]
-
-
-def _complex_logdet_sum(orbitals: jnp.ndarray) -> jnp.ndarray:
-    """Return one complex log determinant sum per leading component."""
-    signs, logdets = jnp.linalg.slogdet(orbitals)
-    logmax = jnp.max(logdets, axis=-1)
-    determinant_sum = jnp.sum(
-        signs * jnp.exp(logdets - logmax[..., None]),
-        axis=-1,
-    )
-    return jnp.log(determinant_sum) + logmax
 
 
 def parity_project_log_amplitude(
@@ -471,90 +527,6 @@ def parity_log_amplitude_loss(
     )
 
 
-def source_aligned_vector_logpsi(
-    raw_logpsi: jnp.ndarray,
-    ground_logpsi: jnp.ndarray,
-    dipole: jnp.ndarray,
-    source_center: float | jnp.ndarray,
-    source_coefficient: complex | jnp.ndarray,
-    residual_log_scale: float | jnp.ndarray,
-) -> jnp.ndarray:
-    r"""Stably combine a dipole source with a vector neural residual.
-
-    This evaluates the three Cartesian components
-
-    .. math::
-
-        \Psi_a = c\,(D_a-D_{0,a})\,\Psi_0
-                 + \exp(\ell_s)\,\Psi_{\mathrm{raw},a}
-
-    directly in a common, component-wise log scale.  The returned value is a
-    complex logarithm with shape broadcast from ``raw_logpsi`` and ``dipole``.
-    A differentiable numerical floor keeps exact zeros finite; away from that
-    tiny floor the complex phase and amplitude reproduce the direct sum.
-    """
-    complex_dtype = jnp.result_type(
-        raw_logpsi,
-        ground_logpsi,
-        source_coefficient,
-        jnp.complex64,
-    )
-    raw_log = jnp.asarray(raw_logpsi, dtype=complex_dtype)
-    ground_log = jnp.asarray(ground_logpsi, dtype=complex_dtype)
-    coefficient = jnp.asarray(source_coefficient, dtype=complex_dtype)
-    residual_log = raw_log + jnp.asarray(residual_log_scale, dtype=complex_dtype)
-    real_dtype = jnp.real(raw_log).dtype
-    centered_dipole = jnp.asarray(dipole, dtype=real_dtype) - jnp.asarray(
-        source_center,
-        dtype=real_dtype,
-    )
-    source_factor = coefficient * centered_dipole
-
-    # The shared scale bounds the residual exponential and the source
-    # exponential multiplied by a smoothly floored source magnitude.  Keeping
-    # the source term itself branch-free at ``D-D0 == 0`` is essential:
-    # ``local_action_ratio`` differentiates this log amplitude twice, and a
-    # ``where`` that replaces the ground exponent at an exact source zero would
-    # silently discard the source derivative (and make its Hessian singular).
-    amplitude_floor = jnp.sqrt(jnp.asarray(jnp.finfo(real_dtype).tiny))
-    floor_sq = amplitude_floor**2
-    source_abs_sq = jnp.real(source_factor) ** 2 + jnp.imag(source_factor) ** 2
-    safe_source_abs_sq = source_abs_sq + floor_sq
-    source_log_magnitude = jnp.real(ground_log) + 0.5 * jnp.log(safe_source_abs_sq)
-    residual_log_magnitude = jnp.real(residual_log)
-    common_log_scale = jnp.maximum(source_log_magnitude, residual_log_magnitude)
-    common_log_scale = jnp.where(
-        jnp.isfinite(common_log_scale),
-        common_log_scale,
-        jnp.asarray(0.0, dtype=real_dtype),
-    )
-    # This scale is a pure numerical gauge: it cancels algebraically from the
-    # returned complex logarithm.  Stopping its derivative avoids undefined
-    # second-order AD from the max/log scale selection at an exact source zero
-    # without changing the derivative of the represented wavefunction.
-    common_log_scale = jax.lax.stop_gradient(common_log_scale)
-
-    source_exponent = (ground_log - common_log_scale).astype(complex_dtype)
-    source_scaled = source_factor * jnp.exp(source_exponent)
-    residual_scaled = jnp.exp(residual_log - common_log_scale)
-    combined_scaled = source_scaled + residual_scaled
-
-    combined_real = jnp.real(combined_scaled)
-    combined_imag = jnp.imag(combined_scaled)
-    combined_abs_sq = combined_real**2 + combined_imag**2
-    is_numerical_zero = combined_abs_sq <= floor_sq
-    safe_abs_sq = jnp.where(is_numerical_zero, floor_sq, combined_abs_sq)
-    safe_real = jnp.where(is_numerical_zero, amplitude_floor, combined_real)
-    safe_imag = jnp.where(
-        is_numerical_zero,
-        jnp.asarray(0.0, dtype=real_dtype),
-        combined_imag,
-    )
-    log_amplitude = common_log_scale + 0.5 * jnp.log(safe_abs_sq)
-    phase = jnp.arctan2(safe_imag, safe_real)
-    return log_amplitude + 1j * phase
-
-
 def molecular_electronic_dipole(data: MoleculeData, axis: int) -> jnp.ndarray:
     """Electronic dipole component for a fixed-nuclei transition source."""
     return -jnp.sum(data.electrons[:, int(axis)])
@@ -771,6 +743,14 @@ def nqs_lit_source_sampled_sums(
     hbar_response_ratio = action + shift * response_ratio
     response_over_source = response_ratio / safe_source
     hbar_over_source = hbar_response_ratio / safe_source
+    response_over_source_moments = weighted_complex_moments(
+        response_over_source,
+        source_weight,
+    )
+    hbar_over_source_moments = weighted_complex_moments(
+        hbar_over_source,
+        source_weight,
+    )
     eloc_finite = jnp.isfinite(jnp.real(eloc_response))
     eloc_response = jnp.where(
         eloc_finite,
@@ -791,14 +771,243 @@ def nqs_lit_source_sampled_sums(
         response_conj_over_source_sum=jnp.sum(
             source_weight * jnp.conj(response_ratio) / safe_source
         ),
-        response_over_source_abs2_sum=jnp.sum(
-            source_weight * jnp.abs(response_over_source) ** 2
-        ),
-        hbar_over_source_sum=jnp.sum(source_weight * hbar_over_source),
-        hbar_over_source_abs2_sum=jnp.sum(
-            source_weight * jnp.abs(hbar_over_source) ** 2
-        ),
         ground_energy_sum=jnp.real(jnp.sum(eloc_response)),
+        response_over_source_moments=response_over_source_moments,
+        hbar_over_source_moments=hbar_over_source_moments,
+        psi_weight_max=jnp.max(psi_weight_unnormalized),
+    )
+
+
+def merge_nqs_lit_source_sums(
+    left: NQSLITSourceSums,
+    right: NQSLITSourceSums,
+) -> NQSLITSourceSums:
+    """Merge source sums, including scaled ratios and centered moments."""
+    scale = jnp.maximum(left.ratio_scale, right.ratio_scale)
+    tiny = jnp.asarray(jnp.finfo(scale.dtype).tiny, dtype=scale.dtype)
+    scale = jnp.maximum(scale, tiny)
+    left_factor = left.ratio_scale / scale
+    right_factor = right.ratio_scale / scale
+
+    def log_moment(moment, weight, factor):
+        factor_sq = factor**2
+        safe_factor = jnp.maximum(factor, tiny)
+        return factor_sq * (moment + 2.0 * jnp.log(safe_factor) * weight)
+
+    left_additive = left._replace(
+        response_over_source_moments=jax.tree.map(
+            jnp.zeros_like,
+            left.response_over_source_moments,
+        ),
+        hbar_over_source_moments=jax.tree.map(
+            jnp.zeros_like,
+            left.hbar_over_source_moments,
+        ),
+        psi_weight_max=jnp.zeros_like(left.psi_weight_max),
+    )
+    right_additive = right._replace(
+        response_over_source_moments=jax.tree.map(
+            jnp.zeros_like,
+            right.response_over_source_moments,
+        ),
+        hbar_over_source_moments=jax.tree.map(
+            jnp.zeros_like,
+            right.hbar_over_source_moments,
+        ),
+        psi_weight_max=jnp.zeros_like(right.psi_weight_max),
+    )
+    merged = jax.tree.map(operator.add, left_additive, right_additive)
+
+    return merged._replace(
+        ratio_scale=scale,
+        ratio_sum=left_factor * left.ratio_sum + right_factor * right.ratio_sum,
+        ratio_abs2_sum=(
+            left_factor**2 * left.ratio_abs2_sum
+            + right_factor**2 * right.ratio_abs2_sum
+        ),
+        psi_weight_sum=(
+            left_factor**2 * left.psi_weight_sum
+            + right_factor**2 * right.psi_weight_sum
+        ),
+        psi_weight_sq_sum=(
+            left_factor**4 * left.psi_weight_sq_sum
+            + right_factor**4 * right.psi_weight_sq_sum
+        ),
+        psi_log_ratio_abs2_sum=(
+            log_moment(
+                left.psi_log_ratio_abs2_sum,
+                left.psi_weight_sum,
+                left_factor,
+            )
+            + log_moment(
+                right.psi_log_ratio_abs2_sum,
+                right.psi_weight_sum,
+                right_factor,
+            )
+        ),
+        response_over_source_moments=merge_weighted_complex_moments(
+            left.response_over_source_moments,
+            right.response_over_source_moments,
+        ),
+        hbar_over_source_moments=merge_weighted_complex_moments(
+            left.hbar_over_source_moments,
+            right.hbar_over_source_moments,
+        ),
+        psi_weight_max=jnp.maximum(
+            left_factor**2 * left.psi_weight_max,
+            right_factor**2 * right.psi_weight_max,
+        ),
+    )
+
+
+def _merge_weighted_complex_moments_across_devices(
+    moments: WeightedComplexMoments,
+    *,
+    axis_name: str,
+) -> WeightedComplexMoments:
+    """Merge centered moments with a VMA-safe parallel Chan reduction.
+
+    A common origin is selected from the first nonempty shard.  Only deviations
+    from that origin are collectively summed, which retains the numerical
+    stability of Chan's merge for nearly collinear, large-magnitude means.  The
+    implementation uses only scalar collectives so it also works inside
+    ``shard_map`` with varying-manual-axis checking enabled.
+    """
+    axis_index = jax.lax.axis_index(axis_name)
+    axis_size = jax.lax.psum(
+        jnp.asarray(1, dtype=axis_index.dtype),
+        axis_name=axis_name,
+    )
+    has_weight = moments.weight_sum > 0.0
+    first_nonempty = jax.lax.pmin(
+        jnp.where(has_weight, axis_index, axis_size),
+        axis_name=axis_name,
+    )
+    zero_mean = jnp.asarray(0.0, dtype=moments.origin.dtype)
+    origin = jax.lax.psum(
+        jnp.where(axis_index == first_nonempty, moments.origin, zero_mean),
+        axis_name=axis_name,
+    )
+    weight_sum = jax.lax.psum(moments.weight_sum, axis_name=axis_name)
+    safe_weight_sum = jnp.where(
+        weight_sum > 0.0,
+        weight_sum,
+        jnp.asarray(1.0, dtype=weight_sum.dtype),
+    )
+    local_delta = jnp.where(
+        has_weight,
+        (moments.origin - origin) + moments.mean_offset,
+        zero_mean,
+    )
+    mean_delta = (
+        jax.lax.psum(
+            moments.weight_sum * local_delta,
+            axis_name=axis_name,
+        )
+        / safe_weight_sum
+    )
+    between_shard = jnp.where(
+        has_weight,
+        moments.weight_sum * jnp.abs(local_delta - mean_delta) ** 2,
+        jnp.asarray(0.0, dtype=moments.centered_abs2_sum.dtype),
+    )
+    centered_abs2_sum = jax.lax.psum(
+        moments.centered_abs2_sum + between_shard,
+        axis_name=axis_name,
+    )
+    return WeightedComplexMoments(
+        weight_sum=weight_sum,
+        origin=origin,
+        mean_offset=mean_delta,
+        centered_abs2_sum=centered_abs2_sum,
+    )
+
+
+def merge_nqs_lit_source_sums_across_devices(
+    local_sums: NQSLITSourceSums,
+    *,
+    axis_name: str,
+) -> NQSLITSourceSums:
+    """Collectively merge source sums over a named data-parallel axis."""
+    local_has_ratio_mass = (
+        (local_sums.ratio_abs2_sum > 0.0)
+        | (local_sums.psi_weight_sum > 0.0)
+        | (jnp.abs(local_sums.ratio_sum) > 0.0)
+    )
+    local_scale = jnp.where(
+        local_has_ratio_mass,
+        local_sums.ratio_scale,
+        jnp.asarray(0.0, dtype=local_sums.ratio_scale.dtype),
+    )
+    scale = jax.lax.pmax(local_scale, axis_name=axis_name)
+    scale = jnp.where(
+        scale > 0.0,
+        scale,
+        jnp.asarray(1.0, dtype=scale.dtype),
+    )
+    tiny = jnp.asarray(jnp.finfo(scale.dtype).tiny, dtype=scale.dtype)
+    factor = local_sums.ratio_scale / jnp.maximum(scale, tiny)
+    factor = jnp.where(local_has_ratio_mass, factor, 0.0)
+    factor_sq = factor**2
+    safe_factor = jnp.maximum(factor, tiny)
+
+    additive = local_sums._replace(
+        response_over_source_moments=jax.tree.map(
+            jnp.zeros_like,
+            local_sums.response_over_source_moments,
+        ),
+        hbar_over_source_moments=jax.tree.map(
+            jnp.zeros_like,
+            local_sums.hbar_over_source_moments,
+        ),
+        psi_weight_max=jnp.zeros_like(local_sums.psi_weight_max),
+    )
+    merged = jax.tree.map(
+        lambda value: jax.lax.psum(value, axis_name=axis_name),
+        additive,
+    )
+    return merged._replace(
+        ratio_scale=scale,
+        ratio_sum=jax.lax.psum(
+            factor * local_sums.ratio_sum,
+            axis_name=axis_name,
+        ),
+        ratio_abs2_sum=jax.lax.psum(
+            factor_sq * local_sums.ratio_abs2_sum,
+            axis_name=axis_name,
+        ),
+        psi_weight_sum=jax.lax.psum(
+            factor_sq * local_sums.psi_weight_sum,
+            axis_name=axis_name,
+        ),
+        psi_weight_sq_sum=jax.lax.psum(
+            factor_sq**2 * local_sums.psi_weight_sq_sum,
+            axis_name=axis_name,
+        ),
+        psi_log_ratio_abs2_sum=jax.lax.psum(
+            factor_sq
+            * (
+                local_sums.psi_log_ratio_abs2_sum
+                + 2.0 * jnp.log(safe_factor) * local_sums.psi_weight_sum
+            ),
+            axis_name=axis_name,
+        ),
+        response_over_source_moments=(
+            _merge_weighted_complex_moments_across_devices(
+                local_sums.response_over_source_moments,
+                axis_name=axis_name,
+            )
+        ),
+        hbar_over_source_moments=(
+            _merge_weighted_complex_moments_across_devices(
+                local_sums.hbar_over_source_moments,
+                axis_name=axis_name,
+            )
+        ),
+        psi_weight_max=jax.lax.pmax(
+            factor_sq * local_sums.psi_weight_max,
+            axis_name=axis_name,
+        ),
     )
 
 
@@ -844,6 +1053,16 @@ def nqs_lit_stats_from_source_sums(
         jnp.asarray(1, dtype=real_dtype),
     )
     reweight_ess_fraction = reweight_ess / valid_sample_count
+    reweight_max_fraction = sums.psi_weight_max / jnp.where(
+        sums.psi_weight_sum > 0.0,
+        sums.psi_weight_sum,
+        jnp.asarray(1.0, dtype=real_dtype),
+    )
+    reweight_max_fraction = jnp.where(
+        has_action_mass & jnp.isfinite(reweight_max_fraction),
+        reweight_max_fraction,
+        jnp.asarray(jnp.nan, dtype=real_dtype),
+    )
     fidelity = (jnp.abs(scaled_normalization) ** 2) / jnp.maximum(
         scaled_ratio_norm,
         jnp.asarray(jnp.finfo(real_dtype).tiny, dtype=real_dtype),
@@ -870,38 +1089,61 @@ def nqs_lit_stats_from_source_sums(
     phi_norm = jnp.asarray(source_norm, dtype=real_dtype)
     action_norm = phi_norm * ratio_norm
     correction_overlap = phi_norm * sums.response_conj_over_source_sum / safe_weight_sum
-    safe_normalization = normalization + jnp.asarray(eps, dtype=normalization.dtype)
+    normalization_valid = (
+        has_action_mass
+        & jnp.isfinite(jnp.real(normalization))
+        & jnp.isfinite(jnp.imag(normalization))
+        & (jnp.abs(normalization) > 0.0)
+        & jnp.isfinite(jnp.real(correction_overlap))
+        & jnp.isfinite(jnp.imag(correction_overlap))
+        & jnp.isfinite(jnp.asarray(eta, dtype=real_dtype))
+        & (jnp.asarray(eta, dtype=real_dtype) > 0.0)
+    )
+    safe_normalization = jnp.where(
+        normalization_valid,
+        normalization,
+        jnp.asarray(1.0 + 0.0j, dtype=normalization.dtype),
+    )
     normalized_overlap = correction_overlap / jnp.conj(safe_normalization)
-    signed_lit = -jnp.imag(normalized_overlap) / jnp.asarray(eta)
-    lit = jnp.maximum(signed_lit, 0.0)
-    broadened = jnp.asarray(eta) * lit / jnp.pi
-    safe_scaled_normalization = scaled_normalization + jnp.asarray(
-        eps,
-        dtype=scaled_normalization.dtype,
+    signed_lit = jnp.where(
+        normalization_valid,
+        -jnp.imag(normalized_overlap) / jnp.asarray(eta),
+        jnp.asarray(jnp.nan, dtype=real_dtype),
     )
-    residual_mean = (
-        scaled_ratio_norm
-        / jnp.maximum(
-            jnp.abs(safe_scaled_normalization) ** 2,
-            jnp.asarray(jnp.finfo(real_dtype).tiny, dtype=real_dtype),
-        )
-        - 2.0 * jnp.real(scaled_normalization / safe_scaled_normalization)
-        + 1.0
+    broadened = jnp.asarray(eta) * signed_lit / jnp.pi
+    scaled_normalization_abs2 = jnp.abs(scaled_normalization) ** 2
+    residual_valid = (
+        has_action_mass
+        & jnp.isfinite(scaled_normalization_abs2)
+        & (scaled_normalization_abs2 > 0.0)
     )
-    residual_mean = jnp.maximum(
-        jnp.real(residual_mean),
-        jnp.asarray(0.0, dtype=real_dtype),
+    safe_scaled_normalization_abs2 = jnp.where(
+        residual_valid,
+        scaled_normalization_abs2,
+        jnp.asarray(1.0, dtype=real_dtype),
+    )
+    residual_mean = jnp.where(
+        residual_valid,
+        jnp.maximum(
+            jnp.real(scaled_ratio_norm / safe_scaled_normalization_abs2 - 1.0),
+            jnp.asarray(0.0, dtype=real_dtype),
+        ),
+        jnp.asarray(jnp.nan, dtype=real_dtype),
     )
     residual_norm = phi_norm * residual_mean
     equation_relative_residual = jnp.sqrt(residual_mean)
-    correction_norm, shifted_hamiltonian_norm, error_d = _source_sampled_error_d_sums(
+    (
+        correction_norm,
+        shifted_hamiltonian_norm,
+        error_d_correction,
+        error_d_shifted,
+        error_d,
+        error_d_valid,
+    ) = _source_sampled_error_d_sums(
         sums,
         phi_norm,
-        safe_normalization,
-        normalized_overlap,
         omega=omega,
         eta=eta,
-        eps=eps,
     )
     safe_sample_count = jnp.maximum(
         sums.sample_count,
@@ -916,13 +1158,11 @@ def nqs_lit_stats_from_source_sums(
         invalid_sample_fraction,
         jnp.asarray(1.0, dtype=real_dtype),
     )
-    nan_real = jnp.asarray(jnp.nan, dtype=real_dtype)
     return NQSLITStats(
         loss=jnp.real(loss),
         fidelity=fidelity,
         reverse_kl=reverse_kl,
         signed_lit=jnp.real(signed_lit),
-        lit=jnp.real(lit),
         broadened=jnp.real(broadened),
         source_norm=jnp.real(phi_norm),
         action_norm=jnp.real(action_norm),
@@ -935,276 +1175,96 @@ def nqs_lit_stats_from_source_sums(
         correction_norm=jnp.real(correction_norm),
         shifted_hamiltonian_norm=jnp.real(shifted_hamiltonian_norm),
         error_d=jnp.real(error_d),
+        error_d_correction=jnp.real(error_d_correction),
+        error_d_shifted=jnp.real(error_d_shifted),
+        error_d_valid=error_d_valid,
         reweight_ess=jnp.real(reweight_ess),
         reweight_ess_fraction=jnp.real(reweight_ess_fraction),
+        reweight_max_fraction=jnp.real(reweight_max_fraction),
         invalid_sample_fraction=jnp.real(invalid_sample_fraction),
-        estimator_mode=jnp.asarray(0, dtype=jnp.int32),
-        direct_hloc_rmse=nan_real,
-        direct_hloc_std=nan_real,
-        direct_hloc_sem=nan_real,
-        source_covariance_loss=jnp.asarray(0.0, dtype=real_dtype),
-        source_covariance_max_loss=jnp.asarray(0.0, dtype=real_dtype),
     )
 
 
 def _source_sampled_error_d_sums(
     sums: NQSLITSourceSums,
     phi_norm: jnp.ndarray,
-    safe_normalization: jnp.ndarray,
-    normalized_overlap: jnp.ndarray,
     *,
     omega: float | jnp.ndarray,
     eta: float | jnp.ndarray,
-    eps: float,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    safe_weight_sum = jnp.maximum(
-        sums.weight_sum,
-        jnp.asarray(eps, dtype=sums.weight_sum.dtype),
+) -> tuple[
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]:
+    """Evaluate the two paper error factors from centered source moments.
+
+    Raw ``E[|X|^2] - |E[X]|^2`` subtraction is deliberately avoided.  It loses
+    all fluctuation information for nearly collinear response/source ratios in
+    float32.  These are the raw norms in Eq. (19) of the supplement: the action
+    normalization ``N`` is applied once, later, by the LIT error monitor.
+    """
+    response_moments = sums.response_over_source_moments
+    hbar_moments = sums.hbar_over_source_moments
+    real_dtype = phi_norm.dtype
+    nan = jnp.asarray(jnp.nan, dtype=real_dtype)
+
+    shift_abs2 = (
+        jnp.asarray(omega, dtype=real_dtype) ** 2
+        + jnp.asarray(eta, dtype=real_dtype) ** 2
     )
-    correction_norm = (
-        phi_norm
-        * sums.response_over_source_abs2_sum
-        / safe_weight_sum
-        / jnp.maximum(jnp.abs(safe_normalization) ** 2, eps)
+    response_weight = response_moments.weight_sum
+    hbar_weight = hbar_moments.weight_sum
+    response_m2 = response_moments.centered_abs2_sum
+    hbar_m2 = hbar_moments.centered_abs2_sum
+    valid = (
+        jnp.isfinite(phi_norm)
+        & (phi_norm > 0.0)
+        & jnp.isfinite(shift_abs2)
+        & (shift_abs2 > 0.0)
+        & jnp.isfinite(response_weight)
+        & (response_weight > 0.0)
+        & jnp.isfinite(hbar_weight)
+        & (hbar_weight > 0.0)
+        & jnp.isfinite(jnp.real(response_moments.mean))
+        & jnp.isfinite(jnp.imag(response_moments.mean))
+        & jnp.isfinite(jnp.real(hbar_moments.mean))
+        & jnp.isfinite(jnp.imag(hbar_moments.mean))
+        & jnp.isfinite(response_m2)
+        & (response_m2 >= 0.0)
+        & jnp.isfinite(hbar_m2)
+        & (hbar_m2 >= 0.0)
     )
-    phi_norm_safe = jnp.maximum(phi_norm, jnp.asarray(eps, dtype=phi_norm.dtype))
-    correction_projection = jnp.abs(normalized_overlap) ** 2 / phi_norm_safe
-    correction_perp = jnp.sqrt(
-        jnp.maximum(
-            jnp.real(correction_norm - correction_projection),
-            jnp.asarray(0.0, dtype=phi_norm.dtype),
-        )
+
+    # Denominators are made benign only for evaluating the masked invalid
+    # branch.  They are never used as numerical regularizers for valid data.
+    safe_shift_abs2 = jnp.where(valid, shift_abs2, 1.0)
+    safe_response_weight = jnp.where(valid, response_weight, 1.0)
+    safe_hbar_weight = jnp.where(valid, hbar_weight, 1.0)
+
+    correction_variance = phi_norm * response_m2 / safe_response_weight
+    shifted_variance = phi_norm * hbar_m2 / safe_hbar_weight / safe_shift_abs2
+    correction_norm = phi_norm * (
+        response_m2 / safe_response_weight + jnp.abs(response_moments.mean) ** 2
     )
-    shift_norm = jnp.sqrt(
-        jnp.asarray(omega, dtype=phi_norm.dtype) ** 2
-        + jnp.asarray(eta, dtype=phi_norm.dtype) ** 2
-    )
-    shift_norm = jnp.maximum(shift_norm, jnp.asarray(eps, dtype=shift_norm.dtype))
     shifted_hamiltonian_norm = (
         phi_norm
-        * sums.hbar_over_source_abs2_sum
-        / safe_weight_sum
-        / jnp.maximum(jnp.abs(safe_normalization) ** 2, eps)
-        / shift_norm**2
+        * (hbar_m2 / safe_hbar_weight + jnp.abs(hbar_moments.mean) ** 2)
+        / safe_shift_abs2
     )
-    shifted_overlap = (
-        phi_norm
-        * sums.hbar_over_source_sum
-        / safe_weight_sum
-        / safe_normalization
-        / shift_norm
-    )
-    shifted_projection = jnp.abs(shifted_overlap) ** 2 / phi_norm_safe
-    shifted_perp = jnp.sqrt(
-        jnp.maximum(
-            jnp.real(shifted_hamiltonian_norm - shifted_projection),
-            jnp.asarray(0.0, dtype=phi_norm.dtype),
-        )
-    )
+    error_d_correction = jnp.sqrt(correction_variance)
+    error_d_shifted = jnp.sqrt(shifted_variance)
+    error_d = jnp.minimum(error_d_correction, error_d_shifted)
+
     return (
-        correction_norm,
-        shifted_hamiltonian_norm,
-        jnp.minimum(correction_perp, shifted_perp),
-    )
-
-
-def nqs_lit_double_sampled_stats(
-    response_apply: ResponseApply,
-    response_params: Params,
-    ground_logpsi: GroundLogPsi,
-    ground_params: Params,
-    source_batched_data: BatchedData[MoleculeData],
-    psi_batched_data: BatchedData[MoleculeData],
-    *,
-    axis: int,
-    source_center: float | jnp.ndarray,
-    source_norm: float | jnp.ndarray,
-    ground_energy: float | jnp.ndarray,
-    omega: float | jnp.ndarray,
-    eta: float | jnp.ndarray,
-    source_floor: float | jnp.ndarray = 0.0,
-    eps: float = 1e-12,
-) -> NQSLITStats:
-    """Compute NQS-LIT diagnostics with direct ``pi_Psi`` samples.
-
-    The source pool supplies the complex normalization
-    ``N=<Phi|Psi>/<Phi|Phi>`` and stable overlap estimator.  The direct
-    ``pi_Psi`` pool supplies the double-Monte-Carlo fidelity estimator,
-    avoiding source-pool reweighting when its effective sample size collapses.
-    """
-    source_sums = nqs_lit_source_sampled_sums(
-        response_apply,
-        response_params,
-        ground_logpsi,
-        ground_params,
-        source_batched_data,
-        axis=axis,
-        source_center=source_center,
-        ground_energy=ground_energy,
-        omega=omega,
-        eta=eta,
-        source_floor=source_floor,
-        eps=eps,
-    )
-    source_stats = nqs_lit_stats_from_source_sums(
-        source_sums,
-        source_norm=source_norm,
-        omega=omega,
-        eta=eta,
-        eps=eps,
-    )
-    data = psi_batched_data.data
-    action = jax.vmap(
-        lambda one: local_action_ratio(
-            response_apply,
-            response_params,
-            ground_logpsi,
-            ground_params,
-            one,
-            ground_energy=ground_energy,
-            omega=omega,
-            eta=eta,
-        )[0],
-        in_axes=(psi_batched_data.vmap_axis,),
-    )(data)
-    dipole = jax.vmap(
-        lambda one: molecular_electronic_dipole(one, axis),
-        in_axes=(psi_batched_data.vmap_axis,),
-    )(data)
-    source = dipole - jnp.asarray(source_center, dtype=dipole.dtype)
-    safe_source = jnp.where(
-        jnp.abs(source) > eps,
-        source,
-        jnp.asarray(eps, dtype=source.dtype) * jnp.where(source < 0, -1.0, 1.0),
-    )
-    ratio = action / safe_source
-    safe_ratio = jnp.where(
-        jnp.abs(ratio) > eps,
-        ratio,
-        jnp.asarray(eps, dtype=ratio.real.dtype) + 0j,
-    )
-    raw_hloc = source_stats.normalization / safe_ratio
-    finite_ratio = jnp.isfinite(jnp.real(ratio)) & jnp.isfinite(jnp.imag(ratio))
-    finite = (
-        (jnp.abs(ratio) > eps)
-        & finite_ratio
-        & jnp.isfinite(jnp.real(raw_hloc))
-        & jnp.isfinite(jnp.imag(raw_hloc))
-    )
-    valid_count = jnp.sum(finite)
-    safe_valid_count = jnp.maximum(valid_count, 1)
-    hloc = jnp.where(finite, raw_hloc, jnp.asarray(0.0, dtype=raw_hloc.dtype))
-    hloc_mean = jnp.sum(hloc) / safe_valid_count
-    direct_hloc_rmse = jnp.sqrt(
-        jnp.real(jnp.sum(jnp.where(finite, jnp.abs(raw_hloc - 1.0) ** 2, 0.0)))
-        / safe_valid_count
-    )
-    direct_hloc_std = jnp.sqrt(
-        jnp.real(jnp.sum(jnp.where(finite, jnp.abs(raw_hloc - hloc_mean) ** 2, 0.0)))
-        / safe_valid_count
-    )
-    sample_count = jnp.asarray(hloc.shape[0], dtype=direct_hloc_std.dtype)
-    direct_hloc_sem = direct_hloc_std / jnp.sqrt(safe_valid_count)
-    fidelity = jnp.clip(jnp.real(hloc_mean), 0.0, 1.0)
-    log_ratio_abs2 = 2.0 * jnp.log(
-        jnp.maximum(
-            jnp.where(finite_ratio, jnp.abs(ratio), 0.0),
-            jnp.asarray(eps, dtype=ratio.real.dtype),
-        )
-    )
-    direct_log_ratio_mean = (
-        jnp.sum(jnp.where(finite, log_ratio_abs2, 0.0)) / safe_valid_count
-    )
-    reverse_kl = jnp.where(
-        valid_count > 0,
-        jnp.maximum(
-            direct_log_ratio_mean - source_stats.log_ratio_norm,
-            jnp.asarray(0.0, dtype=fidelity.dtype),
-        ),
-        jnp.asarray(0.0, dtype=fidelity.dtype),
-    )
-    equation_relative_residual = jnp.sqrt(
-        jnp.maximum(1.0 / jnp.maximum(fidelity, eps) - 1.0, 0.0)
-    )
-    invalid_sample_fraction = 1.0 - valid_count / jnp.maximum(sample_count, 1.0)
-    action_norm = (
-        jnp.asarray(source_norm, dtype=fidelity.dtype)
-        * jnp.abs(source_stats.normalization) ** 2
-        / jnp.maximum(fidelity, jnp.asarray(eps, dtype=fidelity.dtype))
-    )
-    return source_stats._replace(
-        loss=1.0 - fidelity,
-        fidelity=fidelity,
-        reverse_kl=jnp.real(reverse_kl),
-        residual_norm=jnp.asarray(source_norm, dtype=fidelity.dtype)
-        * equation_relative_residual**2,
-        equation_relative_residual=equation_relative_residual,
-        action_norm=jnp.real(action_norm),
-        estimator_mode=jnp.asarray(1, dtype=jnp.int32),
-        direct_hloc_rmse=jnp.real(direct_hloc_rmse),
-        direct_hloc_std=jnp.real(direct_hloc_std),
-        direct_hloc_sem=jnp.real(direct_hloc_sem),
-        invalid_sample_fraction=jnp.real(invalid_sample_fraction),
-    )
-
-
-def _source_sampled_error_d(
-    action: jnp.ndarray,
-    response_ratio: jnp.ndarray,
-    source_weighted_mean,
-    safe_source: jnp.ndarray,
-    phi_norm: jnp.ndarray,
-    safe_normalization: jnp.ndarray,
-    normalized_overlap: jnp.ndarray,
-    *,
-    omega: float | jnp.ndarray,
-    eta: float | jnp.ndarray,
-    eps: float,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    normalized_response_over_source = response_ratio / safe_normalization / safe_source
-    correction_norm = phi_norm * source_weighted_mean(
-        jnp.abs(normalized_response_over_source) ** 2
-    )
-    phi_norm_safe = jnp.maximum(phi_norm, jnp.asarray(eps, dtype=phi_norm.dtype))
-    correction_projection = jnp.abs(normalized_overlap) ** 2 / phi_norm_safe
-    correction_perp = jnp.sqrt(
-        jnp.maximum(
-            jnp.real(correction_norm - correction_projection),
-            jnp.asarray(0.0, dtype=phi_norm.dtype),
-        )
-    )
-
-    shift = jnp.asarray(omega, dtype=response_ratio.real.dtype) + 1j * jnp.asarray(
-        eta,
-        dtype=response_ratio.real.dtype,
-    )
-    hbar_response_ratio = action + shift * response_ratio
-    shift_norm = jnp.sqrt(
-        jnp.asarray(omega, dtype=response_ratio.real.dtype) ** 2
-        + jnp.asarray(eta, dtype=response_ratio.real.dtype) ** 2
-    )
-    shift_norm = jnp.maximum(shift_norm, jnp.asarray(eps, dtype=shift_norm.dtype))
-    shifted_over_source = (
-        hbar_response_ratio / safe_normalization / safe_source / shift_norm
-    )
-    shifted_hamiltonian_norm = phi_norm * source_weighted_mean(
-        jnp.abs(shifted_over_source) ** 2
-    )
-    shifted_overlap = phi_norm * source_weighted_mean(shifted_over_source)
-    shifted_projection = jnp.abs(shifted_overlap) ** 2 / phi_norm_safe
-    shifted_perp = jnp.sqrt(
-        jnp.maximum(
-            jnp.real(shifted_hamiltonian_norm - shifted_projection),
-            jnp.asarray(0.0, dtype=phi_norm.dtype),
-        )
-    )
-    return (
-        correction_norm,
-        shifted_hamiltonian_norm,
-        jnp.minimum(
-            correction_perp,
-            shifted_perp,
-        ),
+        jnp.where(valid, correction_norm, nan),
+        jnp.where(valid, shifted_hamiltonian_norm, nan),
+        jnp.where(valid, error_d_correction, nan),
+        jnp.where(valid, error_d_shifted, nan),
+        jnp.where(valid, error_d, nan),
+        valid,
     )
 
 

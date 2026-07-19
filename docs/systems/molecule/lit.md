@@ -27,7 +27,10 @@ jaqmc molecule lit --yml molecule_lit.yml \
 The command writes `lit_spectrum.npz` under `workflow.save_path`. The file
 contains the scan grid, LIT values, fidelity, reverse-KL and reweighting
 effective-sample-size diagnostics, warm-start/continuation diagnostics,
-selected checkpoint iterations, and peak-picking output.
+selected checkpoint iterations, the two fidelity error factors, and matched
+jackknife blocks for correlated statistical errors. The canonical transform is
+the un-clipped `signed_lit`; finite-width `broadened` values are diagnostic and
+are not a substitute for an inversion.
 
 The frequency scan is intentionally serial. After a negative-frequency warm
 start, JaQMC optimizes frequencies in strictly increasing order. At each point,
@@ -47,21 +50,17 @@ when needed. The nuclear article does not publish its hidden `-100` to `200 MeV`
 transfer grid; this adaptive rule makes that missing engineering choice explicit
 without pretending that one large jump is frequency continuation.
 
-Frequency blocks and remote frequency workers are rejected because they break
-this predecessor chain at block boundaries. Use `lit.scan_parallel=off`.
-Within one frequency, `lit.nqs_data_parallel=local_devices` instead shards the
+Frequency blocks are deliberately unsupported because they break this
+predecessor chain at block boundaries. Within one frequency,
+`lit.nqs_data_parallel=local_devices` instead shards the
 unchanged global Monte Carlo batch across every GPU visible to one process. All
 normalizations and action-state gradients are reduced globally; SPRING uses a
 distributed score matrix but one replicated direction and history. Thus a
-global batch of 1024 on eight GPUs means 128 walkers per GPU, not 8192 walkers,
-and the response-parameter continuation chain remains unique. This mode
-requires source-sampled training (`nqs_direct_psi_train: false`), a batch size
-divisible by the local device count, and one JAX process on one worker. Both
-the configured global training-update and evaluation chunk sizes are checked
-at startup, before sampling. A reused held-out source pool must also have a
-total walker count divisible by the device count so its final evaluation chunk
-can be sharded; this pool-size check runs immediately after loading, before
-covariance evaluation or response training.
+global batch can be configured directly, or by setting a per-device batch that
+is multiplied by the number of local GPUs; the response-parameter continuation
+chain remains unique. This mode requires one JAX process on one worker. Batch
+divisibility and the exact train/evaluation pool sizes are checked immediately
+after loading, before response training.
 
 The published stabilization objective is
 `fidelity - lambda * KL(pi_action || pi_source)`. The defaults use
@@ -69,6 +68,14 @@ The published stabilization objective is
 `epsilon=1e-3 * mean(diag(S))`, and a configurable SPRING decay. The nuclear
 LIT article does not report the decay value; the default `0.99` comes from the
 general SPRING reference rather than from that LIT calculation.
+
+Before the resolvent optimization, JaQMC distills an independently initialized
+response NQS toward the fixed dipole source on the training `pi_Phi` pool and
+selects its best checkpoint on a separate held-out pool. Atomic responses use
+the automatically diagnosed parity opposite to the ground state; multi-center
+molecules are currently accepted only when their discovered spatial sector is
+C1. There is no source-aligned ansatz, direct-`Psi` fallback, or soft point-group
+penalty in the production path.
 
 ## End-To-End H Atom Reference
 
@@ -199,10 +206,6 @@ lit:
   # omega_values: [0.444, 0.46875, 0.480]
   axes: x
   output_filename: lit_spectrum.npz
-  peak_min_height_fraction: 0.02
-  preview_roots: 8
-
-  scan_parallel: "off"
 
   nqs_allow_untrained_ground: false
   nqs_ground_energy: null
@@ -217,25 +220,19 @@ lit:
   nqs_train_pool_batches: 64
   nqs_eval_pool_batches: 16
   nqs_pool_stride: 4
+  # Choose either a global batch or the corresponding per-device batch.
   nqs_train_update_batch_size: 4096
   nqs_eval_batch_size: 4096
+  nqs_train_update_batch_size_per_device: 0
+  nqs_eval_batch_size_per_device: 0
   # Optional: shard each single-frequency batch across all locally visible GPUs.
   nqs_data_parallel: "off"
   nqs_reuse_source_pool: true
   nqs_save_source_pool: true
 
-  # Zero selects the published source-pool importance-reweighting protocol.
-  # A positive threshold enables JaQMC's optional direct-action fallback.
-  nqs_reweight_ess_fraction_min: 0.0
-  nqs_direct_psi_train: false
-  nqs_direct_psi_burn_in: 5
-  nqs_direct_psi_batches: 1
-  nqs_direct_psi_train_batches: null
-  nqs_direct_psi_eval_batches: null
-  nqs_direct_psi_stride: 1
-  # Engineering controls for the optional direct-action fallback.
-  nqs_direct_psi_precompile: true
-  nqs_direct_psi_persistent_sampler: true
+  # Fit the independent response NQS to Phi on the fixed source pools before
+  # applying the resolvent action.
+  nqs_source_distillation_iterations: 1000
 
   nqs_learning_rate: 0.005
   nqs_reverse_kl_weight: 1.0
@@ -268,6 +265,10 @@ lit:
   nqs_response_use_last_layer: false
   nqs_response_envelope: abs_isotropic
   nqs_response_orbitals_spin_split: true
+  nqs_parity_eval_batch_size: 256
+  nqs_sector_tolerance: 1.0e-5
+  nqs_atomic_source_parity_max_loss: 1.0e-3
+  nqs_atomic_ground_parity_max_loss: 1.0e-3
 ```
 
 Run it from the repository root:
@@ -283,6 +284,54 @@ If the checkpoint directory differs from the workflow restore directory, add:
 ```bash
 lit.nqs_checkpoint_path=./runs/h_atom-ground
 ```
+
+## Correlated Multi-Width Inversion
+
+Run the same frequency grid with at least two finite `eta` values and reuse the
+same saved evaluation pool by setting one common, explicit
+`lit.nqs_source_pool_dir` for every run. Each output records matched
+delete-one-block jackknife pseudo-values and the evaluation-pool digest. The
+strict loader rejects independently generated pools and keeps the verified
+cross-frequency and cross-width covariance:
+
+```python
+import numpy as np
+
+from jaqmc.response import aggregate_lit_npz, invert_signed_lit
+
+data = aggregate_lit_npz(
+    [
+        "runs/h_atom-lit-eta005/lit_spectrum.npz",
+        "runs/h_atom-lit-eta010/lit_spectrum.npz",
+    ]
+)
+result = invert_signed_lit(
+    data.omega,
+    data.eta,
+    data.signed_lit,
+    threshold=0.5,
+    pole_energies=np.array([0.375, 4 / 9, 15 / 32]),
+    continuum_grid=np.linspace(0.5, 1.0, 24),
+    covariance=data.covariance,
+    continuum_regularization=1.0e-3,
+)
+```
+
+Pole strengths and continuum densities are constrained to be nonnegative, and
+pole energies can optionally be refined within explicit non-overlapping
+bounds. A single-width fit is allowed for diagnostics but is marked
+`result.diagnostics.underdetermined`; it does not establish stability with
+respect to Lorentzian resolution. `data.statistical_covariance` retains the
+matched-block Monte Carlo correlations. Following the PRL likelihood,
+`data.covariance` additionally contains
+`diag(data.systematic_error**2)`, where `systematic_error` is the raw-LIT
+fidelity/D monitor. Supplement Eq. (19) retains only the leading term in
+`sqrt(1 - fidelity)`, so away from high fidelity this quantity is not a
+rigorous upper bound. This diagonal systematic term is the paper's explicit
+approximation; it should not be interpreted as evidence that optimization
+errors at different frequencies are physically independent. Any invalid or
+non-finite monitor makes the formal loader fail instead of silently assigning
+zero uncertainty.
 
 ## Expected H Atom Sanity Checks
 
@@ -303,11 +352,12 @@ Higher bound bright transitions in the same window are
 1s -> 7p: 0.489796 Ha
 ```
 
-Peak positions are the main diagnostic. Raw local maxima can contain side lobes
-or optimizer artifacts, especially near the ionization threshold where Rydberg
-levels become dense and the reweighting effective sample size can be small. Use
-the `fidelity` and `reweight_ess_fraction` arrays in `lit_spectrum.npz` when
-judging whether a high-energy feature is reliable.
+These energies are references for an inverted response, not targets for local
+maxima of a finite-width curve. Raw local maxima can contain side lobes or
+optimizer artifacts, especially near the ionization threshold where Rydberg
+levels become dense. Check `fidelity`, `reweight_ess_fraction`,
+`reweight_max_fraction`, `error_d_valid`, and `error_bound_monitor` before using
+any transform point in an inversion.
 
 ## Faster Smoke Tests
 

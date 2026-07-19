@@ -10,14 +10,14 @@ from jaqmc.app.molecule.lit_workflow import (
     MolecularLITConfig,
     MoleculeLITWorkflow,
     _add_source_sums,
+    _signed_lit_jackknife_pseudovalues,
 )
 from jaqmc.data import BatchedData
 from jaqmc.response.nqs_lit import (
     MolecularResponseFermiNet,
-    MolecularVectorResponseFermiNet,
     NQSLITSourceSums,
+    WeightedComplexMoments,
     local_action_ratio,
-    nqs_lit_double_sampled_stats,
     nqs_lit_source_sampled_stats,
     nqs_lit_source_sampled_sums,
     nqs_lit_stats_from_source_sums,
@@ -26,7 +26,6 @@ from jaqmc.response.nqs_lit import (
     parity_log_amplitude_residual,
     parity_project_log_amplitude,
     restore_params_from_checkpoint,
-    source_aligned_vector_logpsi,
 )
 from jaqmc.utils.checkpoint import NumPyCheckpointManager
 
@@ -113,17 +112,81 @@ def test_full_response_source_sampled_hydrogen_stats_are_finite():
     assert np.isfinite(float(stats.reverse_kl))
     assert float(stats.reverse_kl) >= 0.0
     assert np.isfinite(float(stats.signed_lit))
-    assert np.isfinite(float(stats.lit))
+    np.testing.assert_allclose(
+        float(stats.broadened),
+        0.02 * float(stats.signed_lit) / np.pi,
+    )
     assert float(stats.reweight_ess) > 0.0
     assert 0.0 < float(stats.reweight_ess_fraction) <= 1.0
     assert np.isfinite(float(stats.error_d))
     assert np.isfinite(float(stats.equation_relative_residual))
     assert float(stats.equation_relative_residual) >= 0.0
     np.testing.assert_allclose(float(stats.invalid_sample_fraction), 0.0)
-    assert np.isnan(float(stats.direct_hloc_rmse))
-    assert np.isnan(float(stats.direct_hloc_std))
-    assert np.isnan(float(stats.direct_hloc_sem))
     np.testing.assert_allclose(float(stats.source_norm), 1.0)
+
+
+def test_signed_lit_jackknife_uses_leave_one_out_ratio_of_sums():
+    batch = _h_batch()
+
+    def sliced(start: int, stop: int) -> BatchedData[MoleculeData]:
+        return BatchedData(
+            data=MoleculeData(
+                electrons=batch.data.electrons[start:stop],
+                atoms=batch.data.atoms,
+                charges=batch.data.charges,
+            ),
+            fields_with_batch=["electrons"],
+        )
+
+    common = dict(
+        response_apply=_hydrogen_2pz_logpsi,
+        response_params={},
+        ground_logpsi=_hydrogen_1s_logpsi,
+        ground_params={},
+        axis=2,
+        source_center=0.0,
+        ground_energy=-0.5,
+        omega=0.375,
+        eta=0.02,
+        source_floor=1e-4,
+    )
+    block_sums = tuple(
+        nqs_lit_source_sampled_sums(
+            batched_data=block,
+            **common,
+        )
+        for block in (sliced(0, 2), sliced(2, 5))
+    )
+    full_sums = _add_source_sums(*block_sums)
+    full_stats = nqs_lit_stats_from_source_sums(
+        full_sums,
+        source_norm=1.0,
+        omega=0.375,
+        eta=0.02,
+    )
+
+    actual = _signed_lit_jackknife_pseudovalues(
+        full_stats,
+        block_sums,
+        source_norm=1.0,
+        omega=0.375,
+        eta=0.02,
+    )
+    leave_one_out = np.asarray(
+        [
+            float(
+                nqs_lit_stats_from_source_sums(
+                    block_sums[1 - index],
+                    source_norm=1.0,
+                    omega=0.375,
+                    eta=0.02,
+                ).signed_lit
+            )
+            for index in range(2)
+        ]
+    )
+    expected = 2.0 * float(full_stats.signed_lit) - leave_one_out
+    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
 
 
 def test_heldout_kernel_reuses_trace_across_params_frequency_and_center():
@@ -281,38 +344,6 @@ def test_fused_source_scores_preserve_source_sampled_sums():
     )
 
 
-def test_double_sampled_hydrogen_stats_reports_direct_estimator():
-    batch = _h_batch()
-
-    stats = nqs_lit_double_sampled_stats(
-        _hydrogen_2pz_logpsi,
-        {},
-        _hydrogen_1s_logpsi,
-        {},
-        batch,
-        batch,
-        axis=2,
-        source_center=0.0,
-        source_norm=1.0,
-        ground_energy=-0.5,
-        omega=0.375,
-        eta=0.02,
-        source_floor=1e-4,
-    )
-
-    assert int(stats.estimator_mode) == 1
-    assert 0.0 <= float(stats.fidelity) <= 1.0
-    assert np.isfinite(float(stats.reverse_kl))
-    assert float(stats.action_norm) >= 0.0
-    assert np.isfinite(float(stats.equation_relative_residual))
-    assert np.isfinite(float(stats.direct_hloc_rmse))
-    assert np.isfinite(float(stats.direct_hloc_std))
-    assert np.isfinite(float(stats.direct_hloc_sem))
-    assert float(stats.direct_hloc_rmse) >= 0.0
-    assert float(stats.direct_hloc_std) >= 0.0
-    assert float(stats.direct_hloc_sem) >= 0.0
-
-
 def test_zero_action_mass_is_finite_and_marked_invalid():
     real = jnp.asarray(0.0, dtype=jnp.float32)
     complex_zero = jnp.asarray(0.0 + 0.0j, dtype=jnp.complex64)
@@ -327,10 +358,20 @@ def test_zero_action_mass_is_finite_and_marked_invalid():
         psi_weight_sq_sum=real,
         psi_log_ratio_abs2_sum=real,
         response_conj_over_source_sum=complex_zero,
-        response_over_source_abs2_sum=real,
-        hbar_over_source_sum=complex_zero,
-        hbar_over_source_abs2_sum=real,
         ground_energy_sum=real,
+        response_over_source_moments=WeightedComplexMoments(
+            weight_sum=jnp.asarray(3.0, dtype=jnp.float32),
+            origin=complex_zero,
+            mean_offset=complex_zero,
+            centered_abs2_sum=real,
+        ),
+        hbar_over_source_moments=WeightedComplexMoments(
+            weight_sum=jnp.asarray(3.0, dtype=jnp.float32),
+            origin=complex_zero,
+            mean_offset=complex_zero,
+            centered_abs2_sum=real,
+        ),
+        psi_weight_max=real,
     )
 
     stats = nqs_lit_stats_from_source_sums(
@@ -362,10 +403,20 @@ def test_scale_aware_source_moments_survive_float32_dynamic_range():
             psi_weight_sq_sum=jnp.asarray(1.0, dtype=jnp.float32),
             psi_log_ratio_abs2_sum=real_zero,
             response_conj_over_source_sum=complex_zero,
-            response_over_source_abs2_sum=real_zero,
-            hbar_over_source_sum=complex_zero,
-            hbar_over_source_abs2_sum=real_zero,
             ground_energy_sum=real_zero,
+            response_over_source_moments=WeightedComplexMoments(
+                weight_sum=jnp.asarray(1.0, dtype=jnp.float32),
+                origin=complex_zero,
+                mean_offset=complex_zero,
+                centered_abs2_sum=real_zero,
+            ),
+            hbar_over_source_moments=WeightedComplexMoments(
+                weight_sum=jnp.asarray(1.0, dtype=jnp.float32),
+                origin=complex_zero,
+                mean_offset=complex_zero,
+                centered_abs2_sum=real_zero,
+            ),
+            psi_weight_max=jnp.asarray(1.0, dtype=jnp.float32),
         )
 
     sums = _add_source_sums(one_sample(1e30), one_sample(1e-30))
@@ -402,27 +453,6 @@ def test_molecular_response_ferminet_returns_complex_logpsi():
     assert jnp.iscomplexobj(value)
     assert np.isfinite(float(jnp.real(value)))
     assert np.isfinite(float(jnp.imag(value)))
-
-
-def test_molecular_vector_response_ferminet_returns_three_complex_components():
-    batch = _h_batch()
-    data = MoleculeData(
-        electrons=batch.data.electrons[0],
-        atoms=batch.data.atoms,
-        charges=batch.data.charges,
-    )
-    response = MolecularVectorResponseFermiNet(
-        nspins=(1, 0),
-        ndets=2,
-        hidden_dims_single=(4,),
-        hidden_dims_double=(2,),
-    )
-    params = response.init(jax.random.PRNGKey(2), batch.unbatched_example())
-    value = response.apply(params, data)
-
-    assert value.shape == (3,)
-    assert jnp.iscomplexobj(value)
-    assert np.all(np.isfinite(np.asarray(value)))
 
 
 def test_odd_parity_projection_is_stable_under_extreme_common_log_shifts():
@@ -778,137 +808,6 @@ def test_parity_helpers_reject_invalid_parity_and_shape():
         parity_project_log_amplitude(log_psi, log_psi, 0)
     with np.testing.assert_raises_regex(ValueError, "identical shapes"):
         parity_log_amplitude_residual(log_psi, log_psi[:1], 1)
-
-
-def test_source_aligned_vector_logpsi_is_source_dominated_at_initialization():
-    raw_logpsi = jnp.asarray(
-        [0.2 + 0.3j, -0.4 - 0.1j, 0.1 + 0.7j],
-        dtype=jnp.complex64,
-    )
-    ground_logpsi = jnp.asarray(-0.6 + 0.4j, dtype=jnp.complex64)
-    dipole = jnp.asarray([0.5, -0.3, 0.8], dtype=jnp.float32)
-    source_center = jnp.asarray([0.1, 0.05, -0.2], dtype=jnp.float32)
-    coefficient = jnp.asarray(1.2 - 0.35j, dtype=jnp.complex64)
-    residual_log_scale = jnp.asarray(-18.0, dtype=jnp.float32)
-
-    result = source_aligned_vector_logpsi(
-        raw_logpsi,
-        ground_logpsi,
-        dipole,
-        source_center,
-        coefficient,
-        residual_log_scale,
-    )
-    source = coefficient * (dipole - source_center) * jnp.exp(ground_logpsi)
-    expected = source + jnp.exp(raw_logpsi + residual_log_scale)
-
-    assert result.shape == (3,)
-    np.testing.assert_allclose(
-        np.asarray(jnp.exp(result)),
-        np.asarray(expected),
-        rtol=3e-6,
-        atol=3e-7,
-    )
-    np.testing.assert_allclose(
-        np.asarray(jnp.exp(result)),
-        np.asarray(source),
-        rtol=3e-6,
-        atol=3e-7,
-    )
-
-
-def test_source_aligned_vector_logpsi_exact_zero_is_finite():
-    result = source_aligned_vector_logpsi(
-        jnp.full((3,), -jnp.inf + 0.0j, dtype=jnp.complex64),
-        jnp.asarray(0.2 + 0.4j, dtype=jnp.complex64),
-        jnp.asarray([0.2, -0.1, 0.7], dtype=jnp.float32),
-        jnp.asarray([0.2, -0.1, 0.7], dtype=jnp.float32),
-        jnp.asarray(1.0 + 0.5j, dtype=jnp.complex64),
-        jnp.asarray(0.0, dtype=jnp.float32),
-    )
-
-    assert result.shape == (3,)
-    assert np.all(np.isfinite(np.asarray(result)))
-
-
-def test_source_aligned_vector_logpsi_keeps_source_hessian_at_source_zero():
-    """An exact dipole zero must not detach the source term from coordinate AD."""
-
-    def log_amplitude(coordinate):
-        result = source_aligned_vector_logpsi(
-            jnp.zeros(3, dtype=jnp.complex64),
-            jnp.asarray(2.0 + 0.0j, dtype=jnp.complex64),
-            jnp.asarray([coordinate, 0.3, -0.4], dtype=jnp.float32),
-            jnp.zeros(3, dtype=jnp.float32),
-            jnp.asarray(1.0 + 0.0j, dtype=jnp.complex64),
-            jnp.asarray(0.0, dtype=jnp.float32),
-        )
-        return jnp.real(result[0])
-
-    coordinate = jnp.asarray(0.0, dtype=jnp.float32)
-    first = jax.grad(log_amplitude)(coordinate)
-    second = jax.grad(jax.grad(log_amplitude))(coordinate)
-
-    np.testing.assert_allclose(float(first), np.exp(2.0), rtol=2e-6)
-    np.testing.assert_allclose(float(second), -np.exp(4.0), rtol=2e-6)
-
-
-def test_source_aligned_vector_response_has_finite_derivatives():
-    batch = _h_batch()
-    data = MoleculeData(
-        electrons=jnp.asarray([[0.2, -0.1, 0.4]], dtype=jnp.float32),
-        atoms=batch.data.atoms,
-        charges=batch.data.charges,
-    )
-    response = MolecularVectorResponseFermiNet(
-        nspins=(1, 0),
-        ndets=1,
-        hidden_dims_single=(2,),
-        hidden_dims_double=(1,),
-    )
-    params = response.init(jax.random.PRNGKey(3), data)
-    direction = jax.tree.map(
-        lambda leaf: jnp.ones_like(leaf) / max(1, leaf.size),
-        params,
-    )
-    flat_electrons = jnp.ravel(data.electrons)
-
-    def scalar_response(parameter_step, electrons_flat):
-        local_params = jax.tree.map(
-            lambda leaf, tangent: leaf + parameter_step * tangent,
-            params,
-            direction,
-        )
-        electrons = jnp.reshape(electrons_flat, data.electrons.shape)
-        local_data = data.merge({"electrons": electrons})
-        raw_logpsi = response.apply(local_params, local_data)
-        ground_logpsi = -0.4 * jnp.sum(electrons**2) + 0.1j * jnp.sum(electrons)
-        dipole = -jnp.sum(electrons, axis=0)
-        aligned = source_aligned_vector_logpsi(
-            raw_logpsi,
-            ground_logpsi,
-            dipole,
-            jnp.zeros(3, dtype=electrons.dtype),
-            jnp.asarray(1.0 + 0.2j, dtype=jnp.complex64),
-            jnp.asarray(-8.0, dtype=electrons.dtype),
-        )
-        return jnp.sum(jnp.real(aligned)) + 0.2 * jnp.sum(jnp.imag(aligned))
-
-    def parameter_function(step):
-        return scalar_response(step, flat_electrons)
-
-    def coordinate_function(electrons):
-        return scalar_response(0.0, electrons)
-
-    parameter_first = jax.grad(parameter_function)(jnp.asarray(0.0))
-    parameter_second = jax.grad(jax.grad(parameter_function))(jnp.asarray(0.0))
-    coordinate_first = jax.grad(coordinate_function)(flat_electrons)
-    coordinate_second = jax.hessian(coordinate_function)(flat_electrons)
-
-    assert np.isfinite(float(parameter_first))
-    assert np.isfinite(float(parameter_second))
-    assert np.all(np.isfinite(np.asarray(coordinate_first)))
-    assert np.all(np.isfinite(np.asarray(coordinate_second)))
 
 
 def test_restore_params_from_stage_checkpoint(tmp_path):

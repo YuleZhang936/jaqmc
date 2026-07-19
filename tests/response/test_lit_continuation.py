@@ -30,7 +30,7 @@ class _BridgeStats(NamedTuple):
     reverse_kl: jax.Array
     invalid_sample_fraction: jax.Array
     reweight_ess_fraction: jax.Array
-    lit: jax.Array
+    signed_lit: jax.Array
     source_norm: jax.Array
 
 
@@ -39,7 +39,7 @@ def _bridge_stats(
     *,
     invalid=0.0,
     ess=1.0,
-    lit=1.0,
+    signed_lit=1.0,
     reverse_kl=0.0,
     source_norm=1.0,
 ):
@@ -49,7 +49,7 @@ def _bridge_stats(
         reverse_kl=jnp.asarray(reverse_kl),
         invalid_sample_fraction=jnp.asarray(invalid),
         reweight_ess_fraction=jnp.asarray(ess),
-        lit=jnp.asarray(lit),
+        signed_lit=jnp.asarray(signed_lit),
         source_norm=jnp.asarray(source_norm),
     )
 
@@ -61,9 +61,9 @@ def _mock_bridge_workflow(config):
     starts = []
     probes = []
 
-    def init_carry(_data, rng, params):
+    def init_carry(rng, params):
         starts.append(float(params))
-        return SimpleNamespace(direct=SimpleNamespace(rng=rng))
+        return SimpleNamespace(rng=rng)
 
     def update(_params, _pool, omega, carry, _iteration):
         optimized.append(float(omega))
@@ -103,7 +103,6 @@ def _run_bridge(
         current_stats,
         None,
         None,
-        None,
         rng,
         response_apply=None,
         ground_logpsi=None,
@@ -132,19 +131,19 @@ def _post_optimization_bridge_workflow(
     rng_starts = []
     attempts = []
 
-    def init_carry(_data, rng, params):
+    def init_carry(rng, params):
         starts.append(float(params))
         rng_starts.append(np.asarray(rng).copy())
-        return SimpleNamespace(direct=SimpleNamespace(rng=rng))
+        return SimpleNamespace(rng=rng)
 
     def update(_params, _pool, omega, carry, _iteration):
         omega_value = float(omega)
         attempts.append(omega_value)
         next_rng = jax.random.fold_in(
-            carry.direct.rng,
+            carry.rng,
             round(1000.0 * omega_value),
         )
-        next_carry = SimpleNamespace(direct=SimpleNamespace(rng=next_rng))
+        next_carry = SimpleNamespace(rng=next_rng)
         return omega, _bridge_stats(1.0), next_carry
 
     update.init_carry = init_carry
@@ -179,7 +178,7 @@ def test_continuation_default_min_step_uses_finer_spectrum_spacing():
 
 
 def test_physics_continuation_step_uses_lit_residual_scale():
-    stats = _bridge_stats(1.0, lit=4.0, source_norm=1.0)
+    stats = _bridge_stats(1.0, signed_lit=4.0, source_norm=1.0)
 
     step = _physics_continuation_step(
         stats,
@@ -923,12 +922,10 @@ def test_continuation_checkpoint_round_trip_across_run_directories(tmp_path):
         loss=jnp.asarray(0.005),
         fidelity=jnp.asarray(0.995),
         reverse_kl=jnp.asarray(0.002),
-        lit=jnp.asarray(1.0),
+        signed_lit=jnp.asarray(1.0),
         source_norm=jnp.asarray(1.0),
         reweight_ess_fraction=jnp.asarray(0.8),
         invalid_sample_fraction=jnp.asarray(0.0),
-        source_covariance_loss=jnp.asarray(0.0),
-        source_covariance_max_loss=jnp.asarray(0.0),
     )
     record = _ContinuationRecord(
         omega=0.2,
@@ -1001,7 +998,6 @@ def test_continuation_checkpoint_round_trip_across_run_directories(tmp_path):
             {"w": jnp.asarray([0.0 + 0.0j])},
             jax.random.PRNGKey(0),
             None,
-            SimpleNamespace(),
             response_apply=None,
             ground_logpsi=None,
             ground_params=ground_params,
@@ -1097,6 +1093,15 @@ def test_continuation_state_fingerprint_allows_new_execution_policy_not_ansatz()
     changed_execution_layout = MolecularLITConfig(
         nqs_continuation_allow_min_step_override=False,
         nqs_data_parallel="local_devices",
+        nqs_train_update_batch_size_per_device=512,
+        nqs_eval_batch_size_per_device=256,
+    )
+    changed_optimizer = MolecularLITConfig(
+        nqs_continuation_allow_min_step_override=False,
+        nqs_learning_rate=0.02,
+        nqs_reverse_kl_weight=0.5,
+        nqs_spring_decay=0.9,
+        nqs_source_distillation_iterations=4000,
     )
 
     old_state, old_full = _continuation_checkpoint_digests(
@@ -1127,6 +1132,10 @@ def test_continuation_state_fingerprint_allows_new_execution_policy_not_ansatz()
         changed_execution_layout,
         **digest_args,
     )
+    optimizer_state, optimizer_full = _continuation_checkpoint_digests(
+        changed_optimizer,
+        **digest_args,
+    )
 
     assert recovered_state == old_state
     assert recovered_full != old_full
@@ -1139,6 +1148,8 @@ def test_continuation_state_fingerprint_allows_new_execution_policy_not_ansatz()
     assert plateau_full != old_full
     assert execution_state == old_state
     assert execution_full != old_full
+    assert optimizer_state == old_state
+    assert optimizer_full != old_full
 
     changed_ground_state, _ = _continuation_checkpoint_digests(
         old_config,
@@ -1193,7 +1204,6 @@ def _run_stage_optimizer(
         initial_params=jnp.asarray(0.0),
         train_pool=None,
         eval_pool=None,
-        fallback_data=None,
         rng=jax.random.PRNGKey(0),
         response_apply=None,
         ground_logpsi=None,
@@ -1217,8 +1227,8 @@ def _mock_stage_optimizer_with_stats(config, initial_stats, candidate_stats):
 
     workflow._nqs_stats_chunked = evaluate
 
-    def init_carry(_data, rng, _params):
-        return SimpleNamespace(direct=SimpleNamespace(rng=rng))
+    def init_carry(rng, _params):
+        return SimpleNamespace(rng=rng)
 
     def update(params, _pool, _omega, carry, _iteration):
         return params + 1.0, candidate_stats, carry
@@ -1241,15 +1251,15 @@ def _mock_optimizer_trajectory(config, stats_by_iteration):
 
     workflow._nqs_stats_chunked = evaluate
 
-    def init_carry(_data, rng, params):
+    def init_carry(rng, params):
         init_calls.append((float(params), np.asarray(rng).copy()))
-        return SimpleNamespace(direct=SimpleNamespace(rng=rng))
+        return SimpleNamespace(rng=rng)
 
     def update(params, _pool, _omega, carry, iteration):
         updates.append((float(params), iteration))
         next_params = params + 1.0
-        next_rng = jax.random.fold_in(carry.direct.rng, iteration + 1)
-        next_carry = SimpleNamespace(direct=SimpleNamespace(rng=next_rng))
+        next_rng = jax.random.fold_in(carry.rng, iteration + 1)
+        next_carry = SimpleNamespace(rng=next_rng)
         return next_params, stats_at(next_params), next_carry
 
     update.init_carry = init_carry

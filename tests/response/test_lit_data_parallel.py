@@ -19,7 +19,6 @@ from jaqmc.app.molecule.lit_workflow import (
     MolecularLITConfig,
     MoleculeLITWorkflow,
     _add_source_sums,
-    _DirectPsiCarry,
     _merge_source_sums_across_devices,
     _NQSUpdateCarry,
     _regularized_action_gradient,
@@ -30,7 +29,7 @@ from jaqmc.app.molecule.lit_workflow import (
     _SpringState,
 )
 from jaqmc.data import BatchedData
-from jaqmc.response.nqs_lit import NQSLITSourceSums
+from jaqmc.response.nqs_lit import NQSLITSourceSums, WeightedComplexMoments
 from jaqmc.utils import parallel_jax
 
 
@@ -84,10 +83,20 @@ def _per_device_source_sums(device_count: int) -> NQSLITSourceSums:
         psi_weight_sq_sum=psi_weight_sq_sum,
         psi_log_ratio_abs2_sum=psi_log_ratio_abs2_sum,
         response_conj_over_source_sum=(0.2 - 0.3j) * (index + 1.0),
-        response_over_source_abs2_sum=0.7 + index,
-        hbar_over_source_sum=(-0.4 + 0.1j) * (index + 1.0),
-        hbar_over_source_abs2_sum=1.2 + 0.4 * index,
         ground_energy_sum=-1.0 - 0.2 * index,
+        response_over_source_moments=WeightedComplexMoments(
+            weight_sum=2.0 + 0.5 * index,
+            origin=(0.7 - 0.2j) * (index + 1.0),
+            mean_offset=jnp.zeros_like(index, dtype=jnp.complex64),
+            centered_abs2_sum=0.3 + 0.1 * index,
+        ),
+        hbar_over_source_moments=WeightedComplexMoments(
+            weight_sum=2.0 + 0.5 * index,
+            origin=(-0.4 + 0.1j) * (index + 1.0),
+            mean_offset=jnp.zeros_like(index, dtype=jnp.complex64),
+            centered_abs2_sum=1.2 + 0.4 * index,
+        ),
+        psi_weight_max=0.25 + 0.05 * index,
     )
 
 
@@ -454,12 +463,10 @@ def _lit_workflow(
     eval_batch_size: int,
 ) -> MoleculeLITWorkflow:
     workflow = object.__new__(MoleculeLITWorkflow)
-    workflow.config = SimpleNamespace(batch_size=train_batch_size)
+    workflow.config = SimpleNamespace(batch_size=train_batch_size, seed=123)
     workflow.lit_config = MolecularLITConfig(
         eta=0.02,
         nqs_data_parallel=data_parallel,
-        nqs_direct_psi_train=False,
-        nqs_reweight_ess_fraction_min=0.0,
         nqs_train_update_batch_size=train_batch_size,
         nqs_eval_batch_size=eval_batch_size,
         nqs_source_floor=1e-4,
@@ -470,7 +477,6 @@ def _lit_workflow(
         nqs_spring_damping_floor=1e-4,
         nqs_sr_max_norm=None,
         nqs_sr_score_eps=1e-7,
-        nqs_source_symmetry_weight=0.0,
     )
     workflow._nqs_chunk_sums_kernel_cache = {}
     return workflow
@@ -509,8 +515,8 @@ def test_data_parallel_empty_and_small_batches_are_rejected(monkeypatch, batch_s
 @pytest.mark.parametrize(
     ("workflow_batch", "train_batch", "eval_batch", "purpose", "batch_size"),
     [
-        (0, 0, 8, "training", 0),
-        (0, 8, 0, "evaluation", 0),
+        (0, 0, 8, "training", 1),
+        (0, 8, 0, "evaluation", 1),
         (1024, 4, 8, "training", 4),
         (1024, 10, 8, "training", 10),
         (1024, 8, 4, "evaluation", 4),
@@ -532,7 +538,7 @@ def test_data_parallel_config_rejects_invalid_effective_batches_before_run(
         train_batch_size=train_batch,
         eval_batch_size=eval_batch,
     )
-    workflow.config = SimpleNamespace(batch_size=workflow_batch)
+    workflow.config = SimpleNamespace(batch_size=workflow_batch, seed=123)
 
     with pytest.raises(
         ValueError,
@@ -551,6 +557,36 @@ def test_data_parallel_config_accepts_formal_1024_on_eight_devices(monkeypatch):
     )
 
     workflow._validate_data_parallel_config()
+
+
+def test_per_device_batches_scale_only_in_local_devices_mode(monkeypatch):
+    monkeypatch.setattr(jax, "local_device_count", lambda: 8)
+    workflow = _lit_workflow(
+        "local_devices",
+        train_batch_size=0,
+        eval_batch_size=0,
+    )
+    workflow.lit_config.nqs_train_update_batch_size_per_device = 512
+    workflow.lit_config.nqs_eval_batch_size_per_device = 256
+
+    assert workflow._nqs_train_update_batch_size() == 4096
+    assert workflow._nqs_eval_batch_size() == 2048
+
+    workflow.lit_config.nqs_data_parallel = "off"
+    assert workflow._nqs_train_update_batch_size() == 512
+    assert workflow._nqs_eval_batch_size() == 256
+
+
+def test_global_and_per_device_batches_are_mutually_exclusive():
+    workflow = _lit_workflow(
+        "off",
+        train_batch_size=16,
+        eval_batch_size=8,
+    )
+    workflow.lit_config.nqs_train_update_batch_size_per_device = 4
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        workflow._validate_chunk_config()
 
 
 def test_yaml_boolean_false_is_normalized_to_off_but_true_is_rejected():
@@ -582,7 +618,7 @@ def test_data_parallel_rejects_multiple_jax_processes(monkeypatch):
         workflow._validate_data_parallel_config()
 
 
-def test_reused_heldout_pool_with_unshardable_tail_is_rejected(monkeypatch):
+def test_reused_heldout_pool_with_partial_chunk_is_rejected(monkeypatch):
     monkeypatch.setattr(jax, "local_device_count", lambda: 8)
     workflow = _lit_workflow(
         "local_devices",
@@ -592,9 +628,9 @@ def test_reused_heldout_pool_with_unshardable_tail_is_rejected(monkeypatch):
 
     with pytest.raises(
         ValueError,
-        match=r"held-out evaluation pool batch size 17.*8 local devices",
+        match=r"held-out evaluation source pool size 17.*divisible.*16",
     ):
-        workflow._validate_data_parallel_source_pools(
+        workflow._validate_source_pool_chunks(
             _hydrogen_batch(32),
             _hydrogen_batch(17),
         )
@@ -636,17 +672,79 @@ def test_local_devices_hydrogen_stats_match_serial_including_one_device():
 
 
 def _dummy_update_carry(batch, params, *, seed: int) -> _NQSUpdateCarry:
+    del batch
     flat_params, _ = ravel_pytree(params)
     return _NQSUpdateCarry(
-        direct=_DirectPsiCarry(
-            batched_data=batch,
-            sampler_state={},
-            rng=jax.random.PRNGKey(seed),
-            initialized=jnp.asarray(False),
-            use_direct=jnp.asarray(False),
-        ),
         spring=_SpringState(previous_direction=jnp.zeros_like(flat_params)),
+        rng=jax.random.PRNGKey(seed),
     )
+
+
+def test_local_devices_source_distillation_matches_serial_global_batch():
+    device_count = jax.local_device_count()
+    batch_size = 4 * device_count
+    eval_batch_size = 2 * device_count
+    train_pool = _hydrogen_batch(batch_size)
+    eval_pool = _hydrogen_batch(batch_size)
+    serial_workflow = _lit_workflow(
+        "off",
+        train_batch_size=batch_size,
+        eval_batch_size=eval_batch_size,
+    )
+    parallel_workflow = _lit_workflow(
+        "local_devices",
+        train_batch_size=batch_size,
+        eval_batch_size=eval_batch_size,
+    )
+    for workflow in (serial_workflow, parallel_workflow):
+        workflow.lit_config.nqs_source_distillation_iterations = 2
+        workflow.lit_config.nqs_selection_interval = 1
+        workflow.lit_config.nqs_log_interval = 0
+    initial_params = {"scale": jnp.asarray(0.93, dtype=jnp.float32)}
+
+    serial_params, _ = serial_workflow._distill_response_from_source(
+        _scaled_hydrogen_response,
+        initial_params,
+        _hydrogen_ground_logpsi,
+        {},
+        train_pool,
+        eval_pool,
+        jax.random.PRNGKey(29),
+        axis=2,
+        source_center=0.0,
+    )
+    parallel_params, _ = parallel_workflow._distill_response_from_source(
+        _scaled_hydrogen_response,
+        initial_params,
+        _hydrogen_ground_logpsi,
+        {},
+        train_pool,
+        eval_pool,
+        jax.random.PRNGKey(29),
+        axis=2,
+        source_center=0.0,
+    )
+    serial_stats = serial_workflow._evaluate_source_distillation(
+        _scaled_hydrogen_response,
+        serial_params,
+        _hydrogen_ground_logpsi,
+        {},
+        eval_pool,
+        axis=2,
+        source_center=0.0,
+    )
+    parallel_stats = parallel_workflow._evaluate_source_distillation(
+        _scaled_hydrogen_response,
+        parallel_params,
+        _hydrogen_ground_logpsi,
+        {},
+        eval_pool,
+        axis=2,
+        source_center=0.0,
+    )
+
+    _assert_tree_allclose(parallel_params, serial_params, rtol=5e-5, atol=5e-6)
+    _assert_tree_allclose(parallel_stats, serial_stats, rtol=5e-5, atol=5e-6)
 
 
 def test_local_devices_source_updates_match_serial_including_one_device():

@@ -1,7 +1,6 @@
 # Copyright (c) 2026 ByteDance Ltd. and/or its affiliates
 # SPDX-License-Identifier: Apache-2.0
 
-import jax
 import numpy as np
 from jax import numpy as jnp
 
@@ -9,9 +8,7 @@ from jaqmc.app.molecule.data import MoleculeData
 from jaqmc.response.source_sector import (
     SourceSector,
     discover_source_sector,
-    source_sector_covariance_loss,
     transform_molecule_data,
-    vector_log_covariance_loss,
 )
 
 
@@ -166,81 +163,3 @@ def test_transform_molecule_data_supports_unbatched_and_batched_electrons():
         expected_batched,
         atol=1e-7,
     )
-
-
-def test_vector_log_covariance_loss_is_stable_and_scale_invariant():
-    operation = jnp.asarray([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
-    psi = jnp.asarray([[1.0 + 2.0j, 2.0 - 0.2j, 0.5 + 0.1j], [0.3j, 1.2 + 0.1j, -0.4j]])
-    transformed = jnp.einsum("ij,bj->bi", operation, psi)
-    log_psi = jnp.log(psi)
-    transformed_log = jnp.log(transformed)
-
-    exact = vector_log_covariance_loss(log_psi, transformed_log, operation)
-    huge_rescaling = vector_log_covariance_loss(
-        log_psi + 1.0e4 + 1.7j,
-        transformed_log + 1.0e4 + 1.7j,
-        operation,
-    )
-    incorrect = vector_log_covariance_loss(log_psi, log_psi, operation)
-
-    np.testing.assert_allclose(exact, 0.0, atol=2e-6)
-    np.testing.assert_allclose(huge_rescaling, exact, atol=2e-6)
-    assert float(incorrect) > 0.1
-    jitted_loss = jax.jit(vector_log_covariance_loss)(
-        log_psi,
-        transformed_log,
-        operation,
-    )
-    assert bool(jnp.isfinite(jitted_loss))
-
-
-def test_vector_log_covariance_loss_distinguishes_zero_from_invalid_logs():
-    identity = jnp.eye(3, dtype=jnp.float32)
-    encoded_zero = jnp.full((3,), -jnp.inf + 0.0j, dtype=jnp.complex64)
-
-    zero_loss = vector_log_covariance_loss(
-        encoded_zero,
-        encoded_zero,
-        identity,
-    )
-    nan_loss = vector_log_covariance_loss(
-        jnp.full((3,), jnp.nan + 0.0j, dtype=jnp.complex64),
-        encoded_zero,
-        identity,
-    )
-    positive_infinity_loss = vector_log_covariance_loss(
-        jnp.full((3,), jnp.inf + 0.0j, dtype=jnp.complex64),
-        encoded_zero,
-        identity,
-    )
-
-    np.testing.assert_allclose(float(zero_loss), 0.0)
-    assert np.isnan(float(nan_loss))
-    assert np.isnan(float(positive_infinity_loss))
-
-
-def test_source_sector_loss_evaluates_covariant_vector_callback():
-    atoms = jnp.asarray([[0.0, 0.0, 0.0], [0.0, -0.757, 0.587], [0.0, 0.757, 0.587]])
-    charges = jnp.asarray([8.0, 1.0, 1.0])
-    sector = discover_source_sector(atoms, charges)
-    data = MoleculeData(
-        electrons=jnp.asarray([[0.4, 0.2, -0.1], [-0.3, 0.7, 0.6]]),
-        atoms=atoms,
-        charges=charges,
-    )
-
-    def vector_log_amplitude(local_data: MoleculeData) -> jnp.ndarray:
-        displacement = jnp.sum(
-            local_data.electrons - jnp.asarray(sector.center),
-            axis=-2,
-        )
-        return jnp.log(displacement.astype(jnp.complex64))
-
-    for operation_index in range(sector.order):
-        loss = source_sector_covariance_loss(
-            vector_log_amplitude,
-            data,
-            sector,
-            operation_index,
-        )
-        np.testing.assert_allclose(loss, 0.0, atol=2e-6)
