@@ -29,6 +29,11 @@ from jaqmc.app.molecule.data import data_init
 from jaqmc.app.molecule.workflow import configure_system
 from jaqmc.data import BatchedData
 from jaqmc.response.inversion import lit_block_statistics
+from jaqmc.response.inversion_io import (
+    LITInversionSettings,
+    invert_lit_npz,
+    lit_inversion_npz_payload,
+)
 from jaqmc.response.lit import lit_error_bound
 from jaqmc.response.nqs_lit import (
     MolecularResponseFermiNet,
@@ -86,6 +91,27 @@ class MolecularLITConfig:
     omega_values: tuple[float, ...] = field(default_factory=tuple)
     axes: str = "xyz"
     output_filename: str = "lit_spectrum.npz"
+    # A formal inversion runs after the raw workflow NPZ has been written.
+    # The current NPZ is always included; additional paths support a matched,
+    # correlated multi-eta fit without weakening the serial frequency chain.
+    inversion_enabled: bool = False
+    inversion_output_filename: str = "lit_inversion.npz"
+    inversion_additional_input_paths: tuple[str, ...] = field(default_factory=tuple)
+    inversion_assume_independent: bool = False
+    inversion_threshold: float | None = None
+    inversion_pole_energies: tuple[float, ...] = field(default_factory=tuple)
+    inversion_continuum_grid: tuple[float, ...] = field(default_factory=tuple)
+    inversion_continuum_regularization: float = 0.0
+    inversion_fit_pole_energies: bool = False
+    inversion_pole_energy_bounds: tuple[tuple[float, float], ...] = field(
+        default_factory=tuple
+    )
+    inversion_covariance_relative_tolerance: float = 1e-10
+    inversion_max_fitted_poles: int = 8
+    inversion_pole_fit_tolerance: float = 1e-7
+    inversion_pole_fit_max_iterations: int = 200
+    inversion_solver_tolerance: float = 1e-10
+    inversion_solver_max_iterations: int | None = None
     nqs_checkpoint_path: str = ""
     nqs_allow_untrained_ground: bool = False
     nqs_ground_energy: float | None = None
@@ -950,6 +976,58 @@ class MoleculeLITWorkflow(Workflow):
             **uncertainty_output,
         )
         self._log_nqs_summary(str(output_path), fidelity)
+        if self.lit_config.inversion_enabled:
+            self._run_formal_inversion(output_path)
+
+    def _inversion_settings(self) -> LITInversionSettings:
+        threshold = self.lit_config.inversion_threshold
+        if threshold is None:
+            msg = "lit.inversion_threshold is required when inversion is enabled."
+            raise ValueError(msg)
+        bounds = self.lit_config.inversion_pole_energy_bounds
+        return LITInversionSettings(
+            threshold=threshold,
+            pole_energies=self.lit_config.inversion_pole_energies,
+            continuum_grid=self.lit_config.inversion_continuum_grid,
+            continuum_regularization=(
+                self.lit_config.inversion_continuum_regularization
+            ),
+            fit_pole_energies=self.lit_config.inversion_fit_pole_energies,
+            pole_energy_bounds=bounds or None,
+            covariance_relative_tolerance=(
+                self.lit_config.inversion_covariance_relative_tolerance
+            ),
+            max_fitted_poles=self.lit_config.inversion_max_fitted_poles,
+            pole_fit_tolerance=self.lit_config.inversion_pole_fit_tolerance,
+            pole_fit_max_iterations=(self.lit_config.inversion_pole_fit_max_iterations),
+            solver_tolerance=self.lit_config.inversion_solver_tolerance,
+            solver_max_iterations=(self.lit_config.inversion_solver_max_iterations),
+        )
+
+    def _run_formal_inversion(self, output_path: UPath) -> None:
+        additional = self.lit_config.inversion_additional_input_paths
+        source_paths = (str(output_path), *additional)
+        if len(set(source_paths)) != len(source_paths):
+            msg = "lit inversion input paths must be unique."
+            raise ValueError(msg)
+        inversion = invert_lit_npz(
+            source_paths,
+            self._inversion_settings(),
+            assume_independent=self.lit_config.inversion_assume_independent,
+        )
+        inversion_path = self.save_path / self.lit_config.inversion_output_filename
+        _save_npz_compressed(
+            inversion_path,
+            **lit_inversion_npz_payload(inversion),
+        )
+        logger.info(
+            "Wrote formal LIT inversion to %s (poles=%s, eta_count=%d, "
+            "underdetermined=%s)",
+            inversion_path,
+            np.array2string(inversion.result.pole_energies, precision=10),
+            inversion.result.diagnostics.unique_eta_count,
+            inversion.result.diagnostics.underdetermined,
+        )
 
     def _omega_grid(self) -> np.ndarray:
         return _lit_omega_grid(self.lit_config)
@@ -966,6 +1044,29 @@ class MoleculeLITWorkflow(Workflow):
         self._validate_source_sector_config()
         self._validate_nqs_iteration_config()
         self._validate_continuation_config()
+        self._validate_inversion_config()
+
+    def _validate_inversion_config(self) -> None:
+        if not self.lit_config.inversion_enabled:
+            return
+        output_filename = self.lit_config.inversion_output_filename
+        if not output_filename or output_filename == self.lit_config.output_filename:
+            msg = (
+                "lit.inversion_output_filename must be nonempty and differ "
+                "from lit.output_filename."
+            )
+            raise ValueError(msg)
+        if not output_filename.endswith(".npz"):
+            msg = "lit.inversion_output_filename must end in '.npz'."
+            raise ValueError(msg)
+        additional = self.lit_config.inversion_additional_input_paths
+        if any(not isinstance(path, str) or not path for path in additional):
+            msg = "lit.inversion_additional_input_paths must contain nonempty paths."
+            raise ValueError(msg)
+        if len(set(additional)) != len(additional):
+            msg = "lit.inversion_additional_input_paths must be unique."
+            raise ValueError(msg)
+        self._inversion_settings()
 
     def _validate_serial_scan_config(self, omega: np.ndarray) -> None:
         warm_omega = self.lit_config.nqs_warm_start_omega
@@ -4741,6 +4842,12 @@ def _save_npz(path: UPath, **payload: object) -> None:
         np.savez(f_out, **payload)  # type: ignore[arg-type]
 
 
+def _save_npz_compressed(path: UPath, **payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f_out:
+        np.savez_compressed(f_out, **payload)  # type: ignore[arg-type]
+
+
 _CONTINUATION_HISTORY_STAT_FIELDS = (
     "fidelity",
     "reverse_kl",
@@ -4750,6 +4857,22 @@ _CONTINUATION_HISTORY_STAT_FIELDS = (
 _CONTINUATION_STATE_CONFIG_EXCLUSIONS = frozenset(
     {
         "output_filename",
+        "inversion_enabled",
+        "inversion_output_filename",
+        "inversion_additional_input_paths",
+        "inversion_assume_independent",
+        "inversion_threshold",
+        "inversion_pole_energies",
+        "inversion_continuum_grid",
+        "inversion_continuum_regularization",
+        "inversion_fit_pole_energies",
+        "inversion_pole_energy_bounds",
+        "inversion_covariance_relative_tolerance",
+        "inversion_max_fitted_poles",
+        "inversion_pole_fit_tolerance",
+        "inversion_pole_fit_max_iterations",
+        "inversion_solver_tolerance",
+        "inversion_solver_max_iterations",
         "nqs_checkpoint_path",
         "nqs_source_pool_dir",
         "nqs_reuse_source_pool",

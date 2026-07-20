@@ -6,8 +6,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from jaqmc.response.inversion import lit_block_statistics
-from jaqmc.response.inversion_io import aggregate_lit_npz
+from jaqmc.response.inversion import forward_lit, lit_block_statistics
+from jaqmc.response.inversion_io import (
+    LITInversionSettings,
+    aggregate_lit_npz,
+    invert_lit_npz,
+    lit_inversion_npz_payload,
+)
 
 
 def _write_workflow_npz(
@@ -313,3 +318,94 @@ def test_tiny_relative_covariance_asymmetry_is_rejected_consistently(tmp_path: P
 
     with pytest.raises(ValueError, match="must be symmetric"):
         aggregate_lit_npz(path)
+
+
+def test_formal_npz_inversion_propagates_jackknife_and_is_pickle_free(
+    tmp_path: Path,
+):
+    omega = np.linspace(0.75, 0.81, 41)
+    exact_energy = 0.78
+    signed_lit = forward_lit(
+        omega,
+        0.003,
+        pole_energies=np.asarray([exact_energy]),
+        pole_strengths=np.asarray([0.18]),
+    )[np.newaxis, :]
+    block_count = 8
+    phases = np.arange(block_count, dtype=np.float64)[np.newaxis, np.newaxis, :]
+    positions = np.linspace(0.0, 2.0 * np.pi, omega.size)[np.newaxis, :, np.newaxis]
+    noise = 0.2 * np.sin(positions + phases)
+    noise -= np.mean(noise, axis=-1, keepdims=True)
+    blocks = signed_lit[..., np.newaxis] + noise
+    path = tmp_path / "lit_spectrum.npz"
+    _write_workflow_npz(
+        path,
+        omega=omega,
+        eta=0.003,
+        signed_lit=signed_lit,
+        blocks=blocks,
+        digests=("pool-x",),
+        systematic_error=np.full_like(signed_lit, 2.0),
+        axes="x",
+        axis_indices=np.asarray([0]),
+    )
+    settings = LITInversionSettings(
+        threshold=0.9,
+        pole_energies=(0.779,),
+        fit_pole_energies=True,
+        pole_energy_bounds=((0.77, 0.79),),
+        pole_fit_tolerance=1e-10,
+        pole_fit_max_iterations=1000,
+    )
+
+    inversion = invert_lit_npz(path, settings)
+
+    assert inversion.result.pole_energies[0] == pytest.approx(exact_energy, abs=1e-8)
+    assert inversion.jackknife is not None
+    assert inversion.jackknife.block_count == block_count
+    assert inversion.jackknife.leave_one_out_pole_energies.shape == (block_count, 1)
+    assert inversion.jackknife.leave_one_out_pole_strengths.shape == (
+        block_count,
+        1,
+        1,
+    )
+    assert np.all(np.isfinite(inversion.jackknife.pole_energy_standard_error))
+
+    output = tmp_path / "lit_inversion.npz"
+    np.savez_compressed(output, **lit_inversion_npz_payload(inversion))
+    with np.load(output, allow_pickle=False) as archive:
+        assert bool(archive["solver_success"][0])
+        assert bool(archive["jackknife_available"])
+        assert int(archive["jackknife_block_count"]) == block_count
+        assert archive["pole_energies"][0] == pytest.approx(exact_energy, abs=1e-8)
+        assert archive["source_lit_paths"].tolist() == [str(path)]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"threshold": 0.9}, "at least one discrete pole"),
+        (
+            {
+                "threshold": 0.9,
+                "pole_energies": (0.78,),
+                "pole_energy_bounds": ((0.77, 0.79),),
+            },
+            "require fit_pole_energies",
+        ),
+        (
+            {
+                "threshold": 0.9,
+                "pole_energies": (0.78,),
+                "continuum_regularization": -1.0,
+            },
+            "finite and nonnegative",
+        ),
+    ],
+)
+def test_formal_inversion_settings_fail_before_a_scan(
+    kwargs: dict[str, object],
+    message: str,
+):
+    with pytest.raises(ValueError, match=message):
+        LITInversionSettings(**kwargs)

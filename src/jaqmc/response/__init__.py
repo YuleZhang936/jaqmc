@@ -16,8 +16,13 @@ from jaqmc.response.inversion import (
 )
 from jaqmc.response.inversion_io import (
     AggregatedLITNPZ,
+    LITInversionJackknife,
+    LITInversionSettings,
+    LITNPZInversion,
     LITNPZMetadata,
     aggregate_lit_npz,
+    invert_lit_npz,
+    lit_inversion_npz_payload,
 )
 from jaqmc.response.lit import (
     broadened_from_lit,
@@ -39,7 +44,10 @@ __all__ = [
     "AggregatedLITNPZ",
     "LITBlockStatistics",
     "LITInversionDiagnostics",
+    "LITInversionJackknife",
     "LITInversionResult",
+    "LITInversionSettings",
+    "LITNPZInversion",
     "LITNPZMetadata",
     "MolecularResponseFermiNet",
     "NQSLITStats",
@@ -48,10 +56,12 @@ __all__ = [
     "forward_lit",
     "ground_local_energy",
     "invert_lit",
+    "invert_lit_npz",
     "invert_signed_lit",
     "lit_block_statistics",
     "lit_error_bound",
     "lit_from_poles",
+    "lit_inversion_npz_payload",
     "lit_linear_continuum_kernel",
     "lit_pole_kernel",
     "local_action_ratio",

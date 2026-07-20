@@ -24,13 +24,16 @@ jaqmc molecule lit --yml molecule_lit.yml \
   workflow.restore_path=./runs/<molecule-ground>
 ```
 
-The command writes `lit_spectrum.npz` under `workflow.save_path`. The file
-contains the scan grid, LIT values, fidelity, reverse-KL and reweighting
+The command always writes `lit_spectrum.npz` under `workflow.save_path`. The
+file contains the scan grid, LIT values, fidelity, reverse-KL and reweighting
 effective-sample-size diagnostics, warm-start/continuation diagnostics,
 selected checkpoint iterations, the two fidelity error factors, and matched
 jackknife blocks for correlated statistical errors. The canonical transform is
 the un-clipped `signed_lit`; finite-width `broadened` values are diagnostic and
-are not a substitute for an inversion.
+are not a substitute for an inversion. When `lit.inversion_enabled=true`, the
+same workflow then validates the raw archive, performs the covariance-weighted
+nonnegative inversion, propagates the matched blocks through the nonlinear
+fit, and writes `lit_inversion.npz`.
 
 The frequency scan is intentionally serial. After a negative-frequency warm
 start, JaQMC optimizes frequencies in strictly increasing order. At each point,
@@ -285,14 +288,51 @@ If the checkpoint directory differs from the workflow restore directory, add:
 lit.nqs_checkpoint_path=./runs/h_atom-ground
 ```
 
-## Correlated Multi-Width Inversion
+## Formal Inversion
+
+Enable the post-scan inversion explicitly and provide a physical continuum
+threshold plus at least one bound pole or a continuum grid:
+
+```yaml
+lit:
+  inversion_enabled: true
+  inversion_output_filename: lit_inversion.npz
+  inversion_threshold: 0.5
+  inversion_pole_energies: [0.375, 0.444444, 0.46875]
+  inversion_fit_pole_energies: true
+  inversion_pole_energy_bounds:
+    - [0.36, 0.39]
+    - [0.43, 0.455]
+    - [0.46, 0.48]
+  inversion_continuum_grid: [0.5, 0.55, 0.65, 0.8, 1.0]
+  inversion_continuum_regularization: 1.0e-3
+```
+
+The output is pickle-free and self-describing. It stores the validated input,
+statistical and fidelity/D covariance terms, fitted poles and continuum,
+forward-fit residual, solver diagnostics, and delete-one-block jackknife errors
+for pole energies, strengths, and continuum density. A failed NNLS or pole fit
+fails the formal workflow instead of silently writing a nominal spectrum.
+
+### Correlated Multi-Width Inversion
 
 Run the same frequency grid with at least two finite `eta` values and reuse the
 same saved evaluation pool by setting one common, explicit
 `lit.nqs_source_pool_dir` for every run. Each output records matched
 delete-one-block jackknife pseudo-values and the evaluation-pool digest. The
 strict loader rejects independently generated pools and keeps the verified
-cross-frequency and cross-width covariance:
+cross-frequency and cross-width covariance. On the final width, list the
+earlier raw archives as additional inputs; the current archive is included
+automatically:
+
+```yaml
+lit:
+  inversion_enabled: true
+  inversion_additional_input_paths:
+    - runs/h_atom-lit-eta005/lit_spectrum.npz
+```
+
+The lower-level programmatic interface remains available for custom analyses:
 
 ```python
 import numpy as np
