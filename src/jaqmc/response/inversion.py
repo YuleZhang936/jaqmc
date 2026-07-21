@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import SupportsInt, cast
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -57,6 +58,7 @@ class LITInversionDiagnostics:
     covariance_effective_ranks: NDArray[np.int64] | None
     covariance_truncated: tuple[bool, ...] | None
     unique_eta_count: int
+    cross_width_validated: bool
     underdetermined: bool
     underdetermined_reasons: tuple[str, ...]
 
@@ -78,6 +80,25 @@ class LITInversionResult:
     fitted_lit: NDArray[np.float64]
     residual: NDArray[np.float64]
     diagnostics: LITInversionDiagnostics
+
+
+@dataclass(frozen=True)
+class LITPoleInitialization:
+    """Data-driven initialization for a fixed number of discrete poles.
+
+    The energies are selected without external spectroscopy: poles are added
+    greedily on a dense candidate grid by minimizing the same covariance-
+    weighted nonnegative variable-projection objective used by the final fit.
+    ``pole_energy_bounds`` are deterministic, ordered Voronoi cells around the
+    selected candidates and remove label-permutation ambiguity during the
+    continuous refinement.
+    """
+
+    pole_energies: NDArray[np.float64]
+    pole_energy_bounds: NDArray[np.float64]
+    objective: float
+    candidate_grid_points: int
+    minimum_separation: float
 
 
 @dataclass(frozen=True)
@@ -914,6 +935,247 @@ def _fit_coefficients(
     return design, solves
 
 
+def _positive_integer(value: object, name: str, *, minimum: int) -> int:
+    try:
+        converted = int(cast(SupportsInt, value))
+    except (TypeError, ValueError, OverflowError) as error:
+        msg = f"{name} must be an integer of at least {minimum}, got {value!r}"
+        raise ValueError(msg) from error
+    if isinstance(value, (bool, np.bool_)) or converted != value or converted < minimum:
+        msg = f"{name} must be an integer of at least {minimum}, got {value!r}"
+        raise ValueError(msg)
+    return converted
+
+
+def _pole_search_window(
+    omega: NDArray[np.float64],
+    threshold: float,
+    energy_min: float | None,
+    energy_max: float | None,
+) -> tuple[float, float]:
+    if not np.isfinite(threshold):
+        msg = f"threshold must be finite, got {threshold}"
+        raise ValueError(msg)
+    observed_min = float(np.min(omega))
+    observed_max = float(np.max(omega))
+    lower = observed_min if energy_min is None else float(energy_min)
+    upper = observed_max if energy_max is None else float(energy_max)
+    upper = min(upper, float(np.nextafter(float(threshold), -np.inf)))
+    if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+        msg = (
+            "pole search bounds must be finite and strictly increasing below "
+            f"threshold; got ({lower}, {upper})"
+        )
+        raise ValueError(msg)
+    tolerance = 1e-12 * max(1.0, abs(observed_min), abs(observed_max))
+    if lower < observed_min - tolerance or upper > observed_max + tolerance:
+        msg = (
+            "pole search bounds must lie inside the observed omega window "
+            f"[{observed_min}, {observed_max}], got [{lower}, {upper}]"
+        )
+        raise ValueError(msg)
+    return lower, upper
+
+
+def _pole_candidate_grid(
+    lower: float,
+    upper: float,
+    pole_count: int,
+    observation_count: int,
+    candidate_grid_points: int | None,
+) -> NDArray[np.float64]:
+    minimum_points = max(4 * pole_count + 1, 17)
+    if candidate_grid_points is None:
+        points = min(max(4 * observation_count, 257), 4097)
+    else:
+        points = _positive_integer(
+            candidate_grid_points,
+            "candidate_grid_points",
+            minimum=minimum_points,
+        )
+    return np.linspace(lower, upper, points)
+
+
+def _pole_minimum_separation(
+    requested: float | None,
+    eta: NDArray[np.float64],
+    candidates: NDArray[np.float64],
+    pole_count: int,
+) -> float:
+    spacing = float(candidates[1] - candidates[0])
+    separation = (
+        max(float(np.min(eta)), 4.0 * spacing)
+        if requested is None
+        else float(requested)
+    )
+    if not np.isfinite(separation) or separation <= 0.0:
+        msg = "minimum_separation must be finite and positive"
+        raise ValueError(msg)
+    if (pole_count - 1) * separation > candidates[-1] - candidates[0]:
+        msg = (
+            "pole_count and minimum_separation do not fit inside the search "
+            f"window: count={pole_count}, separation={separation}, "
+            f"window=({candidates[0]}, {candidates[-1]})"
+        )
+        raise ValueError(msg)
+    return separation
+
+
+def _greedy_pole_candidates(
+    candidates: NDArray[np.float64],
+    pole_count: int,
+    minimum_separation: float,
+    objective: Callable[[NDArray[np.float64]], float | None],
+) -> tuple[NDArray[np.float64], float]:
+    selected: list[float] = []
+    best_objective = np.inf
+    for _ in range(pole_count):
+        step_energy: float | None = None
+        step_objective = np.inf
+        for candidate in candidates:
+            candidate_value = float(candidate)
+            if any(
+                abs(candidate_value - existing) < minimum_separation
+                for existing in selected
+            ):
+                continue
+            trial = np.sort(np.asarray((*selected, candidate_value), dtype=np.float64))
+            value = objective(trial)
+            if value is not None and value < step_objective:
+                step_energy = candidate_value
+                step_objective = value
+        if step_energy is None:
+            msg = (
+                "data-driven pole initialization could not place all requested "
+                "poles; reduce pole_count/minimum_separation or widen the scan"
+            )
+            raise RuntimeError(msg)
+        selected.append(step_energy)
+        selected.sort()
+        best_objective = step_objective
+    return np.asarray(selected, dtype=np.float64), best_objective
+
+
+def _automatic_pole_bounds(
+    energies: NDArray[np.float64],
+    lower: float,
+    upper: float,
+) -> NDArray[np.float64]:
+    bounds = np.empty((energies.size, 2), dtype=np.float64)
+    bounds[0, 0] = lower
+    bounds[-1, 1] = upper
+    for index, boundary in enumerate((energies[:-1] + energies[1:]) / 2.0):
+        bounds[index, 1] = np.nextafter(boundary, -np.inf)
+        bounds[index + 1, 0] = np.nextafter(boundary, np.inf)
+    if energies.size == 1:
+        bounds[0] = (lower, upper)
+    return bounds
+
+
+def initialize_lit_poles(
+    omega: ArrayLike,
+    eta: ArrayLike,
+    signed_lit: ArrayLike,
+    *,
+    threshold: float,
+    pole_count: int,
+    energy_min: float | None = None,
+    energy_max: float | None = None,
+    candidate_grid_points: int | None = None,
+    minimum_separation: float | None = None,
+    continuum_grid: ArrayLike | None = None,
+    standard_deviation: ArrayLike | None = None,
+    covariance: ArrayLike | None = None,
+    covariance_relative_tolerance: float = 1e-10,
+    continuum_regularization: float = 0.0,
+    solver_tolerance: float = 1e-10,
+    solver_max_iterations: int | None = None,
+) -> LITPoleInitialization:
+    """Infer pole-energy starting points directly from a raw signed LIT.
+
+    This initializer assumes only a requested model order and a search window.
+    It never consumes reference or experimental transition energies.  At each
+    step it adds the candidate that gives the smallest covariance-weighted
+    nonnegative least-squares objective after refitting all pole strengths.
+    A minimum separation prevents one strong off-grid line from consuming
+    several nearly duplicate candidates.
+    """
+    pole_count = _positive_integer(pole_count, "pole_count", minimum=1)
+    omega_flat, eta_flat, observation_shape = _observation_arrays(omega, eta)
+    response = _response_axes(signed_lit, observation_shape)
+    grid = _one_dimensional_finite_array(continuum_grid, "continuum_grid")
+    if grid.size:
+        _validate_model_components(
+            float(threshold),
+            np.empty(0, dtype=np.float64),
+            grid,
+        )
+    lower, upper = _pole_search_window(
+        omega_flat,
+        float(threshold),
+        energy_min,
+        energy_max,
+    )
+    candidates = _pole_candidate_grid(
+        lower,
+        upper,
+        pole_count,
+        omega_flat.size,
+        candidate_grid_points,
+    )
+    separation = _pole_minimum_separation(
+        minimum_separation,
+        eta_flat,
+        candidates,
+        pole_count,
+    )
+    _validate_solver_options(
+        pole_count,
+        solver_tolerance,
+        1e-7,
+        covariance_relative_tolerance,
+    )
+    whitenings, _ = _whitenings(
+        n_axes=response.shape[0],
+        observation_shape=observation_shape,
+        standard_deviation=standard_deviation,
+        covariance=covariance,
+        covariance_relative_tolerance=covariance_relative_tolerance,
+    )
+
+    def objective(trial: NDArray[np.float64]) -> float | None:
+        _, solves = _fit_coefficients(
+            omega_flat,
+            eta_flat,
+            response,
+            whitenings,
+            trial,
+            grid,
+            continuum_regularization,
+            solver_tolerance,
+            solver_max_iterations,
+        )
+        if not all(solve.success for solve in solves):
+            return None
+        return float(sum(solve.augmented_objective for solve in solves))
+
+    energies, best_objective = _greedy_pole_candidates(
+        candidates,
+        pole_count,
+        separation,
+        objective,
+    )
+    bounds = _automatic_pole_bounds(energies, lower, upper)
+    _pole_bounds(bounds, energies, float(threshold))
+    return LITPoleInitialization(
+        pole_energies=energies,
+        pole_energy_bounds=bounds,
+        objective=best_objective,
+        candidate_grid_points=candidates.size,
+        minimum_separation=separation,
+    )
+
+
 def _pole_bounds(
     bounds: ArrayLike | None,
     pole_energies: NDArray[np.float64],
@@ -1234,10 +1496,6 @@ def _inversion_diagnostics(
         )
     unique_eta_count = _unique_eta_count(eta)
     underdetermined_reasons: list[str] = []
-    if unique_eta_count == 1:
-        underdetermined_reasons.append(
-            "only one eta is present; cross-width inversion stability is untested"
-        )
     data_rank = int(np.linalg.matrix_rank(design))
     if data_rank < design.shape[1]:
         underdetermined_reasons.append(
@@ -1296,6 +1554,7 @@ def _inversion_diagnostics(
         covariance_effective_ranks=covariance_effective_ranks,
         covariance_truncated=covariance_truncated,
         unique_eta_count=unique_eta_count,
+        cross_width_validated=unique_eta_count > 1,
         underdetermined=bool(underdetermined_reasons),
         underdetermined_reasons=tuple(underdetermined_reasons),
     )
@@ -1419,7 +1678,9 @@ __all__ = [
     "LITBlockStatistics",
     "LITInversionDiagnostics",
     "LITInversionResult",
+    "LITPoleInitialization",
     "forward_lit",
+    "initialize_lit_poles",
     "invert_lit",
     "invert_signed_lit",
     "lit_block_statistics",

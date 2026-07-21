@@ -6,6 +6,7 @@ import numpy as np
 from jaqmc.response.inversion import (
     _nonnegative_least_squares,
     forward_lit,
+    initialize_lit_poles,
     invert_signed_lit,
     lit_block_statistics,
     lit_linear_continuum_kernel,
@@ -117,7 +118,7 @@ def test_block_statistics_preserve_cross_frequency_covariance_of_mean():
     assert stats.block_count == 4
 
 
-def test_fixed_poles_are_recovered_and_single_eta_is_flagged_underdetermined():
+def test_fixed_poles_are_recovered_from_one_full_rank_eta():
     omega = np.linspace(0.05, 0.75, 101)
     energies = np.array([0.22, 0.48])
     strengths = np.array([0.8, 0.35])
@@ -140,10 +141,9 @@ def test_fixed_poles_are_recovered_and_single_eta_is_flagged_underdetermined():
     np.testing.assert_allclose(result.fitted_lit[0], signed_lit, rtol=1e-11)
     assert result.diagnostics.solver_success == (True,)
     assert result.diagnostics.unique_eta_count == 1
-    assert result.diagnostics.underdetermined
-    assert any(
-        "one eta" in reason for reason in result.diagnostics.underdetermined_reasons
-    )
+    assert not result.diagnostics.cross_width_validated
+    assert not result.diagnostics.underdetermined
+    assert not result.diagnostics.underdetermined_reasons
 
 
 def test_piecewise_linear_continuum_is_recovered():
@@ -208,6 +208,7 @@ def test_mixed_multi_eta_axes_can_be_merged_as_flat_observations():
     np.testing.assert_allclose(result.pole_strengths, strengths, rtol=1e-10)
     np.testing.assert_allclose(result.continuum_density, density, rtol=1e-10)
     assert result.diagnostics.unique_eta_count == 2
+    assert result.diagnostics.cross_width_validated
     assert not result.diagnostics.underdetermined
 
 
@@ -368,6 +369,88 @@ def test_pole_energy_fit_is_shared_across_axes():
     assert result.pole_strengths.shape == (3, 1)
     assert result.diagnostics.pole_fit_success
     assert result.diagnostics.unique_eta_count == 2
+
+
+def test_five_ordered_bounded_poles_are_recovered():
+    omega_block = np.linspace(0.12, 0.72, 91)
+    omega = np.tile(omega_block, 2)
+    eta = np.repeat(np.array([0.012, 0.035]), omega_block.size)
+    true_energies = np.array([0.20, 0.29, 0.39, 0.50, 0.63])
+    strengths = np.array(
+        [
+            [0.75, 0.52, 0.38, 0.24, 0.15],
+            [0.18, 0.33, 0.47, 0.61, 0.74],
+        ]
+    )
+    signed_lit = forward_lit(
+        omega,
+        eta,
+        pole_energies=true_energies,
+        pole_strengths=strengths,
+    )
+    initial_energies = true_energies + np.array([0.014, -0.012, 0.011, -0.013, 0.012])
+    bounds = np.column_stack((true_energies - 0.025, true_energies + 0.025))
+
+    result = invert_signed_lit(
+        omega,
+        eta,
+        signed_lit,
+        threshold=0.75,
+        pole_energies=initial_energies,
+        fit_pole_energies=True,
+        pole_energy_bounds=bounds,
+        max_fitted_poles=5,
+        pole_fit_tolerance=2e-7,
+        pole_fit_max_iterations=100,
+    )
+
+    assert result.pole_energies.shape == (5,)
+    assert np.all(np.diff(result.pole_energies) > 0.0)
+    np.testing.assert_allclose(result.pole_energies, true_energies, atol=3e-7)
+    np.testing.assert_allclose(result.pole_strengths, strengths, rtol=3e-6)
+    assert result.diagnostics.pole_fit_success
+    assert result.diagnostics.unique_eta_count == 2
+
+
+def test_five_poles_are_initialized_blindly_from_single_eta_data():
+    omega = np.linspace(0.75, 0.90, 601)
+    eta = 0.003
+    true_energies = np.array([0.77975, 0.84843, 0.87250, 0.88367, 0.88974])
+    strengths = np.array([1.0, 0.25, 0.10, 0.055, 0.035])
+    signed_lit = forward_lit(
+        omega,
+        eta,
+        pole_energies=true_energies,
+        pole_strengths=strengths,
+    )
+
+    initialization = initialize_lit_poles(
+        omega,
+        eta,
+        signed_lit,
+        threshold=0.904,
+        pole_count=5,
+        candidate_grid_points=601,
+    )
+    result = invert_signed_lit(
+        omega,
+        eta,
+        signed_lit,
+        threshold=0.904,
+        pole_energies=initialization.pole_energies,
+        fit_pole_energies=True,
+        pole_energy_bounds=initialization.pole_energy_bounds,
+        max_fitted_poles=5,
+        pole_fit_tolerance=1e-9,
+        pole_fit_max_iterations=100,
+    )
+
+    assert initialization.pole_energies.shape == (5,)
+    assert np.all(np.diff(initialization.pole_energy_bounds.ravel()) > 0.0)
+    np.testing.assert_allclose(result.pole_energies, true_energies, atol=2e-8)
+    np.testing.assert_allclose(result.pole_strengths[0], strengths, rtol=2e-7)
+    assert not result.diagnostics.cross_width_validated
+    assert not result.diagnostics.underdetermined
 
 
 def test_curvature_regularization_is_reported_and_preserves_nonnegativity():

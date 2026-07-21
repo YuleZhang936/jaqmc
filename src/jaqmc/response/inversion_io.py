@@ -961,6 +961,9 @@ def lit_inversion_npz_payload(inversion: LITNPZInversion) -> dict[str, object]:
             diagnostics.unique_eta_count,
             dtype=np.int64,
         ),
+        "cross_width_validated": np.asarray(
+            diagnostics.cross_width_validated,
+        ),
         "underdetermined": np.asarray(diagnostics.underdetermined),
         "underdetermined_reasons": np.asarray(diagnostics.underdetermined_reasons),
     }

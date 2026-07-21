@@ -87,6 +87,25 @@ def molecule_lit(cfg: ConfigManager, dry_run: bool):
     MoleculeLITWorkflow(cfg)(dry_run)
 
 
+# --- response postprocessing ---
+
+
+@cli.group(help="Response-function postprocessing tools.")
+def response():
+    pass
+
+
+@response.add_command
+@make_cli(
+    name="invert-lit",
+    help="Explicitly invert saved raw LIT NPZ files on the CPU.",
+)
+def response_invert_lit(cfg: ConfigManager, dry_run: bool):
+    from jaqmc.response.inversion_postprocess import LITInversionPostprocessor
+
+    LITInversionPostprocessor(cfg)(dry_run)
+
+
 # --- solid ---
 
 

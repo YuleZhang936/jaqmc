@@ -22,6 +22,9 @@ from jaqmc.app.molecule.lit_workflow import (
     _merge_source_sums_across_devices,
     _NQSUpdateCarry,
     _regularized_action_gradient,
+    _shard_batched_data_across_local_devices,
+    _shard_rng_across_local_devices,
+    _slice_batched_data,
     _solve_sr_direction_chunked,
     _solve_sr_direction_data_parallel,
     _spring_direction_chunked,
@@ -30,6 +33,8 @@ from jaqmc.app.molecule.lit_workflow import (
 )
 from jaqmc.data import BatchedData
 from jaqmc.response.nqs_lit import NQSLITSourceSums, WeightedComplexMoments
+from jaqmc.sampler.base import SamplePlan
+from jaqmc.sampler.mcmc import MCMCSampler
 from jaqmc.utils import parallel_jax
 
 
@@ -456,6 +461,18 @@ def _hydrogen_batch(batch_size: int) -> BatchedData[MoleculeData]:
     )
 
 
+def _gaussian_logpsi(params, data: MoleculeData):
+    return -params["decay"] * jnp.sum(data.electrons**2)
+
+
+def _source_sample_plan(batch, rng):
+    plan = SamplePlan(
+        _gaussian_logpsi,
+        {"electrons": MCMCSampler(steps=2, adapt_frequency=8)},
+    )
+    return plan, plan.init(batch, rng)
+
+
 def _lit_workflow(
     data_parallel: str,
     *,
@@ -480,6 +497,130 @@ def _lit_workflow(
     )
     workflow._nqs_chunk_sums_kernel_cache = {}
     return workflow
+
+
+def test_source_sampling_rngs_are_independent_and_data_sharded():
+    device_count = jax.local_device_count()
+    rngs = _shard_rng_across_local_devices(jax.random.PRNGKey(913))
+    keys = np.asarray(rngs).reshape(device_count, 2)
+
+    assert rngs.sharding.spec == parallel_jax.DATA_PARTITION
+    assert np.unique(keys, axis=0).shape[0] == device_count
+
+
+def test_batch_slice_preserves_explicit_data_sharding():
+    device_count = jax.local_device_count()
+    batch = _hydrogen_batch(8 * device_count)
+    sharded = _shard_batched_data_across_local_devices(batch)
+
+    sliced = _slice_batched_data(
+        sharded,
+        2 * device_count,
+        4 * device_count,
+    )
+
+    assert sliced.batch_size == 4 * device_count
+    # JAX may normalize trailing replicated dimensions into explicit ``None``
+    # entries, so compare the physical mesh and leading batch partition rather
+    # than requiring identical PartitionSpec spellings.
+    assert sliced.data.electrons.sharding.mesh == sharded.data.electrons.sharding.mesh
+    assert sliced.data.electrons.sharding.spec[0] == parallel_jax.BATCH_AXIS_NAME
+    np.testing.assert_array_equal(
+        sliced.data.electrons,
+        batch.data.electrons[2 * device_count : 6 * device_count],
+    )
+
+
+def test_local_devices_source_pool_sampling_shards_walkers_and_reduces_state():
+    device_count = jax.local_device_count()
+    batch = _hydrogen_batch(4 * device_count)
+    workflow = _lit_workflow(
+        "local_devices",
+        train_batch_size=batch.batch_size,
+        eval_batch_size=batch.batch_size,
+    )
+    workflow.lit_config.nqs_source_burn_in = 2
+    plan, sampler_state, burn_in_batch, burn_in_rng = workflow._prepare_source_sampler(
+        MCMCSampler(steps=2, adapt_frequency=8),
+        batch,
+        {},
+        _hydrogen_ground_logpsi,
+        jax.random.PRNGKey(920),
+        axis=2,
+        source_center=0.0,
+    )
+
+    assert int(sampler_state["electrons"].counter) == 2
+    assert len(workflow._source_sample_step_kernel_cache) == 1
+
+    pool, final_batch, final_state, _ = workflow._collect_sample_pool(
+        plan,
+        {},
+        burn_in_batch,
+        sampler_state,
+        burn_in_rng,
+        batches=2,
+        stride=2,
+    )
+
+    assert pool.batch_size == 2 * batch.batch_size
+    assert final_batch.batch_size == batch.batch_size
+    assert final_batch.data.electrons.sharding.spec[0] == parallel_jax.BATCH_AXIS_NAME
+    assert pool.data.electrons.sharding.spec[0] == parallel_jax.BATCH_AXIS_NAME
+    mcmc_state = final_state["electrons"]
+    assert int(mcmc_state.counter) == 6
+    assert len(workflow._source_sample_step_kernel_cache) == 1
+    for leaf in jax.tree.leaves(mcmc_state):
+        assert parallel_jax.BATCH_AXIS_NAME not in tuple(leaf.sharding.spec)
+        assert np.isfinite(np.asarray(leaf)).all()
+
+
+def test_off_source_pool_sampling_preserves_serial_step_sequence():
+    batch = _hydrogen_batch(8)
+    workflow = _lit_workflow(
+        "off",
+        train_batch_size=batch.batch_size,
+        eval_batch_size=batch.batch_size,
+    )
+    params = {"decay": jnp.asarray(0.7, dtype=jnp.float32)}
+    initial_rng = jax.random.PRNGKey(931)
+    plan, sampler_state = _source_sample_plan(batch, jax.random.PRNGKey(930))
+
+    pool, final_batch, final_state, final_rng = workflow._collect_sample_pool(
+        plan,
+        params,
+        batch,
+        sampler_state,
+        initial_rng,
+        batches=2,
+        stride=2,
+    )
+
+    reference_plan, reference_state = _source_sample_plan(
+        batch,
+        jax.random.PRNGKey(930),
+    )
+    reference_batch = batch
+    reference_rng = initial_rng
+    reference_snapshots = []
+    for _ in range(2):
+        for _ in range(2):
+            reference_rng, sample_rng = jax.random.split(reference_rng)
+            reference_batch, _, reference_state = reference_plan.step(
+                params,
+                reference_batch,
+                reference_state,
+                sample_rng,
+            )
+        reference_snapshots.append(reference_batch.data.electrons)
+
+    np.testing.assert_array_equal(
+        pool.data.electrons,
+        jnp.concatenate(reference_snapshots, axis=0),
+    )
+    _assert_tree_allclose(final_batch, reference_batch, rtol=0.0, atol=0.0)
+    _assert_tree_allclose(final_state, reference_state, rtol=0.0, atol=0.0)
+    np.testing.assert_array_equal(final_rng, reference_rng)
 
 
 def test_data_parallel_batch_must_be_divisible_by_devices(monkeypatch):

@@ -29,11 +29,6 @@ from jaqmc.app.molecule.data import data_init
 from jaqmc.app.molecule.workflow import configure_system
 from jaqmc.data import BatchedData
 from jaqmc.response.inversion import lit_block_statistics
-from jaqmc.response.inversion_io import (
-    LITInversionSettings,
-    invert_lit_npz,
-    lit_inversion_npz_payload,
-)
 from jaqmc.response.lit import lit_error_bound
 from jaqmc.response.nqs_lit import (
     MolecularResponseFermiNet,
@@ -91,27 +86,6 @@ class MolecularLITConfig:
     omega_values: tuple[float, ...] = field(default_factory=tuple)
     axes: str = "xyz"
     output_filename: str = "lit_spectrum.npz"
-    # A formal inversion runs after the raw workflow NPZ has been written.
-    # The current NPZ is always included; additional paths support a matched,
-    # correlated multi-eta fit without weakening the serial frequency chain.
-    inversion_enabled: bool = False
-    inversion_output_filename: str = "lit_inversion.npz"
-    inversion_additional_input_paths: tuple[str, ...] = field(default_factory=tuple)
-    inversion_assume_independent: bool = False
-    inversion_threshold: float | None = None
-    inversion_pole_energies: tuple[float, ...] = field(default_factory=tuple)
-    inversion_continuum_grid: tuple[float, ...] = field(default_factory=tuple)
-    inversion_continuum_regularization: float = 0.0
-    inversion_fit_pole_energies: bool = False
-    inversion_pole_energy_bounds: tuple[tuple[float, float], ...] = field(
-        default_factory=tuple
-    )
-    inversion_covariance_relative_tolerance: float = 1e-10
-    inversion_max_fitted_poles: int = 8
-    inversion_pole_fit_tolerance: float = 1e-7
-    inversion_pole_fit_max_iterations: int = 200
-    inversion_solver_tolerance: float = 1e-10
-    inversion_solver_max_iterations: int | None = None
     nqs_checkpoint_path: str = ""
     nqs_allow_untrained_ground: bool = False
     nqs_ground_energy: float | None = None
@@ -367,6 +341,7 @@ class MoleculeLITWorkflow(Workflow):
             tuple[Any, Any, Any],
         ] = {}
         self._source_distillation_eval_kernel_cache: dict[tuple[Any, ...], Any] = {}
+        self._source_sample_step_kernel_cache: dict[int, Any] = {}
         self._validate_config()
 
     def run(self) -> None:
@@ -976,58 +951,6 @@ class MoleculeLITWorkflow(Workflow):
             **uncertainty_output,
         )
         self._log_nqs_summary(str(output_path), fidelity)
-        if self.lit_config.inversion_enabled:
-            self._run_formal_inversion(output_path)
-
-    def _inversion_settings(self) -> LITInversionSettings:
-        threshold = self.lit_config.inversion_threshold
-        if threshold is None:
-            msg = "lit.inversion_threshold is required when inversion is enabled."
-            raise ValueError(msg)
-        bounds = self.lit_config.inversion_pole_energy_bounds
-        return LITInversionSettings(
-            threshold=threshold,
-            pole_energies=self.lit_config.inversion_pole_energies,
-            continuum_grid=self.lit_config.inversion_continuum_grid,
-            continuum_regularization=(
-                self.lit_config.inversion_continuum_regularization
-            ),
-            fit_pole_energies=self.lit_config.inversion_fit_pole_energies,
-            pole_energy_bounds=bounds or None,
-            covariance_relative_tolerance=(
-                self.lit_config.inversion_covariance_relative_tolerance
-            ),
-            max_fitted_poles=self.lit_config.inversion_max_fitted_poles,
-            pole_fit_tolerance=self.lit_config.inversion_pole_fit_tolerance,
-            pole_fit_max_iterations=(self.lit_config.inversion_pole_fit_max_iterations),
-            solver_tolerance=self.lit_config.inversion_solver_tolerance,
-            solver_max_iterations=(self.lit_config.inversion_solver_max_iterations),
-        )
-
-    def _run_formal_inversion(self, output_path: UPath) -> None:
-        additional = self.lit_config.inversion_additional_input_paths
-        source_paths = (str(output_path), *additional)
-        if len(set(source_paths)) != len(source_paths):
-            msg = "lit inversion input paths must be unique."
-            raise ValueError(msg)
-        inversion = invert_lit_npz(
-            source_paths,
-            self._inversion_settings(),
-            assume_independent=self.lit_config.inversion_assume_independent,
-        )
-        inversion_path = self.save_path / self.lit_config.inversion_output_filename
-        _save_npz_compressed(
-            inversion_path,
-            **lit_inversion_npz_payload(inversion),
-        )
-        logger.info(
-            "Wrote formal LIT inversion to %s (poles=%s, eta_count=%d, "
-            "underdetermined=%s)",
-            inversion_path,
-            np.array2string(inversion.result.pole_energies, precision=10),
-            inversion.result.diagnostics.unique_eta_count,
-            inversion.result.diagnostics.underdetermined,
-        )
 
     def _omega_grid(self) -> np.ndarray:
         return _lit_omega_grid(self.lit_config)
@@ -1044,29 +967,6 @@ class MoleculeLITWorkflow(Workflow):
         self._validate_source_sector_config()
         self._validate_nqs_iteration_config()
         self._validate_continuation_config()
-        self._validate_inversion_config()
-
-    def _validate_inversion_config(self) -> None:
-        if not self.lit_config.inversion_enabled:
-            return
-        output_filename = self.lit_config.inversion_output_filename
-        if not output_filename or output_filename == self.lit_config.output_filename:
-            msg = (
-                "lit.inversion_output_filename must be nonempty and differ "
-                "from lit.output_filename."
-            )
-            raise ValueError(msg)
-        if not output_filename.endswith(".npz"):
-            msg = "lit.inversion_output_filename must end in '.npz'."
-            raise ValueError(msg)
-        additional = self.lit_config.inversion_additional_input_paths
-        if any(not isinstance(path, str) or not path for path in additional):
-            msg = "lit.inversion_additional_input_paths must contain nonempty paths."
-            raise ValueError(msg)
-        if len(set(additional)) != len(additional):
-            msg = "lit.inversion_additional_input_paths must be unique."
-            raise ValueError(msg)
-        self._inversion_settings()
 
     def _validate_serial_scan_config(self, omega: np.ndarray) -> None:
         warm_omega = self.lit_config.nqs_warm_start_omega
@@ -1709,6 +1609,29 @@ class MoleculeLITWorkflow(Workflow):
         )
         rng, source_rng = jax.random.split(rng)
         source_state = source_plan.init(batched_data, source_rng)
+        if self._nqs_data_parallel_enabled():
+            self._validate_data_parallel_batch(
+                batched_data,
+                purpose="source sampling",
+            )
+            source_step = self._source_sample_step_kernel(
+                source_plan,
+                batched_data,
+            )
+            ground_params = _replicate_across_local_devices(ground_params)
+            batched_data = _shard_batched_data_across_local_devices(batched_data)
+            source_state = _replicate_across_local_devices(source_state)
+            for _ in range(self.lit_config.nqs_source_burn_in):
+                rng, source_rng = jax.random.split(rng)
+                source_rngs = _shard_rng_across_local_devices(source_rng)
+                batched_data, _, source_state = source_step(
+                    ground_params,
+                    batched_data,
+                    source_state,
+                    source_rngs,
+                )
+            return source_plan, source_state, batched_data, rng
+
         for _ in range(self.lit_config.nqs_source_burn_in):
             rng, source_rng = jax.random.split(rng)
             batched_data, _, source_state = source_plan.step(
@@ -1735,6 +1658,28 @@ class MoleculeLITWorkflow(Workflow):
             1,
             int(self.lit_config.nqs_pool_stride if stride is None else stride),
         )
+        if self._nqs_data_parallel_enabled():
+            self._validate_data_parallel_batch(
+                batched_data,
+                purpose="source sampling",
+            )
+            sample_step = self._source_sample_step_kernel(sample_plan, batched_data)
+            params = _replicate_across_local_devices(params)
+            batched_data = _shard_batched_data_across_local_devices(batched_data)
+            sampler_state = _replicate_across_local_devices(sampler_state)
+            for _ in range(max(1, int(batches))):
+                for _ in range(stride):
+                    rng, sample_rng = jax.random.split(rng)
+                    sample_rngs = _shard_rng_across_local_devices(sample_rng)
+                    batched_data, _, sampler_state = sample_step(
+                        params,
+                        batched_data,
+                        sampler_state,
+                        sample_rngs,
+                    )
+                pool.append(batched_data)
+            return _concat_batched_data(pool), batched_data, sampler_state, rng
+
         for _ in range(max(1, int(batches))):
             for _ in range(stride):
                 rng, sample_rng = jax.random.split(rng)
@@ -1746,6 +1691,52 @@ class MoleculeLITWorkflow(Workflow):
                 )
             pool.append(batched_data)
         return _concat_batched_data(pool), batched_data, sampler_state, rng
+
+    def _source_sample_step_kernel(
+        self,
+        sample_plan: SamplePlan,
+        batched_data: BatchedData,
+    ):
+        """Compile one source MCMC step over process-local devices.
+
+        Returns:
+            A kernel with sharded walkers and RNGs, replicated parameters and
+            sampler state, and globally reduced sampler statistics.
+        """
+        cache = getattr(self, "_source_sample_step_kernel_cache", None)
+        if cache is None:
+            cache = {}
+            self._source_sample_step_kernel_cache = cache
+        cache_key = id(sample_plan)
+        kernel = cache.get(cache_key)
+        if kernel is not None:
+            return kernel
+
+        device_count = jax.local_device_count()
+        logger.info(
+            "Compiling NQS-LIT source sampling data parallelism devices=%d "
+            "global_batch=%d local_batch=%d",
+            device_count,
+            int(batched_data.batch_size),
+            int(batched_data.batch_size) // device_count,
+        )
+        kernel = parallel_jax.jit_sharded(
+            sample_plan.step,
+            in_specs=(
+                parallel_jax.SHARE_PARTITION,
+                batched_data.partition_spec,
+                parallel_jax.SHARE_PARTITION,
+                parallel_jax.DATA_PARTITION,
+            ),
+            out_specs=(
+                batched_data.partition_spec,
+                parallel_jax.SHARE_PARTITION,
+                parallel_jax.SHARE_PARTITION,
+            ),
+            check_vma=True,
+        )
+        cache[cache_key] = kernel
+        return kernel
 
     def _load_or_collect_source_pool(
         self,
@@ -4842,12 +4833,6 @@ def _save_npz(path: UPath, **payload: object) -> None:
         np.savez(f_out, **payload)  # type: ignore[arg-type]
 
 
-def _save_npz_compressed(path: UPath, **payload: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as f_out:
-        np.savez_compressed(f_out, **payload)  # type: ignore[arg-type]
-
-
 _CONTINUATION_HISTORY_STAT_FIELDS = (
     "fidelity",
     "reverse_kl",
@@ -4857,22 +4842,6 @@ _CONTINUATION_HISTORY_STAT_FIELDS = (
 _CONTINUATION_STATE_CONFIG_EXCLUSIONS = frozenset(
     {
         "output_filename",
-        "inversion_enabled",
-        "inversion_output_filename",
-        "inversion_additional_input_paths",
-        "inversion_assume_independent",
-        "inversion_threshold",
-        "inversion_pole_energies",
-        "inversion_continuum_grid",
-        "inversion_continuum_regularization",
-        "inversion_fit_pole_energies",
-        "inversion_pole_energy_bounds",
-        "inversion_covariance_relative_tolerance",
-        "inversion_max_fitted_poles",
-        "inversion_pole_fit_tolerance",
-        "inversion_pole_fit_max_iterations",
-        "inversion_solver_tolerance",
-        "inversion_solver_max_iterations",
         "nqs_checkpoint_path",
         "nqs_source_pool_dir",
         "nqs_reuse_source_pool",
@@ -5427,6 +5396,19 @@ def _replicate_across_local_devices(value):
     )
 
 
+def _shard_rng_across_local_devices(rng):
+    """Derive and shard one independent PRNG key per local device.
+
+    Returns:
+        A flattened key array partitioned so each device receives one key.
+    """
+    per_device_rngs = jax.random.split(rng, jax.local_device_count()).flatten()
+    return jax.device_put(
+        per_device_rngs,
+        parallel_jax.make_sharding(parallel_jax.DATA_PARTITION),
+    )
+
+
 def _shard_batched_data_across_local_devices(pool: BatchedData) -> BatchedData:
     """Place batch fields across the local mesh and replicate shared fields.
 
@@ -5449,9 +5431,22 @@ def _slice_batched_data(pool: BatchedData, start: int, size: int) -> BatchedData
             f"for batch_size={pool.batch_size}."
         )
         raise ValueError(msg)
+    batch_slice = slice(start, start + size)
+
+    def slice_leaf(value):
+        if isinstance(value, jax.Array) and isinstance(
+            value.sharding,
+            jax.sharding.NamedSharding,
+        ):
+            # Explicitly preserve the input NamedSharding.  Plain indexing is
+            # ambiguous for a proper subset of a batch-partitioned global
+            # array and raises ShardingTypeError on more than one device.
+            return value.at[batch_slice].get(out_sharding=value.sharding)
+        return operator.itemgetter(batch_slice)(value)
+
     updates = {
         field_name: jax.tree.map(
-            operator.itemgetter(slice(start, start + size)),
+            slice_leaf,
             getattr(pool.data, field_name),
         )
         for field_name in pool.fields_with_batch

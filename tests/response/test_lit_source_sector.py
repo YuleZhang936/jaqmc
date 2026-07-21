@@ -15,6 +15,7 @@ from jaqmc.app.molecule.lit_workflow import (
     MoleculeLITWorkflow,
     _project_source_center_to_invariant_subspace,
     _resolve_atomic_parity_sector,
+    _shard_batched_data_across_local_devices,
 )
 from jaqmc.data import BatchedData
 from jaqmc.response.source_sector import SourceSector
@@ -368,6 +369,45 @@ def test_atomic_pure_source_guard_accepts_both_response_parities(
         axis=0,
         response_parity=response_parity,
     )
+    np.testing.assert_allclose(parity_loss, 0.0, atol=2e-7)
+
+
+def test_atomic_pure_source_guard_accepts_sharded_heldout_pool():
+    device_count = jax.local_device_count()
+    workflow = object.__new__(MoleculeLITWorkflow)
+    workflow.lit_config = MolecularLITConfig(
+        nqs_parity_eval_batch_size=4 * device_count,
+        nqs_atomic_source_parity_max_loss=1e-4,
+    )
+    atom_center = jnp.asarray([0.2, -0.3, 0.1], dtype=jnp.float32)
+    base_batch = _atomic_batch(atom_center)
+    eval_pool = BatchedData(
+        data=base_batch.data.merge(
+            {
+                "electrons": jnp.tile(
+                    base_batch.data.electrons,
+                    (2 * device_count, 1, 1),
+                )
+            }
+        ),
+        fields_with_batch=("electrons",),
+    )
+    eval_pool = _shard_batched_data_across_local_devices(eval_pool)
+    sector = _resolve_atomic_parity_sector(
+        workflow._configured_source_sector(eval_pool.data),
+        -1,
+    )
+
+    parity_loss = workflow._validate_atomic_source_parity(
+        _even_atomic_ground(atom_center),
+        {},
+        eval_pool,
+        sector,
+        -atom_center,
+        axis=0,
+        response_parity=-1,
+    )
+
     np.testing.assert_allclose(parity_loss, 0.0, atol=2e-7)
 
 

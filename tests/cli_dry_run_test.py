@@ -262,6 +262,12 @@ run:
         "workflow.save_path=lit_run",
     ),
     CliDryRunCase(
+        "response_invert_lit_dry_run",
+        "response invert-lit inversion.input_paths=[raw_lit.npz] "
+        "inversion.output_path=inversion_k1.npz inversion.threshold=0.9 "
+        "inversion.pole_energies=[0.78]",
+    ),
+    CliDryRunCase(
         "solid_evaluate_density_yaml",
         "solid evaluate --yml solid_eval.yml",
         {

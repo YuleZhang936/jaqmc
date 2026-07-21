@@ -31,33 +31,16 @@ sampler:
 
 lit:
   eta: 0.003
-  omega_min: 0.772
-  omega_max: 0.787
-  omega_points: 61
+  # Broad bound-state window below the first-principles He+ threshold.  The
+  # 0.00025-Ha grid is chosen without supplying experimental transition data.
+  omega_min: 0.750
+  omega_max: 0.900
+  omega_points: 601
   axes: x
   output_filename: lit_spectrum.npz
-
-  # Run the covariance-weighted nonnegative inversion automatically after the
-  # raw LIT archive is complete.  This threshold is E(He+) - E0 for the formal
-  # ground checkpoint used below; update it when replacing that checkpoint.
-  inversion_enabled: true
-  inversion_output_filename: lit_inversion.npz
-  inversion_additional_input_paths: []
-  inversion_assume_independent: false
-  inversion_threshold: 0.9036762677
-  inversion_pole_energies: [0.780]
-  inversion_fit_pole_energies: true
-  inversion_pole_energy_bounds: [[0.775, 0.785]]
-  # This narrow window lies below ionization. A nonnegative continuum test
-  # selected zero density, so the production model retains only the bound pole.
-  inversion_continuum_grid: []
-  inversion_continuum_regularization: 0.0
-  inversion_covariance_relative_tolerance: 1.0e-10
-  inversion_max_fitted_poles: 1
-  inversion_pole_fit_tolerance: 1.0e-10
-  inversion_pole_fit_max_iterations: 1000
-  inversion_solver_tolerance: 1.0e-10
-  inversion_solver_max_iterations: null
+  # The formal NQS workflow ends after writing this raw archive.  Pole count,
+  # peak locations, and continuum models are explicit CPU postprocessing
+  # hypotheses handled later by `jaqmc response invert-lit`.
 
   nqs_allow_untrained_ground: false
   nqs_ground_energy: null
@@ -86,9 +69,7 @@ lit:
   nqs_data_parallel: local_devices
   nqs_source_pool_dir: ''
   # Metadata binds the exact walker count, ground-checkpoint content, and
-  # nuclear geometry, rejecting every old or cross-system pool. Reuse the newly
-  # generated centered 512/64 pools so multi-eta calculations can share
-  # identical held-out jackknife blocks.
+  # nuclear geometry, rejecting every old or cross-system pool.
   nqs_reuse_source_pool: true
   nqs_save_source_pool: true
   # Fit the independent opposite-parity response NQS to Phi on the fixed

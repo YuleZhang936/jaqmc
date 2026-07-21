@@ -191,43 +191,6 @@ def test_unknown_single_frequency_data_parallel_modes_are_rejected(mode):
         workflow._validate_config()
 
 
-def test_enabled_formal_inversion_is_validated_before_scan():
-    workflow = object.__new__(MoleculeLITWorkflow)
-    workflow.lit_config = MolecularLITConfig(
-        inversion_enabled=True,
-        inversion_threshold=0.9,
-        inversion_pole_energies=(0.78,),
-        inversion_fit_pole_energies=True,
-        inversion_pole_energy_bounds=((0.77, 0.79),),
-    )
-
-    workflow._validate_config()
-
-
-def test_enabled_formal_inversion_requires_threshold():
-    workflow = object.__new__(MoleculeLITWorkflow)
-    workflow.lit_config = MolecularLITConfig(
-        inversion_enabled=True,
-        inversion_pole_energies=(0.78,),
-    )
-
-    with pytest.raises(ValueError, match="inversion_threshold"):
-        workflow._validate_config()
-
-
-def test_formal_inversion_cannot_overwrite_raw_lit():
-    workflow = object.__new__(MoleculeLITWorkflow)
-    workflow.lit_config = MolecularLITConfig(
-        inversion_enabled=True,
-        inversion_output_filename="lit_spectrum.npz",
-        inversion_threshold=0.9,
-        inversion_pole_energies=(0.78,),
-    )
-
-    with pytest.raises(ValueError, match="must be nonempty and differ"):
-        workflow._validate_config()
-
-
 def test_batched_data_chunks_cover_pool_and_cycle():
     pool = BatchedData(
         data=MoleculeData(
