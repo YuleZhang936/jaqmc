@@ -372,10 +372,11 @@ def test_atomic_pure_source_guard_accepts_both_response_parities(
     np.testing.assert_allclose(parity_loss, 0.0, atol=2e-7)
 
 
-def test_atomic_pure_source_guard_accepts_sharded_heldout_pool():
+def test_atomic_pure_source_guard_accepts_sharded_heldout_pool(monkeypatch):
     device_count = jax.local_device_count()
     workflow = object.__new__(MoleculeLITWorkflow)
     workflow.lit_config = MolecularLITConfig(
+        nqs_data_parallel="local_devices",
         nqs_parity_eval_batch_size=4 * device_count,
         nqs_atomic_source_parity_max_loss=1e-4,
     )
@@ -397,10 +398,37 @@ def test_atomic_pure_source_guard_accepts_sharded_heldout_pool():
         workflow._configured_source_sector(eval_pool.data),
         -1,
     )
+    even_ground = _even_atomic_ground(atom_center)
+
+    def parameterized_even_ground(params, data):
+        return params["scale"] * even_ground({}, data)
+
+    placement_calls = {"replicate": 0, "shard": 0}
+    original_replicate = lit_workflow_module._replicate_across_local_devices
+    original_shard = lit_workflow_module._shard_batched_data_across_local_devices
+
+    def record_replicate(value):
+        placement_calls["replicate"] += 1
+        return original_replicate(value)
+
+    def record_shard(value):
+        placement_calls["shard"] += 1
+        return original_shard(value)
+
+    monkeypatch.setattr(
+        lit_workflow_module,
+        "_replicate_across_local_devices",
+        record_replicate,
+    )
+    monkeypatch.setattr(
+        lit_workflow_module,
+        "_shard_batched_data_across_local_devices",
+        record_shard,
+    )
 
     parity_loss = workflow._validate_atomic_source_parity(
-        _even_atomic_ground(atom_center),
-        {},
+        parameterized_even_ground,
+        {"scale": jnp.asarray(1.0)},
         eval_pool,
         sector,
         -atom_center,
@@ -409,6 +437,7 @@ def test_atomic_pure_source_guard_accepts_sharded_heldout_pool():
     )
 
     np.testing.assert_allclose(parity_loss, 0.0, atol=2e-7)
+    assert placement_calls == {"replicate": 1, "shard": 1}
 
 
 def test_atomic_pure_source_guard_rejects_parity_leakage():

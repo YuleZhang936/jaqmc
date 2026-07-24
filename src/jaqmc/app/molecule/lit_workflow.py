@@ -1411,6 +1411,15 @@ class MoleculeLITWorkflow(Workflow):
             ),
             0,
         )
+        if self._nqs_data_parallel_enabled():
+            self._validate_data_parallel_batch(
+                evaluation_batch,
+                purpose="atomic source parity evaluation",
+            )
+            ground_params = _replicate_across_local_devices(ground_params)
+            evaluation_batch = _shard_batched_data_across_local_devices(
+                evaluation_batch
+            )
         centers = jnp.asarray(
             source_centers,
             dtype=evaluation_batch.data.electrons.dtype,
